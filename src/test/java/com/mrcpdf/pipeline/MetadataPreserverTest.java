@@ -2,10 +2,14 @@ package com.mrcpdf.pipeline;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.zip.InflaterInputStream;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -13,12 +17,93 @@ import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class MetadataPreserverTest {
 
     private final MetadataPreserver preserver = new MetadataPreserver();
+
+    @TempDir
+    java.nio.file.Path tempDir;
+
+    /**
+     * Regression test for the outline deep-copy bug: the old implementation
+     * left /Dest references pointing at SOURCE pages, which PDFBox then
+     * serialized into the output as a hidden second page tree (roughly
+     * doubling the output size).  The outline must be rebuilt with
+     * destinations remapped to the output pages.
+     */
+    @Test
+    void preserve_remapsOutlineDestinationsWithoutCopyingSourcePages() throws IOException {
+        File input = new File("tests/all-features.pdf");
+        assertTrue(input.exists(),
+                "fixture tests/all-features.pdf not found (run ./gradlew generateTestPdfs)");
+
+        File saved = tempDir.resolve("out.pdf").toFile();
+        try (PDDocument source = Loader.loadPDF(input);
+             PDDocument output = blankOutputFor(source)) {
+            var result = preserver.preserve(source, output, allPages(output));
+            assertEquals(2, result.outlines(), "Should report 2 top-level bookmarks");
+            output.save(saved);
+        }
+
+        // The saved file must contain exactly one page tree — the source pages
+        // must not leak in through the copied outline.
+        assertEquals(1, countPageTrees(saved), "Output must contain exactly one page tree");
+
+        // Outline destinations must resolve to the output pages in order.
+        try (PDDocument loaded = Loader.loadPDF(saved)) {
+            PDDocumentOutline outline = loaded.getDocumentCatalog().getDocumentOutline();
+            assertNotNull(outline, "Outline should be preserved");
+            List<Integer> destIndices = new ArrayList<>();
+            collectDestPageIndices(outline, loaded, destIndices);
+            assertEquals(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), destIndices,
+                    "Outline destinations should map to output pages in order");
+        }
+    }
+
+    private static void collectDestPageIndices(PDOutlineNode node, PDDocument doc,
+                                               List<Integer> out) throws IOException {
+        for (PDOutlineItem item : node.children()) {
+            PDPageDestination dest = item.getDestination() instanceof PDPageDestination
+                    ? (PDPageDestination) item.getDestination() : null;
+            if (dest != null) {
+                PDPage page = dest.getPage();
+                if (page != null) out.add(doc.getPages().indexOf(page));
+            }
+            collectDestPageIndices(item, doc, out);
+        }
+    }
+
+    private static int countPageTrees(File pdf) throws IOException {
+        byte[] raw = Files.readAllBytes(pdf.toPath());
+        StringBuilder hay = new StringBuilder(new String(raw, StandardCharsets.ISO_8859_1));
+        String ascii = hay.toString();
+        int searchFrom = 0;
+        while (true) {
+            int st = ascii.indexOf("stream", searchFrom);
+            if (st < 0) break;
+            int end = ascii.indexOf("endstream", st);
+            if (end < 0) break;
+            int dataStart = st + "stream".length();
+            if (dataStart < end && ascii.charAt(dataStart) == '\r') dataStart++;
+            if (dataStart < end && ascii.charAt(dataStart) == '\n') dataStart++;
+            byte[] data = new byte[end - dataStart];
+            System.arraycopy(raw, dataStart, data, 0, data.length);
+            try (InflaterInputStream in = new InflaterInputStream(new ByteArrayInputStream(data))) {
+                hay.append('\n').append(new String(in.readAllBytes(), StandardCharsets.ISO_8859_1));
+            } catch (IOException ignored) {
+            }
+            searchFrom = end + "endstream".length();
+        }
+        String full = hay.toString();
+        return full.split("/Type /Pages", -1).length - 1;
+    }
 
     /**
      * Builds an output PDDocument with the same number of blank pages as the
