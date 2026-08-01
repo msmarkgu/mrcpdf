@@ -132,6 +132,7 @@ Because the mask supplies the sharp text and the background supplies the smooth 
 - Tests: `src/test/java/com/mrcpdf/` (JUnit 5; requires Java 21)
 - Performance/compression analysis: [`docs/MRC-compression-effect.md`](docs/MRC-compression-effect.md), [`docs/report-mrc.md`](docs/report-mrc.md)
 - Design notes: [`docs/mrc-only-plan.md`](docs/mrc-only-plan.md), [`docs/bookmarks-hyperlinks-attachments.md`](docs/bookmarks-hyperlinks-attachments.md)
+- Test runs (sample CLI output, compression results): [`docs/test-runs.md`](docs/test-runs.md)
 
 ### Benchmarking
 

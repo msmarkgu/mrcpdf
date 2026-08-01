@@ -77,6 +77,7 @@ public class TestPdfGenerator implements Callable<Integer> {
             makeWithAttachments();
             makeNoisyScan();
             makeScannedText();
+            makeAllInOne();
 
             System.out.println("\nDone. Files in " + OUT_DIR + "/");
             return 0;
@@ -641,6 +642,137 @@ public class TestPdfGenerator implements Callable<Integer> {
             doc.save(path.toFile());
         }
         System.out.println("  scanned-text.pdf");
+    }
+
+    // ── 9. all-features.pdf ─────────────────────────────────────────────
+    // One fixture that combines every preserved feature at once: dense
+    // scanned pages with an invisible searchable text layer, a nested
+    // bookmarks outline, sticky-note and underline annotations on several
+    // pages, and embedded file attachments.
+
+    private void makeAllInOne() throws IOException {
+        List<List<String>> pages = buildScannedPages();
+
+        Path path = OUT_DIR.resolve("all-features.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDDocumentInformation info = doc.getDocumentInformation();
+            info.setTitle("All Features Test Document");
+            info.setAuthor("MrcPdf Test Suite");
+            info.setSubject("Test PDF with text, bookmarks, annotations and attachments");
+            info.setKeywords("test, text, bookmarks, annotations, attachments, pdf");
+
+            List<PDPage> pdPages = new ArrayList<>();
+            for (List<String> lines : pages) {
+                BufferedImage img = new BufferedImage(W, H, BufferedImage.TYPE_BYTE_GRAY);
+                Graphics2D g = img.createGraphics();
+                g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
+                        RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                g.setColor(Color.WHITE);
+                g.fillRect(0, 0, W, H);
+                g.setColor(Color.BLACK);
+                g.setFont(font14);
+                int y = MARGIN;
+                for (String line : lines) {
+                    if (!line.isEmpty()) g.drawString(line, MARGIN, y);
+                    y += LINE_HEIGHT;
+                }
+                g.dispose();
+
+                PDImageXObject pdImg = JPEGFactory.createFromImage(doc, img, 0.95f);
+                PDPage pdPage = new PDPage(new PDRectangle(W, H));
+                doc.addPage(pdPage);
+                pdPages.add(pdPage);
+                try (PDPageContentStream cs = new PDPageContentStream(doc, pdPage)) {
+                    cs.drawImage(pdImg, 0, 0, W, H);
+                    cs.beginText();
+                    cs.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 14);
+                    cs.setRenderingMode(RenderingMode.NEITHER);
+                    y = MARGIN;
+                    for (String line : lines) {
+                        if (!line.isEmpty()) {
+                            cs.setTextMatrix(Matrix.getTranslateInstance(MARGIN, H - y));
+                            cs.showText(line);
+                        }
+                        y += LINE_HEIGHT;
+                    }
+                    cs.endText();
+                }
+            }
+
+            // Nested bookmarks outline: 2 parts, each with 5 chapter children
+            PDDocumentOutline outline = new PDDocumentOutline();
+            doc.getDocumentCatalog().setDocumentOutline(outline);
+            String[] partNames = {"Part I: Foundations", "Part II: In Practice"};
+            for (int p = 0; p < partNames.length; p++) {
+                PDOutlineItem part = new PDOutlineItem();
+                part.setTitle(partNames[p]);
+                outline.addLast(part);
+                for (int c = 0; c < 5; c++) {
+                    int pageIndex = p * 5 + c;
+                    PDOutlineItem chapter = new PDOutlineItem();
+                    chapter.setTitle("Chapter " + (pageIndex + 1));
+                    PDPageFitWidthDestination dest = new PDPageFitWidthDestination();
+                    dest.setPage(pdPages.get(pageIndex));
+                    chapter.setDestination(dest);
+                    part.addLast(chapter);
+                }
+            }
+
+            // Annotations: sticky notes and an underline spread across pages
+            PDAnnotationText note1 = new PDAnnotationText();
+            note1.setRectangle(new PDRectangle(100, H - 100, 200, 50));
+            note1.setContents("Sticky note on page 1.");
+            note1.setOpen(false);
+            pdPages.get(0).getAnnotations().add(note1);
+
+            PDAnnotationUnderline underline = new PDAnnotationUnderline();
+            float[] quads = {
+                MARGIN, H - MARGIN,
+                MARGIN + 200, H - MARGIN,
+                MARGIN, H - MARGIN - 20,
+                MARGIN + 200, H - MARGIN - 20
+            };
+            underline.setRectangle(new PDRectangle(MARGIN, H - MARGIN - 20, 200, 20));
+            underline.setQuadPoints(quads);
+            underline.setContents("Underlined text on page 1.");
+            pdPages.get(0).getAnnotations().add(underline);
+
+            for (int idx : new int[] {4, 7}) {
+                PDAnnotationText note = new PDAnnotationText();
+                note.setRectangle(new PDRectangle(100, H - 100, 200, 50));
+                note.setContents("Sticky note on page " + (idx + 1) + ".");
+                note.setOpen(false);
+                pdPages.get(idx).getAnnotations().add(note);
+            }
+
+            // Embedded file attachments
+            PDDocumentNameDictionary names = new PDDocumentNameDictionary(doc.getDocumentCatalog());
+            doc.getDocumentCatalog().setNames(names);
+            PDEmbeddedFilesNameTreeNode embeddedFilesNode = new PDEmbeddedFilesNameTreeNode();
+            names.setEmbeddedFiles(embeddedFilesNode);
+
+            java.util.Map<String, PDComplexFileSpecification> fileMap = new java.util.LinkedHashMap<>();
+            String[][] attachments = {
+                {"readme.txt", "text/plain", "This is an embedded text file for testing attachment preservation."},
+                {"data.bin", "application/octet-stream", "binary test data here"},
+                {"notes.txt", "text/plain", "Additional attachment: page notes for the all-features fixture."},
+            };
+            for (String[] att : attachments) {
+                PDEmbeddedFile ef = new PDEmbeddedFile(doc);
+                ef.setSubtype(att[1]);
+                PDComplexFileSpecification spec = new PDComplexFileSpecification();
+                spec.setFile(att[0]);
+                spec.setEmbeddedFile(ef);
+                try (var os = ef.createOutputStream()) {
+                    os.write(att[2].getBytes(StandardCharsets.UTF_8));
+                }
+                fileMap.put(att[0], spec);
+            }
+            embeddedFilesNode.setNames(fileMap);
+
+            doc.save(path.toFile());
+        }
+        System.out.println("  all-features.pdf");
     }
 
     public static void main(String[] args) {

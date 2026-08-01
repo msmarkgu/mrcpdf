@@ -20,14 +20,19 @@ import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDMetadata;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkInfo;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitWidthDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode;
 
 /**
  * Copies metadata from a source PDF to an output PDF.
  *
  * Preserved elements:
  *   - PDDocumentInformation (title, author, subject, keywords, creator, producer)
- *   - PDDocumentOutline (bookmark tree) — COS-level deep copy
+ *   - PDDocumentOutline (bookmark tree) — rebuilt with destinations remapped
+ *     from the source pages to the corresponding output pages
  *   - Per-page PDAnnotation lists — each annotation COS dictionary is duplicated
  *   - Embedded files (attachments) — COS-level deep copy of the Names/EmbeddedFiles tree
  *   - XML metadata stream (XMP)
@@ -35,9 +40,6 @@ import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocume
  * Limitations:
  *   - Annotation page references (e.g. link destinations) are not remapped.
  *   - Named destinations are preserved but may reference missing pages.
- *   - Outline entries pointing to specific pages are kept but not remapped
- *     (the output pages are in the same order, so page-number-based links
- *     generally still work).
  */
 public class MetadataPreserver {
 
@@ -56,7 +58,7 @@ public class MetadataPreserver {
      */
     public PreserveResult preserve(PDDocument source, PDDocument output, List<PDPage> outputPages) throws IOException {
         copyDocumentInfo(source, output);
-        int outlines = copyOutline(source, output);
+        int outlines = copyOutline(source, output, outputPages);
         int annotations = copyAnnotations(source, outputPages);
         int embeddedFiles = copyEmbeddedFiles(source, output);
         copyXmlMetadata(source, output);
@@ -96,19 +98,57 @@ public class MetadataPreserver {
         void accept(T t) throws Exception;
     }
 
-    private int copyOutline(PDDocument source, PDDocument output) throws IOException {
+    private int copyOutline(PDDocument source, PDDocument output, List<PDPage> outputPages) throws IOException {
         PDDocumentOutline srcOutline = source.getDocumentCatalog().getDocumentOutline();
         if (srcOutline == null) return 0;
 
-        // Deep-copy the outline COS dictionary tree
-        COSDictionary srcDict = srcOutline.getCOSObject();
-        COSDictionary dstDict = deepCopyCOSDictionary(srcDict);
-        PDDocumentOutline dstOutline = new PDDocumentOutline(dstDict);
-        output.getDocumentCatalog().setDocumentOutline(dstOutline);
-
+        // Rebuild the outline instead of deep-copying the COS dictionary: the
+        // deep copy would carry /Dest indirect references to the SOURCE pages,
+        // which PDFBox then serializes into the output as a hidden second copy
+        // of the source document (bloating the file).  Each item is recreated
+        // with its destination remapped to the matching output page by index.
+        PDDocumentOutline dstOutline = new PDDocumentOutline();
         int count = 0;
-        for (var child : srcOutline.children()) count++;
+        for (PDOutlineItem srcItem : srcOutline.children()) {
+            dstOutline.addLast(copyOutlineItem(srcItem, source, outputPages));
+            count++;
+        }
+        output.getDocumentCatalog().setDocumentOutline(dstOutline);
         return count;
+    }
+
+    private PDOutlineItem copyOutlineItem(PDOutlineItem srcItem, PDDocument source,
+                                          List<PDPage> outputPages) {
+        PDOutlineItem dstItem = new PDOutlineItem();
+        String title = srcItem.getTitle();
+        dstItem.setTitle(title != null ? title : "");
+        remapDestination(srcItem, dstItem, source, outputPages);
+        for (PDOutlineItem child : srcItem.children()) {
+            dstItem.addLast(copyOutlineItem(child, source, outputPages));
+        }
+        return dstItem;
+    }
+
+    private void remapDestination(PDOutlineItem srcItem, PDOutlineItem dstItem,
+                                  PDDocument source, List<PDPage> outputPages) {
+        org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDDestination dest = null;
+        try {
+            dest = srcItem.getDestination();
+        } catch (Exception e) {
+            return;
+        }
+        if (!(dest instanceof PDPageDestination)) return;
+        try {
+            PDPage srcPage = ((PDPageDestination) dest).getPage();
+            if (srcPage == null) return;
+            int idx = source.getPages().indexOf(srcPage);
+            if (idx < 0 || idx >= outputPages.size()) return;
+            PDPageFitWidthDestination outDest = new PDPageFitWidthDestination();
+            outDest.setPage(outputPages.get(idx));
+            dstItem.setDestination(outDest);
+        } catch (Exception e) {
+            // Destinations that cannot be resolved are dropped, not carried over.
+        }
     }
 
     private int copyAnnotations(PDDocument source, List<PDPage> outputPages) throws IOException {
