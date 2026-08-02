@@ -10,7 +10,6 @@ import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSBase;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
-import org.apache.pdfbox.cos.COSObject;
 import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
@@ -18,13 +17,11 @@ import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDMetadata;
-import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkInfo;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitWidthDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
-import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode;
 
 /**
  * Copies metadata from a source PDF to an output PDF.
@@ -212,14 +209,6 @@ public class MetadataPreserver {
 
     private static COSDictionary deepCopyCOSDictionary(COSDictionary original) {
         return deepCopyCOSDictionary(original, new IdentityHashMap<>());
-    }
-
-    private static COSStream deepCopyCOSStream(COSStream original) {
-        return deepCopyCOSStream(original, new IdentityHashMap<>());
-    }
-
-    private static COSArray deepCopyCOSArray(COSArray original) {
-        return deepCopyCOSArray(original, new IdentityHashMap<>());
     }
 
     private static COSDictionary deepCopyCOSDictionary(COSDictionary original,

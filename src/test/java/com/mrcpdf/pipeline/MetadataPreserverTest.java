@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.zip.InflaterInputStream;
+import java.util.stream.StreamSupport;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -154,9 +155,8 @@ class MetadataPreserverTest {
             assertNotNull(srcOutline, "Source fixture should have an outline");
             assertNotNull(dstOutline, "Outline should be copied when source has one");
 
-            int srcCount = 0, dstCount = 0;
-            for (var child : srcOutline.children()) srcCount++;
-            for (var child : dstOutline.children()) dstCount++;
+            int srcCount = (int) StreamSupport.stream(srcOutline.children().spliterator(), false).count();
+            int dstCount = (int) StreamSupport.stream(dstOutline.children().spliterator(), false).count();
             assertEquals(srcCount, dstCount, "Outline item count should match");
             assertEquals(3, srcCount, "with-annotations.pdf should have 3 bookmarks");
         }
