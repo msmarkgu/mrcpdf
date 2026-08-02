@@ -279,6 +279,14 @@ public class MrcPdf implements Callable<Integer> {
                 }
 
                 // ── Pass 2: assemble (streaming) ──
+                if (useMrc && jbig2Batch == null) {
+                    // jbig2enc is unavailable, so disable the assembler's per-page
+                    // compressor: without this, addPage() would spawn a failing
+                    // jbig2enc subprocess for every page before falling back to
+                    // CCITT G4. The single-page compress() API stays available
+                    // for embedders/tests.
+                    assembler.setCompressor(null);
+                }
                 System.out.println("  Assembling PDF...");
                 try (PDDocument output = new PDDocument()) {
                     List<PDPage> outPages = new ArrayList<>(pageCount);
@@ -428,19 +436,40 @@ public class MrcPdf implements Callable<Integer> {
 
             List<List<CharPos>> lines = new ArrayList<>();
             List<CharPos> currentLine = new ArrayList<>();
-            float lineY = chars.get(0).y;
             float[] heights = new float[chars.size()];
             for (int i = 0; i < chars.size(); i++) heights[i] = chars.get(i).height;
             java.util.Arrays.sort(heights);
-            float medianHeight = heights[heights.length / 2];
-            float lineThreshold = medianHeight * 0.5f;
+            float pageMedianHeight = heights[heights.length / 2];
+
+            // Anchor each line to the RUNNING MEAN baseline of its characters,
+            // not a fixed first-char anchor: a slightly raised first glyph (e.g. a
+            // superscript) no longer forces the rest of the line to split off, and
+            // slowly drifting baselines (curved scans) stay one line. The threshold
+            // is adaptive — the larger of the page-wide median and the current
+            // line's mean height — so smaller sub/superscript glyphs merge into
+            // their line while genuinely distant lines still split.
+            float lineMeanY = 0f;
+            float lineMeanHeight = 0f;
+            int lineCount = 1;
             for (CharPos cp : chars) {
-                if (Math.abs(cp.y - lineY) > lineThreshold) {
-                    if (!currentLine.isEmpty()) {
+                if (currentLine.isEmpty()) {
+                    // First char of a line: establishes its baseline anchor.
+                    lineMeanY = cp.y;
+                    lineMeanHeight = cp.height;
+                    lineCount = 1;
+                } else {
+                    float threshold = 0.5f * Math.max(pageMedianHeight, lineMeanHeight);
+                    if (Math.abs(cp.y - lineMeanY) > threshold) {
                         lines.add(currentLine);
+                        currentLine = new ArrayList<>();
+                        lineMeanY = cp.y;
+                        lineMeanHeight = cp.height;
+                        lineCount = 1;
+                    } else {
+                        lineMeanY = (lineMeanY * lineCount + cp.y) / (lineCount + 1);
+                        lineMeanHeight = (lineMeanHeight * lineCount + cp.height) / (lineCount + 1);
+                        lineCount++;
                     }
-                    currentLine = new ArrayList<>();
-                    lineY = cp.y;
                 }
                 currentLine.add(cp);
             }

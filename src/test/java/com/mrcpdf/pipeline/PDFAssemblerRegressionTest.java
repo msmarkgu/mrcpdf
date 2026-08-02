@@ -105,6 +105,41 @@ class PDFAssemblerRegressionTest {
     }
 
     /**
+     * Regression test for the whole-word glyph skip.
+     *
+     * The old code wrapped showText(word) in a try/catch and dropped the ENTIRE
+     * word when any character was unsupported by the font. With the char-level
+     * fallback, only the unsupported character (an emoji here) is dropped, so
+     * the rest of the word stays in the searchable layer.
+     */
+    @Test
+    void textLayer_dropsUnsupportedCharKeepsRestOfWord() throws IOException {
+        File source = createSourcePdf();
+        int imgW = PAGE_W;
+        int imgH = PAGE_H;
+
+        // "AB" + emoji (U+1F600, not in Helvetica WinAnsi) + "CD"
+        String word = "AB" + "\uD83D\uDE00" + "CD";
+        List<TextBlock> blocks = Collections.singletonList(
+            new TextBlock(word, new Rectangle(10, 100, 120, 40), 0.95));
+        PageResult ocr = new PageResult(1, imgW, imgH, blocks);
+
+        BufferedImage bg = new BufferedImage(imgW, imgH, BufferedImage.TYPE_BYTE_GRAY);
+        List<BufferedImage> bgs = Collections.singletonList(bg);
+
+        PDFAssembler assembler = new PDFAssembler();
+        try (PDDocument doc = assembler.assemble(source, bgs, null,
+                Collections.singletonList(ocr), false)) {
+            PDPage page = doc.getPage(0);
+            String content = readContentStream(page);
+
+            assertNotNull(content, "Content stream should not be null");
+            assertTrue(content.contains("ABCD"),
+                "Supported chars must remain in the text layer, got: " + content);
+        }
+    }
+
+    /**
      * Regression test for the JBIG2 dead-code bug.
      *
      * The JBIG2Compressor was instantiated in the CLI entry point but never
