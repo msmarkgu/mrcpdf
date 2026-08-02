@@ -174,36 +174,54 @@ public class PDFAssembler {
             param.setCompressionQuality(quality);
             param.setProgressiveMode(ImageWriteParam.MODE_DEFAULT);
 
-            // Force 4:2:0 chroma subsampling via standard JPEG metadata
+            // Force 4:2:0 chroma subsampling via standard JPEG metadata.
+            // Component IDs are bounds-checked so a nonstandard writer tree
+            // can't corrupt the encoding; on any unexpected metadata we just
+            // fall back to the writer's default subsampling.
             ImageTypeSpecifier type = ImageTypeSpecifier.createFromRenderedImage(toEncode);
             IIOMetadata meta = writer.getDefaultImageMetadata(type, param);
             if (meta != null && !meta.isReadOnly()) {
-                Element tree = (Element) meta.getAsTree("javax_imageio_jpeg_image_1.0");
-                NodeList markers = tree.getElementsByTagName("markerSequence");
-                if (markers.getLength() > 0) {
-                    Element markerSeq = (Element) markers.item(0);
-                    NodeList sofList = markerSeq.getElementsByTagName("sof");
-                    if (sofList.getLength() > 0) {
-                        Element sof = (Element) sofList.item(0);
-                        Element marker = (Element) sof.getParentNode();
-                        NodeList childNodes = marker.getChildNodes();
-                        for (int ci = 0; ci < childNodes.getLength(); ci++) {
-                            Node child = childNodes.item(ci);
-                            if (child.getNodeType() == Node.ELEMENT_NODE) {
+                try {
+                    Element tree = (Element) meta.getAsTree("javax_imageio_jpeg_image_1.0");
+                    NodeList markers = tree.getElementsByTagName("markerSequence");
+                    if (markers.getLength() > 0) {
+                        Element markerSeq = (Element) markers.item(0);
+                        NodeList sofList = markerSeq.getElementsByTagName("sof");
+                        if (sofList.getLength() > 0) {
+                            Element sof = (Element) sofList.item(0);
+                            int numComponents;
+                            try {
+                                numComponents = Integer.parseInt(sof.getAttribute("numFrameComponents"));
+                            } catch (NumberFormatException e) {
+                                numComponents = 4; // sane default; loop still bounds-checks IDs
+                            }
+                            Element marker = (Element) sof.getParentNode();
+                            NodeList childNodes = marker.getChildNodes();
+                            for (int ci = 0; ci < childNodes.getLength(); ci++) {
+                                Node child = childNodes.item(ci);
+                                if (child.getNodeType() != Node.ELEMENT_NODE) continue;
                                 Element comp = (Element) child;
-                                if (comp.getAttribute("componentId").equals("1")
-                                        || comp.getAttribute("componentId").equals("2")) {
-                                    comp.setAttribute("HsamplingFactor", "1");
-                                    comp.setAttribute("VsamplingFactor", "1");
-                                } else if (comp.getAttribute("componentId").equals("0")) {
+                                int compId;
+                                try {
+                                    compId = Integer.parseInt(comp.getAttribute("componentId"));
+                                } catch (NumberFormatException e) {
+                                    continue;
+                                }
+                                if (compId < 0 || compId >= numComponents) continue;
+                                if (compId == 0) {
                                     comp.setAttribute("HsamplingFactor", "2");
                                     comp.setAttribute("VsamplingFactor", "2");
+                                } else {
+                                    comp.setAttribute("HsamplingFactor", "1");
+                                    comp.setAttribute("VsamplingFactor", "1");
                                 }
                             }
                         }
                     }
+                    meta.setFromTree("javax_imageio_jpeg_image_1.0", tree);
+                } catch (Exception e) {
+                    // Unexpected metadata tree — keep the writer's default subsampling.
                 }
-                meta.setFromTree("javax_imageio_jpeg_image_1.0", tree);
             }
 
             ByteArrayOutputStream baos = new ByteArrayOutputStream(8192);
@@ -403,37 +421,8 @@ public class PDFAssembler {
             }
 
             // Layer 3: invisible OCR text
-            float scaleX = pageW / ocr.getWidth();
-            float scaleY = pageH / ocr.getHeight();
             PDFont pageFont = resolveFont(output);
-            cs.beginText();
-            cs.setFont(pageFont, minFontSize);
-            cs.setRenderingMode(RenderingMode.NEITHER);
-
-            for (TextBlock tb : ocr.getTextBlocks()) {
-                float x = tb.getBbox().x * scaleX;
-                float y = pageH - (tb.getBbox().y + tb.getBbox().height * baselineRatio(tb)) * scaleY;
-                float fontSize = Math.max(tb.getBbox().height * scaleY, minFontSize);
-                cs.setFont(pageFont, fontSize);
-                // Word-level scaling: uniform horizontal stretch to fill bbox
-                float naturalWidth;
-                try {
-                    naturalWidth = pageFont.getStringWidth(tb.getWord()) / 1000f * fontSize;
-                } catch (IllegalArgumentException e) {
-                    naturalWidth = tb.getWord().length() * fontSize * 0.5f;
-                }
-                float targetWidth = tb.getBbox().width * scaleX;
-                float sx = naturalWidth > 0 ? targetWidth / naturalWidth : 1.0f;
-                cs.setTextMatrix(Matrix.concatenate(
-                    Matrix.getTranslateInstance(x, y),
-                    Matrix.getScaleInstance(sx, 1)));
-                try {
-                    cs.showText(tb.getWord());
-                } catch (Exception e) {
-                    skippedGlyphCount++;
-                }
-            }
-            cs.endText();
+            writeTextLayer(cs, ocr, pageW, pageH, pageFont);
         }
 
         return outPage;
@@ -466,7 +455,7 @@ public class PDFAssembler {
         dynamicFont = null;
         jbig2GlobalStream = null;
         if (skippedGlyphCount > 0) {
-            System.out.printf("  Warning: %d words skipped — unsupported glyphs for font.%n", skippedGlyphCount);
+            System.out.printf("  Warning: %d characters dropped from invisible text layer — unsupported glyphs for font.%n", skippedGlyphCount);
             System.out.println("  Set pdf.fontPath in settings.jsonc to a CJK TTF/OTF file (e.g., NotoSansCJKsc-Regular.otf).");
             skippedGlyphCount = 0;
         }
@@ -547,40 +536,78 @@ public class PDFAssembler {
             }
 
             // Layer 3: invisible OCR text
-            float scaleX = pageW / ocr.getWidth();
-            float scaleY = pageH / ocr.getHeight();
             PDFont pageFont = resolveFont(output);
-            cs.beginText();
-            cs.setFont(pageFont, minFontSize);
-            cs.setRenderingMode(RenderingMode.NEITHER);
+            writeTextLayer(cs, ocr, pageW, pageH, pageFont);
+        }
 
-            for (TextBlock tb : ocr.getTextBlocks()) {
-                float x = tb.getBbox().x * scaleX;
-                float y = pageH - (tb.getBbox().y + tb.getBbox().height * baselineRatio(tb)) * scaleY;
-                float fontSize = Math.max(tb.getBbox().height * scaleY, minFontSize);
-                cs.setFont(pageFont, fontSize);
-                // Word-level scaling: uniform horizontal stretch to fill bbox
-                float naturalWidth;
+        return outPage;
+    }
+
+    /**
+     * Draws the invisible, searchable text layer for a page.
+     *
+     * Each word is stretched horizontally to fill its detected bounding box, so
+     * the extracted text stays aligned with the visual text in the background.
+     * Characters the current font cannot encode are dropped individually rather
+     * than skipping the whole word, so a single unsupported glyph (emoji, rare
+     * symbol) no longer removes the rest of the word from the searchable layer.
+     */
+    private void writeTextLayer(PDPageContentStream cs, PageResult ocr,
+                                float pageW, float pageH, PDFont pageFont) throws IOException {
+        float scaleX = pageW / ocr.getWidth();
+        float scaleY = pageH / ocr.getHeight();
+        cs.beginText();
+        cs.setFont(pageFont, minFontSize);
+        cs.setRenderingMode(RenderingMode.NEITHER);
+
+        for (TextBlock tb : ocr.getTextBlocks()) {
+            float x = tb.getBbox().x * scaleX;
+            float y = pageH - (tb.getBbox().y + tb.getBbox().height * baselineRatio(tb)) * scaleY;
+            float fontSize = Math.max(tb.getBbox().height * scaleY, minFontSize);
+            cs.setFont(pageFont, fontSize);
+
+            String safeWord = filterSupportedChars(pageFont, tb.getWord());
+
+            // Word-level scaling: uniform horizontal stretch to fill bbox
+            float naturalWidth;
+            try {
+                naturalWidth = pageFont.getStringWidth(safeWord) / 1000f * fontSize;
+            } catch (IllegalArgumentException e) {
+                naturalWidth = safeWord.length() * fontSize * 0.5f;
+            }
+            float targetWidth = tb.getBbox().width * scaleX;
+            float sx = naturalWidth > 0 ? targetWidth / naturalWidth : 1.0f;
+            cs.setTextMatrix(Matrix.concatenate(
+                Matrix.getTranslateInstance(x, y),
+                Matrix.getScaleInstance(sx, 1)));
+            if (!safeWord.isEmpty()) {
                 try {
-                    naturalWidth = pageFont.getStringWidth(tb.getWord()) / 1000f * fontSize;
-                } catch (IllegalArgumentException e) {
-                    naturalWidth = tb.getWord().length() * fontSize * 0.5f;
-                }
-                float targetWidth = tb.getBbox().width * scaleX;
-                float sx = naturalWidth > 0 ? targetWidth / naturalWidth : 1.0f;
-                cs.setTextMatrix(Matrix.concatenate(
-                    Matrix.getTranslateInstance(x, y),
-                    Matrix.getScaleInstance(sx, 1)));
-                try {
-                    cs.showText(tb.getWord());
+                    cs.showText(safeWord);
                 } catch (Exception e) {
                     skippedGlyphCount++;
                 }
             }
-            cs.endText();
         }
+        cs.endText();
+    }
 
-        return outPage;
+    /**
+     * Returns the characters of {@code word} that {@code font} can encode,
+     * dropping the rest. Unsupported characters are counted in
+     * {@link #skippedGlyphCount}.
+     */
+    private String filterSupportedChars(PDFont font, String word) {
+        StringBuilder sb = new StringBuilder(word.length());
+        for (int i = 0; i < word.length(); i++) {
+            String ch = word.substring(i, i + 1);
+            try {
+                font.encode(ch);
+                sb.append(ch);
+            } catch (Exception e) {
+                skippedGlyphCount++;
+            }
+        }
+        return sb.toString();
     }
 
     private static float baselineRatio(TextBlock tb) {

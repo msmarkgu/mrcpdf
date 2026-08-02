@@ -11,8 +11,9 @@ import java.util.List;
  * Tracks temporary files created during a pipeline run and provides
  * a single cleanup() call to delete them all.
  *
- * Each file is also registered with deleteOnExit() as a safety net
- * in case cleanup() is not called (e.g., JVM crash).
+ * Callers are responsible for invoking {@link #cleanup()} (e.g. from a
+ * finally block); files are not registered with deleteOnExit() so the
+ * class stays safe for long-running processes.
  */
 public class TempFileManager {
 
@@ -28,7 +29,6 @@ public class TempFileManager {
     public File createTempFile(String prefix, String suffix) throws IOException {
         Files.createDirectories(Path.of("temp"));
         File f = Files.createTempFile(Path.of("temp"), prefix, suffix).toFile();
-        f.deleteOnExit();
         tempFiles.add(f);
         return f;
     }
