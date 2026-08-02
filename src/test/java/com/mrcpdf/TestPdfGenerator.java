@@ -25,8 +25,7 @@ import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecification;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile;
-import org.apache.pdfbox.pdmodel.font.PDType1Font;
-import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.apache.pdfbox.pdmodel.font.PDType0Font;
 import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.graphics.state.RenderingMode;
@@ -109,6 +108,11 @@ public class TestPdfGenerator implements Callable<Integer> {
         Graphics2D g = img.createGraphics();
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
                 RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+        // Match PDF text-matrix metrics so the raster width equals the invisible
+        // layer's advance widths (integer glyph rounding would make the visual
+        // text narrower, re-creating a growing hit-box mismatch).
+        g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS,
+                RenderingHints.VALUE_FRACTIONALMETRICS_ON);
         g.setColor(Color.BLACK);
         return g;
     }
@@ -600,12 +604,17 @@ public class TestPdfGenerator implements Callable<Integer> {
 
         Path path = OUT_DIR.resolve("scanned-text.pdf");
         try (PDDocument doc = new PDDocument()) {
+            // Layer font must be the same DejaVu font used to rasterize the
+            // visible text, otherwise the searchable layer drifts horizontally.
+            PDType0Font layerFont = PDType0Font.load(doc, new File(FONT_PATH));
             for (List<String> lines : pages) {
                 // 1. Grayscale "scan" background
                 BufferedImage img = new BufferedImage(W, H, BufferedImage.TYPE_BYTE_GRAY);
                 Graphics2D g = img.createGraphics();
                 g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
                         RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS,
+                        RenderingHints.VALUE_FRACTIONALMETRICS_ON);
                 g.setColor(Color.WHITE);
                 g.fillRect(0, 0, W, H);
                 g.setColor(Color.BLACK);
@@ -624,7 +633,7 @@ public class TestPdfGenerator implements Callable<Integer> {
                 try (PDPageContentStream cs = new PDPageContentStream(doc, pdPage)) {
                     cs.drawImage(pdImg, 0, 0, W, H);
                     cs.beginText();
-                    cs.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 14);
+                    cs.setFont(layerFont, 14);
                     cs.setRenderingMode(RenderingMode.NEITHER);
                     y = MARGIN;
                     for (String line : lines) {
@@ -653,6 +662,7 @@ public class TestPdfGenerator implements Callable<Integer> {
 
         Path path = OUT_DIR.resolve("all-features.pdf");
         try (PDDocument doc = new PDDocument()) {
+            PDType0Font layerFont = PDType0Font.load(doc, new File(FONT_PATH));
             PDDocumentInformation info = doc.getDocumentInformation();
             info.setTitle("All Features Test Document");
             info.setAuthor("MrcPdf Test Suite");
@@ -665,6 +675,8 @@ public class TestPdfGenerator implements Callable<Integer> {
                 Graphics2D g = img.createGraphics();
                 g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
                         RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS,
+                        RenderingHints.VALUE_FRACTIONALMETRICS_ON);
                 g.setColor(Color.WHITE);
                 g.fillRect(0, 0, W, H);
                 g.setColor(Color.BLACK);
@@ -683,7 +695,7 @@ public class TestPdfGenerator implements Callable<Integer> {
                 try (PDPageContentStream cs = new PDPageContentStream(doc, pdPage)) {
                     cs.drawImage(pdImg, 0, 0, W, H);
                     cs.beginText();
-                    cs.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 14);
+                    cs.setFont(layerFont, 14);
                     cs.setRenderingMode(RenderingMode.NEITHER);
                     y = MARGIN;
                     for (String line : lines) {

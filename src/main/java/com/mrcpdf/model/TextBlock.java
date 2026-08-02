@@ -10,8 +10,9 @@ import java.util.List;
  * bbox           Bounding box in pixel coordinates
  *                (x, y, width, height; origin at top-left of the page image).
  * confidence     Tesseract's confidence score (0.0 = low, 100.0 = high).
- * charPositions  Per-character source positions in PDF points
- *                ({x, y, width, height} per char), or null when unavailable.
+ * charPositions  Per-character source positions in image pixels, same units as
+ *                bbox ({x, y, width, height} per char; y = baseline,
+ *                top-left origin), or null when unavailable.
  */
 public class TextBlock {
 

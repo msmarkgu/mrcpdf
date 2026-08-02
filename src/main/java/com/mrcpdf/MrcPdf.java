@@ -21,7 +21,6 @@ import javax.imageio.ImageIO;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
-import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
@@ -228,7 +227,8 @@ public class MrcPdf implements Callable<Integer> {
                                     new File(tempDir, "bg-" + pageIdx + ".bmp"));
 
                             // Extract existing text (no OCR — source must be searchable)
-                            PageResult r = TextPositionCollector.extractPage(source, pageIdx, dpi);
+                            PageResult r = TextPositionCollector.extractPage(source, pageIdx, dpi,
+                                    page.getWidth(), page.getHeight());
                             double elapsed = (System.nanoTime() - localStart) / 1e9;
                             double cumulative = (System.nanoTime() - pipelineStart) / 1e9;
                             System.out.printf(perPageFmt, pageIdx + 1, pageIdx + 1,
@@ -401,15 +401,16 @@ public class MrcPdf implements Callable<Integer> {
             chars = new ArrayList<>();
         }
 
-        static PageResult extractPage(PDDocument doc, int pageIdx, float dpi) throws IOException {
+        static PageResult extractPage(PDDocument doc, int pageIdx, float dpi,
+                                      int imgW, int imgH) throws IOException {
             TextPositionCollector c = new TextPositionCollector();
             c.setStartPage(pageIdx + 1);
             c.setEndPage(pageIdx + 1);
             c.writeText(doc, new StringWriter());
-            PDPage pdPage = doc.getPage(pageIdx);
-            PDRectangle cb = pdPage.getCropBox();
-            int imgW = Math.round(cb.getWidth() * dpi / 72f);
-            int imgH = Math.round(cb.getHeight() * dpi / 72f);
+            // imgW/imgH are the dimensions of the rendered background image
+            // (which already includes any page rotation swap). Using the actual
+            // rendered dimensions keeps the text-layer scale factors consistent
+            // with the background regardless of rotation or rounding.
             return new PageResult(pageIdx, imgW, imgH, c.buildWordBlocks(dpi));
         }
 
@@ -505,6 +506,7 @@ public class MrcPdf implements Callable<Integer> {
             StringBuilder sb = new StringBuilder();
             float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE;
             float maxX = Float.MIN_VALUE, maxY = Float.MIN_VALUE;
+            float scale = dpi / 72f;
             List<float[]> charPosList = new ArrayList<>();
             for (CharPos cp : word) {
                 sb.append(cp.text);
@@ -512,11 +514,13 @@ public class MrcPdf implements Callable<Integer> {
                 minY = Math.min(minY, cp.y);
                 maxX = Math.max(maxX, cp.x + cp.width);
                 maxY = Math.max(maxY, cp.y + cp.height);
-                charPosList.add(new float[]{cp.x, cp.y, cp.width, cp.height});
+                charPosList.add(new float[]{cp.x * scale, cp.y * scale,
+                        cp.width * scale, cp.height * scale});
             }
-            float scale = dpi / 72f;
             int px = Math.round(minX * scale);
-            // bbox.y = top of character in image pixels (top-left origin, y increases downward)
+            // bbox.y = topmost baseline in image pixels (top-left origin, y increases
+            // downward); charPositions are stored in the same pixel units so that
+            // baselineRatio() compares like with like.
             int py = Math.round(minY * scale);
             int pw = Math.round((maxX - minX) * scale);
             int ph = Math.round((maxY - minY) * scale);
