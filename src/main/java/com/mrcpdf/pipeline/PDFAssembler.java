@@ -11,11 +11,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
-import java.util.stream.Collectors;
 
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
@@ -51,8 +49,6 @@ import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.apache.pdfbox.pdmodel.graphics.color.PDOutputIntent;
 import org.apache.pdfbox.pdmodel.graphics.image.CCITTFactory;
-import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
-import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.graphics.state.RenderingMode;
 import org.apache.pdfbox.util.Matrix;
@@ -63,7 +59,6 @@ import org.w3c.dom.NodeList;
 
 import com.mrcpdf.model.PageResult;
 import com.mrcpdf.model.TextBlock;
-import com.mrcpdf.util.Settings;
 
 /**
  * Re-assembles a searchable PDF from per-page inputs:

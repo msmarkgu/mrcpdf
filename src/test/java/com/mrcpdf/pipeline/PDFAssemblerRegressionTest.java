@@ -2,8 +2,6 @@ package com.mrcpdf.pipeline;
 
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -13,11 +11,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-
-import javax.imageio.ImageIO;
-import javax.imageio.ImageReader;
-import javax.imageio.metadata.IIOMetadata;
-import javax.imageio.stream.ImageInputStream;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.cos.COSBase;
@@ -33,8 +26,6 @@ import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.w3c.dom.Element;
-import org.w3c.dom.NodeList;
 
 import com.mrcpdf.model.PageResult;
 import com.mrcpdf.model.TextBlock;
@@ -106,7 +97,6 @@ class PDFAssemblerRegressionTest {
 
             assertNotNull(content, "Content stream should not be null");
 
-            long tmCount = content.chars().filter(c -> c == 'T').count();
             int actualTmCount = countOperator(content, "Tm");
             assertTrue(actualTmCount >= blocks.size(),
                 "Expected at least " + blocks.size() + " Tm operators "
@@ -321,7 +311,6 @@ class PDFAssemblerRegressionTest {
      */
     @Test
     void addPageJbig2_usesSharedGlobalsReference() throws Exception {
-        File source = createSourcePdf();
         int imgW = PAGE_W;
         int imgH = PAGE_H;
 

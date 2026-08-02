@@ -9,8 +9,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-import javax.imageio.ImageIO;
-
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.graphics.image.CCITTFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
