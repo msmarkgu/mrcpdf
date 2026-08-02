@@ -9,8 +9,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-import javax.imageio.ImageIO;
-
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.graphics.image.CCITTFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
@@ -199,10 +197,12 @@ public class JBIG2Compressor {
     private CompressionResult compressWithJbig2enc(File jbig2enc, BufferedImage mask) throws IOException {
         Files.createDirectories(Path.of("temp"));
         File tempBmp = Files.createTempFile(Path.of("temp"), "mrcpdf-jbig2-", ".bmp").toFile();
-        tempBmp.deleteOnExit();
-        javax.imageio.ImageIO.write(mask, "bmp", tempBmp);
 
         try {
+            // Write the mask inside the try so the finally block always cleans up,
+            // even if ImageIO.write fails (no deleteOnExit / global shutdown hook).
+            javax.imageio.ImageIO.write(mask, "bmp", tempBmp);
+
             String prefix = tempBmp.getAbsolutePath().replaceAll("\\.bmp$", "");
 
             String flags = Settings.getInstance().getString("jbig2enc.flags", "-p -s");

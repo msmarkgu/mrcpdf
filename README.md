@@ -99,6 +99,25 @@ Each page is re-encoded as three layers:
 
 Because the mask supplies the sharp text and the background supplies the smooth content, file size drops dramatically with no visible quality loss.
 
+<details>
+<summary>How JBIG2 compression works</summary>
+
+JBIG2 (ISO/IEC 14492) is a lossy bitonal compression standard built for scanned text. mrcpdf feeds the binary foreground mask to the bundled `jbig2enc` binary (via `JBIG2Compressor`).
+
+- **Symbol modeling** — the encoder extracts each connected black component (a character, or pieces of merged characters) and clusters them into a **symbol dictionary** of distinct glyph shapes. A page with thousands of characters typically reduces to a few dozen unique symbols.
+- **Symbol matching** — each region is then encoded as a reference to the closest dictionary symbol (by ID + position offset), a **refinement** (deltas from a similar symbol), or raw pattern bits when no match is good enough.
+- **Shared dictionary across pages** — one jbig2enc invocation over all pages (`-p -s` flags, configurable via `jbig2enc.flags` in settings.jsonc) builds a single **global symbol dictionary** reused by every page. Forms and reports that reuse the same glyphs shrink dramatically because each symbol is stored only once.
+- **Adaptive arithmetic coding** — symbol IDs, offsets, and refinement bits are entropy-coded with a context-adaptive arithmetic coder that learns local probability models, squeezing near the theoretical limit.
+- **Lossiness** — near-identical symbols are treated as identical, so the output is visually lossless but not bit-identical: slightly different instantiations of a glyph may be swapped for one canonical shape.
+
+The compressed stream (global symbol segment + per-page segments) is embedded as a PDF ImageMask and drawn in black over the JPEG background, restoring razor-sharp text at full resolution.
+
+If `jbig2enc` is unavailable or fails, mrcpdf falls back to **CCITT G4** (fax) compression — the same bitonal idea but with no symbol modeling, so output is larger.
+
+</details>
+
+<br>
+
 > Note: mrcpdf re-embeds text extracted from the source PDF. If the source has no text layer (e.g. a raw scan), pages are still MRC-compressed but carry no invisible text — there is no OCR.
 
 ---

@@ -16,6 +16,7 @@ public class SegmentedImage {
     private final BufferedImage foregroundMask;
     private final BufferedImage cleanedBackground;
 
+    /** Holds the two MRC visual layers produced by ImageSegmenter.segment(). */
     public SegmentedImage(BufferedImage foregroundMask, BufferedImage cleanedBackground) {
         this.foregroundMask = foregroundMask;
         this.cleanedBackground = cleanedBackground;

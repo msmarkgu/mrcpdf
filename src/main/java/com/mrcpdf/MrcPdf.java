@@ -21,7 +21,6 @@ import javax.imageio.ImageIO;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
-import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
@@ -228,7 +227,8 @@ public class MrcPdf implements Callable<Integer> {
                                     new File(tempDir, "bg-" + pageIdx + ".bmp"));
 
                             // Extract existing text (no OCR — source must be searchable)
-                            PageResult r = TextPositionCollector.extractPage(source, pageIdx, dpi);
+                            PageResult r = TextPositionCollector.extractPage(source, pageIdx, dpi,
+                                    page.getWidth(), page.getHeight());
                             double elapsed = (System.nanoTime() - localStart) / 1e9;
                             double cumulative = (System.nanoTime() - pipelineStart) / 1e9;
                             System.out.printf(perPageFmt, pageIdx + 1, pageIdx + 1,
@@ -279,6 +279,14 @@ public class MrcPdf implements Callable<Integer> {
                 }
 
                 // ── Pass 2: assemble (streaming) ──
+                if (useMrc && jbig2Batch == null) {
+                    // jbig2enc is unavailable, so disable the assembler's per-page
+                    // compressor: without this, addPage() would spawn a failing
+                    // jbig2enc subprocess for every page before falling back to
+                    // CCITT G4. The single-page compress() API stays available
+                    // for embedders/tests.
+                    assembler.setCompressor(null);
+                }
                 System.out.println("  Assembling PDF...");
                 try (PDDocument output = new PDDocument()) {
                     List<PDPage> outPages = new ArrayList<>(pageCount);
@@ -393,15 +401,16 @@ public class MrcPdf implements Callable<Integer> {
             chars = new ArrayList<>();
         }
 
-        static PageResult extractPage(PDDocument doc, int pageIdx, float dpi) throws IOException {
+        static PageResult extractPage(PDDocument doc, int pageIdx, float dpi,
+                                      int imgW, int imgH) throws IOException {
             TextPositionCollector c = new TextPositionCollector();
             c.setStartPage(pageIdx + 1);
             c.setEndPage(pageIdx + 1);
             c.writeText(doc, new StringWriter());
-            PDPage pdPage = doc.getPage(pageIdx);
-            PDRectangle cb = pdPage.getCropBox();
-            int imgW = Math.round(cb.getWidth() * dpi / 72f);
-            int imgH = Math.round(cb.getHeight() * dpi / 72f);
+            // imgW/imgH are the dimensions of the rendered background image
+            // (which already includes any page rotation swap). Using the actual
+            // rendered dimensions keeps the text-layer scale factors consistent
+            // with the background regardless of rotation or rounding.
             return new PageResult(pageIdx, imgW, imgH, c.buildWordBlocks(dpi));
         }
 
@@ -428,19 +437,40 @@ public class MrcPdf implements Callable<Integer> {
 
             List<List<CharPos>> lines = new ArrayList<>();
             List<CharPos> currentLine = new ArrayList<>();
-            float lineY = chars.get(0).y;
             float[] heights = new float[chars.size()];
             for (int i = 0; i < chars.size(); i++) heights[i] = chars.get(i).height;
             java.util.Arrays.sort(heights);
-            float medianHeight = heights[heights.length / 2];
-            float lineThreshold = medianHeight * 0.5f;
+            float pageMedianHeight = heights[heights.length / 2];
+
+            // Anchor each line to the RUNNING MEAN baseline of its characters,
+            // not a fixed first-char anchor: a slightly raised first glyph (e.g. a
+            // superscript) no longer forces the rest of the line to split off, and
+            // slowly drifting baselines (curved scans) stay one line. The threshold
+            // is adaptive — the larger of the page-wide median and the current
+            // line's mean height — so smaller sub/superscript glyphs merge into
+            // their line while genuinely distant lines still split.
+            float lineMeanY = 0f;
+            float lineMeanHeight = 0f;
+            int lineCount = 1;
             for (CharPos cp : chars) {
-                if (Math.abs(cp.y - lineY) > lineThreshold) {
-                    if (!currentLine.isEmpty()) {
+                if (currentLine.isEmpty()) {
+                    // First char of a line: establishes its baseline anchor.
+                    lineMeanY = cp.y;
+                    lineMeanHeight = cp.height;
+                    lineCount = 1;
+                } else {
+                    float threshold = 0.5f * Math.max(pageMedianHeight, lineMeanHeight);
+                    if (Math.abs(cp.y - lineMeanY) > threshold) {
                         lines.add(currentLine);
+                        currentLine = new ArrayList<>();
+                        lineMeanY = cp.y;
+                        lineMeanHeight = cp.height;
+                        lineCount = 1;
+                    } else {
+                        lineMeanY = (lineMeanY * lineCount + cp.y) / (lineCount + 1);
+                        lineMeanHeight = (lineMeanHeight * lineCount + cp.height) / (lineCount + 1);
+                        lineCount++;
                     }
-                    currentLine = new ArrayList<>();
-                    lineY = cp.y;
                 }
                 currentLine.add(cp);
             }
@@ -476,6 +506,7 @@ public class MrcPdf implements Callable<Integer> {
             StringBuilder sb = new StringBuilder();
             float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE;
             float maxX = Float.MIN_VALUE, maxY = Float.MIN_VALUE;
+            float scale = dpi / 72f;
             List<float[]> charPosList = new ArrayList<>();
             for (CharPos cp : word) {
                 sb.append(cp.text);
@@ -483,11 +514,13 @@ public class MrcPdf implements Callable<Integer> {
                 minY = Math.min(minY, cp.y);
                 maxX = Math.max(maxX, cp.x + cp.width);
                 maxY = Math.max(maxY, cp.y + cp.height);
-                charPosList.add(new float[]{cp.x, cp.y, cp.width, cp.height});
+                charPosList.add(new float[]{cp.x * scale, cp.y * scale,
+                        cp.width * scale, cp.height * scale});
             }
-            float scale = dpi / 72f;
             int px = Math.round(minX * scale);
-            // bbox.y = top of character in image pixels (top-left origin, y increases downward)
+            // bbox.y = topmost baseline in image pixels (top-left origin, y increases
+            // downward); charPositions are stored in the same pixel units so that
+            // baselineRatio() compares like with like.
             int py = Math.round(minY * scale);
             int pw = Math.round((maxX - minX) * scale);
             int ph = Math.round((maxY - minY) * scale);

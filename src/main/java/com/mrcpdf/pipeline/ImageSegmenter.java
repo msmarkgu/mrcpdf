@@ -6,25 +6,66 @@ import com.mrcpdf.model.SegmentedImage;
 
 public class ImageSegmenter {
 
+    // tileSize is in image pixels at the rendering DPI (not PDF points): the
+    // side length of each square tile used to estimate the local background.
     private final int tileSize;
     private final double percentile;
+    // inpaintRadius is in image pixels at the rendering DPI: the Manhattan
+    // distance from a foreground pixel to the nearest background pixel up to
+    // which an inpainted color is propagated. Inpainting erases text from the
+    // background layer so the JPEG carries no text detail (see inpaintBackground).
     private final int inpaintRadius;
 
     public ImageSegmenter() {
         this(64, 0.95, 3);
     }
 
+    /**
+     * @param tileSize     side length of the background-normalization grid tiles,
+     *                     in image pixels (default 64)
+     * @param percentile   per-tile background-level percentile (0.0 - 1.0, default 0.95)
+     * @param inpaintRadius inpaint propagation radius, in image pixels (default 3);
+     *                     should be ~1.5x the thickest text stroke
+     */
     public ImageSegmenter(int tileSize, double percentile, int inpaintRadius) {
         this.tileSize = tileSize;
         this.percentile = percentile;
         this.inpaintRadius = inpaintRadius;
     }
 
+    /**
+     * Segments a rendered page image into a foreground mask and a cleaned
+     * background, the two visual layers of MRC compression.
+     *
+     * Algorithm:
+     *   1. Extract the page as ARGB pixels and convert to grayscale using
+     *      ITU-R BT.601 luma (toGrayscale).
+     *   2. Correct non-uniform illumination (shadows, gradients, scanner
+     *      vignetting): divide the page into a grid of tileSize tiles, estimate
+     *      each tile's local background level at the given percentile, build a
+     *      smooth background surface via bilinear interpolation, then stretch
+     *      each pixel: new = old * 255 / bg (backgroundNormalize).
+     *   3. Auto-threshold the normalized image with Otsu's method to separate
+     *      dark foreground (text) from bright background (otsuThreshold).
+     *   4. Build a binary TYPE_BYTE_BINARY foreground mask: black where the
+     *      pixel intensity is <= threshold (text), white elsewhere. This mask
+     *      becomes the JBIG2-compressed foreground layer in the output PDF.
+     *   5. Inpaint the text regions out of the original (color) image by
+     *      propagating surrounding pixel colors inward up to inpaintRadius px
+     *      (two-pass Manhattan distance transform), so the JPEG background
+     *      carries no text detail (inpaintBackground).
+     *   6. Return the pair as a SegmentedImage.
+     */
     public SegmentedImage segment(BufferedImage image) {
         int width = image.getWidth();
         int height = image.getHeight();
 
         int[] origPixels = new int[width * height];
+        // Bulk-copy the whole image into the flat ARGB array in row-major order:
+        // getRGB(x0, y0, w, h, dst, offset, scansize). Here offset=0 starts at
+        // origPixels[0] and scansize=width matches the packed layout, so pixel
+        // (x, y) lands at origPixels[y * width + x]. This avoids per-pixel
+        // getRGB(x, y) overhead; the flat arrays below operate on this copy.
         image.getRGB(0, 0, width, height, origPixels, 0, width);
 
         int[] gray = toGrayscale(origPixels);
@@ -33,6 +74,8 @@ public class ImageSegmenter {
         int threshold = otsuThreshold(bgNormalized);
         int[] maskPixels = new int[width * height];
         for (int i = 0; i < maskPixels.length; i++) {
+            // ARGB ints on the mask: 0xFF000000 = opaque black (text/foreground),
+            // 0xFFFFFFFF = opaque white (background).
             maskPixels[i] = (gray[i] <= threshold) ? 0xFF000000 : 0xFFFFFFFF;
         }
         BufferedImage foregroundMask = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_BINARY);
@@ -241,8 +284,17 @@ public class ImageSegmenter {
     }
 
     /**
-     * Inpaints foreground (text) pixels by propagating background pixel colors
-     * inward using a two-pass Manhattan distance transform.
+     * "Inpaint" fills the foreground (text) pixels with the colors of the
+     * surrounding background, erasing letter shapes from the background layer.
+     * This matters because the background is JPEG-compressed at low quality,
+     * and JPEG smears hard edges — if text strokes remained, JPEG
+     * ringing/block artifacts would appear around characters. Removing them
+     * keeps the smooth background clean to compress; the sharp text lives only
+     * in the lossless JBIG2 foreground mask.
+     *
+     * Implementation: propagates surrounding background pixel colors inward
+     * using a two-pass Manhattan distance transform, up to {@code radius} px;
+     * foreground pixels farther away are set white.
      *
      * This replaces the O(N × R²) brute-force search with O(N) propagation
      * (4-connected manhattan distance to nearest background pixel).
