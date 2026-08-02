@@ -16,8 +16,6 @@ import java.util.List;
 import java.util.Random;
 import java.util.concurrent.Callable;
 
-import javax.imageio.ImageIO;
-
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;

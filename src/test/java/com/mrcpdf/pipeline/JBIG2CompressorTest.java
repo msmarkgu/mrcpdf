@@ -12,7 +12,6 @@ import javax.imageio.ImageIO;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Tests for JBIG2Compressor with synthetic binary images.
