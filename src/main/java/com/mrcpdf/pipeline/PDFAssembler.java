@@ -384,6 +384,16 @@ public class PDFAssembler {
         PDRectangle cropBox = sourcePage.getCropBox();
         float pageW = cropBox.getWidth();
         float pageH = cropBox.getHeight();
+        // The background image is rendered in display orientation, which swaps
+        // width and height for rotated (90/270) pages.  Match those display
+        // dimensions so the background is drawn undistorted and the text-layer
+        // scale factors stay consistent.  The output page keeps /Rotate 0
+        // because the background is already pre-rotated.
+        if (sourcePage.getRotation() % 180 != 0) {
+            float tmp = pageW;
+            pageW = pageH;
+            pageH = tmp;
+        }
 
         // Create page with [0,0,pageW,pageH] so user space origin aligns
         // with the crop-box-relative coordinates from text extraction.
@@ -504,6 +514,14 @@ public class PDFAssembler {
         PDRectangle cropBox = sourcePage.getCropBox();
         float pageW = cropBox.getWidth();
         float pageH = cropBox.getHeight();
+        // Rotated (90/270) pages render in display orientation with swapped
+        // width/height; use those display dimensions so the pre-rotated
+        // background is drawn undistorted and text coordinates stay aligned.
+        if (sourcePage.getRotation() % 180 != 0) {
+            float tmp = pageW;
+            pageW = pageH;
+            pageH = tmp;
+        }
 
         PDPage outPage = new PDPage(new PDRectangle(pageW, pageH));
         output.addPage(outPage);
@@ -564,11 +582,14 @@ public class PDFAssembler {
             float x = tb.getBbox().x * scaleX;
             float y = pageH - (tb.getBbox().y + tb.getBbox().height * baselineRatio(tb)) * scaleY;
             float fontSize = Math.max(tb.getBbox().height * scaleY, minFontSize);
-            cs.setFont(pageFont, fontSize);
 
             String safeWord = filterSupportedChars(pageFont, tb.getWord());
 
-            // Word-level scaling: uniform horizontal stretch to fill bbox
+            // Word-level scaling: uniform horizontal stretch to fill bbox.
+            // The stretch is folded into the font size (fontSize * sx) instead
+            // of a text-matrix horizontal scale so that any viewer — whether or
+            // not it applies text-matrix scaling when hit-testing — computes the
+            // same word boxes. The rendered advance widths are identical.
             float naturalWidth;
             try {
                 naturalWidth = pageFont.getStringWidth(safeWord) / 1000f * fontSize;
@@ -577,9 +598,8 @@ public class PDFAssembler {
             }
             float targetWidth = tb.getBbox().width * scaleX;
             float sx = naturalWidth > 0 ? targetWidth / naturalWidth : 1.0f;
-            cs.setTextMatrix(Matrix.concatenate(
-                Matrix.getTranslateInstance(x, y),
-                Matrix.getScaleInstance(sx, 1)));
+            cs.setFont(pageFont, fontSize * sx);
+            cs.setTextMatrix(Matrix.getTranslateInstance(x, y));
             if (!safeWord.isEmpty()) {
                 try {
                     cs.showText(safeWord);
@@ -613,15 +633,18 @@ public class PDFAssembler {
     private static float baselineRatio(TextBlock tb) {
         List<float[]> positions = tb.getCharPositions();
         if (positions != null && !positions.isEmpty()) {
-            float[] bottoms = new float[positions.size()];
+            float[] baselines = new float[positions.size()];
             for (int i = 0; i < positions.size(); i++) {
-                float[] c = positions.get(i);
-                bottoms[i] = c[1] + c[3];
+                baselines[i] = positions.get(i)[1];
             }
-            Arrays.sort(bottoms);
-            float median = bottoms[bottoms.length / 2];
+            Arrays.sort(baselines);
+            float median = baselines[baselines.length / 2];
+            // bbox.y is the topmost baseline in pixels; place the drawn baseline
+            // at the median baseline so uniform lines land exactly on the source
+            // baseline (ratio ~0) and words with a raised/dropped glyph stay on
+            // their main baseline.
             float ratio = (median - tb.getBbox().y) / (float) tb.getBbox().height;
-            return Math.max(0.5f, Math.min(1.0f, ratio));
+            return Math.max(0f, Math.min(1.0f, ratio));
         }
         String word = tb.getWord();
         for (int i = 0; i < word.length(); i++) {
