@@ -20,7 +20,7 @@ cd mrcpdf
 A pure-MRC PDF compressor split out of the [TrulyFreeOCR](https://github.com/msmarkgu/TrulyFreeOCR) project (OCR removed — no Tesseract, no PaddleOCR, no GPU, no cloud):
 
 - **Visually lossless** — MRC splits each page into a background JPEG (downsampled + smoothed) and a razor-sharp JBIG2/CCITT foreground mask, so text stays pixel-crisp while the background compresses heavily.
-- **Preserves content** — existing text is re-embedded as an invisible searchable layer; bookmarks, annotations, and embedded attachments are deep-copied into the output.
+- **Preserves content** — existing text is re-embedded as an invisible searchable layer; bookmarks, annotations, and embedded attachments are deep-copied into the output. Optional `--fg-color` keeps original text colors in the visual layer.
 - **Business-friendly license** — Apache 2.0, no disclosure obligations. All runtime dependencies are permissively licensed.
 - **Self-contained** — single fat JAR + `bootstrap.sh`/`bootstrap.bat`. JDK, Gradle, and the JBIG2 native binary are all project-local. No sudo, no Python, no system deps. Copy the folder and it runs anywhere.
 - **No cloud / no GPU** — CPU-only, fully offline, zero data leaves the machine.
@@ -82,6 +82,7 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--bg-scale <0.1-1.0>` | Background downscale factor (default 0.33). |
 | `--jpeg-quality <0.1-1.0>` | Background JPEG quality when a mask is present (default 0.50). |
 | `--pdfa` | Enable PDF/A-2b output (XMP metadata, sRGB OutputIntent). |
+| `--fg-color` | Re-render the foreground in the source's true text colors via a soft-mask color layer. Off by default; not compatible with `--pdfa`. |
 | `--threads <n>` | Worker threads for page prep (default: available processors). |
 | `--settings <file>` | Path to `settings.jsonc` (default `./settings.jsonc`). |
 
@@ -91,10 +92,10 @@ The jbig2enc binary and CJK font bundled in `deps/` are used automatically; all 
 
 ## Mixed Raster Content (MRC) Compression
 
-Each page is re-encoded as three layers:
+Each page is re-encoded as three layers (a fourth, optional color layer, with `--fg-color`):
 
 1. **Background** — the cleaned page image: downsampled (3× by default), mildly blurred, and JPEG-compressed at 4:2:0 chroma subsampling. Text regions are inpainted away so the JPEG carries almost no text detail.
-2. **Foreground mask** — a binary stencil of the text pixels, compressed with **JBIG2** (shared symbol dictionary across all pages) or CCITT G4 fallback. Drawn as a PDF ImageMask in black, it restores text at full resolution.
+2. **Foreground mask** — a binary stencil of the text pixels, compressed with **JBIG2** (shared symbol dictionary across all pages) or CCITT G4 fallback. Drawn as a PDF ImageMask (black by default, or in the source's true text colors with `--fg-color`), it restores text at full resolution.
 3. **Text layer** — the source PDF's existing text, re-positioned word-by-word as invisible (`RenderingMode.NEITHER`) searchable text.
 
 Because the mask supplies the sharp text and the background supplies the smooth content, file size drops dramatically with no visible quality loss.
@@ -110,7 +111,7 @@ JBIG2 (ISO/IEC 14492) is a lossy bitonal compression standard built for scanned 
 - **Adaptive arithmetic coding** — symbol IDs, offsets, and refinement bits are entropy-coded with a context-adaptive arithmetic coder that learns local probability models, squeezing near the theoretical limit.
 - **Lossiness** — near-identical symbols are treated as identical, so the output is visually lossless but not bit-identical: slightly different instantiations of a glyph may be swapped for one canonical shape.
 
-The compressed stream (global symbol segment + per-page segments) is embedded as a PDF ImageMask and drawn in black over the JPEG background, restoring razor-sharp text at full resolution.
+The compressed stream (global symbol segment + per-page segments) is embedded as a PDF ImageMask and drawn over the JPEG background — in black by default, or in the source's true text colors when `--fg-color` is set — restoring razor-sharp text at full resolution.
 
 If `jbig2enc` is unavailable or fails, mrcpdf falls back to **CCITT G4** (fax) compression — the same bitonal idea but with no symbol modeling, so output is larger.
 
@@ -134,7 +135,7 @@ If `jbig2enc` is unavailable or fails, mrcpdf falls back to **CCITT G4** (fax) c
 | Page size / orientation | ✅ Preserved (per crop box) |
 
 ### Known limitations
-- The invisible text layer is re-rendered with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family, size styling, and color are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected.
+- The invisible text layer is re-rendered with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family and size styling are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected. Text color is preserved in the visual layer when `--fg-color` is enabled.
 - Annotation destinations and named destinations are kept but not remapped to the new document; page-number-based links (bookmarks pointing to pages in order) generally still work.
 
 ---
