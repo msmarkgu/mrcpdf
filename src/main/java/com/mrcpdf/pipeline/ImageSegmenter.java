@@ -1,6 +1,8 @@
 package com.mrcpdf.pipeline;
 
 import java.awt.image.BufferedImage;
+import java.util.HashMap;
+import java.util.Map;
 
 import com.mrcpdf.model.SegmentedImage;
 
@@ -14,23 +16,61 @@ public class ImageSegmenter {
     // distance from a foreground pixel to the nearest background pixel up to
     // which an inpainted color is propagated. Inpainting erases text from the
     // background layer so the JPEG carries no text detail (see inpaintBackground).
+    // radius <= 0 means infinite propagation (no white blobs behind thick strokes).
     private final int inpaintRadius;
+    // Thresholding: "sauvola" (default, local adaptive) or "otsu" (global).
+    private final String thresholdMode;
+    private final int sauvolaWindow;
+    private final double sauvolaK;
+    private final int sauvolaR;
+    // Connected-component filtering: components larger than these limits are
+    // treated as pictures/logos and left in the background layer (not masked).
+    // 0 disables that filter.
+    private final double maxComponentArea; // fraction of page area
+    private final double maxComponentDim;  // fraction of the larger page dimension
 
     public ImageSegmenter() {
-        this(64, 0.95, 3);
+        this(64, 0.95, 0);
     }
 
     /**
-     * @param tileSize     side length of the background-normalization grid tiles,
-     *                     in image pixels (default 64)
-     * @param percentile   per-tile background-level percentile (0.0 - 1.0, default 0.95)
-     * @param inpaintRadius inpaint propagation radius, in image pixels (default 3);
-     *                     should be ~1.5x the thickest text stroke
+     * @param tileSize       side length of the background-normalization grid tiles,
+     *                       in image pixels (default 64)
+     * @param percentile     per-tile background-level percentile (0.0 - 1.0, default 0.95)
+     * @param inpaintRadius  inpaint propagation radius, in image pixels; <= 0 means
+     *                       infinite (default)
      */
     public ImageSegmenter(int tileSize, double percentile, int inpaintRadius) {
+        this(tileSize, percentile, inpaintRadius, "sauvola", 15, 0.20, 128, 0.005, 0.10);
+    }
+
+    /**
+     * Full configuration constructor.
+     *
+     * @param tileSize         background-normalization tile side, in image pixels
+     * @param percentile       per-tile background-level percentile (0.0 - 1.0)
+     * @param inpaintRadius    inpaint propagation radius; <= 0 = infinite
+     * @param thresholdMode    "sauvola" (local adaptive, default) or "otsu" (global)
+     * @param sauvolaWindow    Sauvola local window side, in image pixels (default 15)
+     * @param sauvolaK         Sauvola sensitivity factor (default 0.20)
+     * @param sauvolaR         Sauvola dynamic range of the image (default 128)
+     * @param maxComponentArea components above this fraction of page area are dropped
+     *                         from the mask (0 disables)
+     * @param maxComponentDim  components above this fraction of the larger page
+     *                         dimension are dropped from the mask (0 disables)
+     */
+    public ImageSegmenter(int tileSize, double percentile, int inpaintRadius,
+                          String thresholdMode, int sauvolaWindow, double sauvolaK, int sauvolaR,
+                          double maxComponentArea, double maxComponentDim) {
         this.tileSize = tileSize;
         this.percentile = percentile;
         this.inpaintRadius = inpaintRadius;
+        this.thresholdMode = "otsu".equalsIgnoreCase(thresholdMode) ? "otsu" : "sauvola";
+        this.sauvolaWindow = Math.max(1, sauvolaWindow);
+        this.sauvolaK = sauvolaK;
+        this.sauvolaR = Math.max(1, sauvolaR);
+        this.maxComponentArea = Math.max(0, maxComponentArea);
+        this.maxComponentDim = Math.max(0, maxComponentDim);
     }
 
     /**
@@ -45,16 +85,23 @@ public class ImageSegmenter {
      *      each tile's local background level at the given percentile, build a
      *      smooth background surface via bilinear interpolation, then stretch
      *      each pixel: new = old * 255 / bg (backgroundNormalize).
-     *   3. Auto-threshold the normalized image with Otsu's method to separate
-     *      dark foreground (text) from bright background (otsuThreshold).
-     *   4. Build a binary TYPE_BYTE_BINARY foreground mask: black where the
-     *      pixel intensity is <= threshold (text), white elsewhere. This mask
-     *      becomes the JBIG2-compressed foreground layer in the output PDF.
-     *   5. Inpaint the text regions out of the original (color) image by
+     *   3. Threshold the normalized image to separate dark foreground (text)
+     *      from bright background. Default is local adaptive Sauvola
+     *      thresholding (sauvolaThreshold), which keeps faint text on uneven
+     *      backgrounds; the global Otsu method (otsuThreshold) is available via
+     *      the "otsu" threshold mode.
+     *   4. Drop oversized connected components (photos, logos, halftones) from
+     *      the mask so they stay in the color background instead of polluting
+     *      the JBIG2 dictionary (filterLargeComponents).
+     *   5. Build a binary TYPE_BYTE_BINARY foreground mask: black where the
+     *      pixel is foreground (text), white elsewhere. This mask becomes the
+     *      JBIG2-compressed foreground layer in the output PDF.
+     *   6. Inpaint the text regions out of the original (color) image by
      *      propagating surrounding pixel colors inward up to inpaintRadius px
-     *      (two-pass Manhattan distance transform), so the JPEG background
-     *      carries no text detail (inpaintBackground).
-     *   6. Return the pair as a SegmentedImage.
+     *      (two-pass Manhattan distance transform); radius <= 0 propagates to
+     *      every foreground pixel so no white blobs remain. The JPEG background
+     *      then carries no text detail (inpaintBackground).
+     *   7. Return the pair as a SegmentedImage.
      */
     public SegmentedImage segment(BufferedImage image) {
         int width = image.getWidth();
@@ -71,12 +118,30 @@ public class ImageSegmenter {
         int[] gray = toGrayscale(origPixels);
         int[] bgNormalized = backgroundNormalize(gray, width, height, tileSize);
 
-        int threshold = otsuThreshold(bgNormalized);
+        // Phase 1: binary classification into foreground (1) / background (0)
+        int[] binary = new int[width * height];
+        if ("otsu".equals(thresholdMode)) {
+            int threshold = otsuThreshold(bgNormalized);
+            for (int i = 0; i < binary.length; i++) {
+                binary[i] = (gray[i] <= threshold) ? 1 : 0;
+            }
+        } else {
+            int[] thresholds = sauvolaThreshold(bgNormalized, width, height, sauvolaWindow, sauvolaK, sauvolaR);
+            for (int i = 0; i < binary.length; i++) {
+                binary[i] = (bgNormalized[i] <= thresholds[i]) ? 1 : 0;
+            }
+        }
+
+        // Phase 2: drop oversized components (photos/logos) from the mask
+        if (maxComponentArea > 0 || maxComponentDim > 0) {
+            filterLargeComponents(binary, width, height, maxComponentArea, maxComponentDim);
+        }
+
         int[] maskPixels = new int[width * height];
         for (int i = 0; i < maskPixels.length; i++) {
             // ARGB ints on the mask: 0xFF000000 = opaque black (text/foreground),
             // 0xFFFFFFFF = opaque white (background).
-            maskPixels[i] = (gray[i] <= threshold) ? 0xFF000000 : 0xFFFFFFFF;
+            maskPixels[i] = (binary[i] != 0) ? 0xFF000000 : 0xFFFFFFFF;
         }
         BufferedImage foregroundMask = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_BINARY);
         foregroundMask.setRGB(0, 0, width, height, maskPixels, 0, width);
@@ -284,6 +349,178 @@ public class ImageSegmenter {
     }
 
     /**
+     * Sauvola local adaptive thresholding.
+     *
+     * Computes a per-pixel threshold from the mean and standard deviation of a
+     * small window around each pixel, using integral images so the whole page is
+     * O(W×H) regardless of window size. Unlike the global Otsu method this keeps
+     * faint text in low-contrast / unevenly lit regions:
+     *
+     *     threshold = mean * (1 + k * (stddev / R - 1))
+     *
+     * Background pixels (stddev ≈ 0) get threshold ≈ mean * (1 - k), which stays
+     * below a bright uniform background, while dark text far below the local mean
+     * is classified foreground. Returns an int array of thresholds (one per pixel).
+     */
+    private int[] sauvolaThreshold(int[] gray, int width, int height, int window, double k, int r) {
+        // Integral images: sum and sum-of-squares, both long to avoid overflow
+        // (sum of 255 over 8M pixels exceeds int range).
+        long[] integral = new long[width * height];
+        long[] integralSq = new long[width * height];
+        for (int y = 0; y < height; y++) {
+            int row = y * width;
+            long rowSum = 0, rowSumSq = 0;
+            for (int x = 0; x < width; x++) {
+                int v = gray[row + x];
+                rowSum += v;
+                rowSumSq += (long) v * v;
+                long above = y > 0 ? integral[row - width + x] : 0;
+                long aboveSq = y > 0 ? integralSq[row - width + x] : 0;
+                integral[row + x] = rowSum + above;
+                integralSq[row + x] = rowSumSq + aboveSq;
+            }
+        }
+
+        int half = window / 2;
+        int[] thresholds = new int[width * height];
+        for (int y = 0; y < height; y++) {
+            int row = y * width;
+            int y0 = Math.max(0, y - half);
+            int y1 = Math.min(height - 1, y + half);
+            for (int x = 0; x < width; x++) {
+                int x0 = Math.max(0, x - half);
+                int x1 = Math.min(width - 1, x + half);
+
+                long sum = rectSum(integral, x0, y0, x1, y1, width);
+                long sumSq = rectSum(integralSq, x0, y0, x1, y1, width);
+                int count = (x1 - x0 + 1) * (y1 - y0 + 1);
+                double mean = (double) sum / count;
+                double variance = ((double) sumSq / count) - mean * mean;
+                double std = variance > 0 ? Math.sqrt(variance) : 0;
+                thresholds[row + x] = (int) Math.round(mean * (1.0 + k * (std / r - 1.0)));
+            }
+        }
+        return thresholds;
+    }
+
+    private static long rectSum(long[] integral, int x0, int y0, int x1, int y1, int width) {
+        long topLeft = x0 > 0 && y0 > 0 ? integral[(y0 - 1) * width + (x0 - 1)] : 0;
+        long topRight = y0 > 0 ? integral[(y0 - 1) * width + x1] : 0;
+        long bottomLeft = x0 > 0 ? integral[y1 * width + (x0 - 1)] : 0;
+        return integral[y1 * width + x1] - topRight - bottomLeft + topLeft;
+    }
+
+    /**
+     * Removes oversized connected components from the binary mask so that dark
+     * photos, logos and halftone regions stay in the (color) background layer
+     * instead of being binarized into the JBIG2 foreground dictionary.
+     *
+     * A component is dropped when its pixel area exceeds {@code maxComponentArea}
+     * (a fraction of the page area) or either bbox dimension exceeds
+     * {@code maxComponentDim} (a fraction of the larger page dimension). Setting
+     * either limit to 0 disables that criterion.
+     *
+     * Implementation: single-pass union-find labeling (8-connectivity) with one
+     * int array (negative root size), then per-root area/bbox accumulation.
+     */
+    private static void filterLargeComponents(int[] binary, int width, int height,
+                                              double maxComponentArea, double maxComponentDim) {
+        int n = binary.length;
+        // uf[i] < 0 : i is a root, -uf[i] = component size (background uses 0)
+        // uf[i] >= 0: i points at its parent
+        int[] uf = new int[n];
+        for (int y = 0; y < height; y++) {
+            int row = y * width;
+            for (int x = 0; x < width; x++) {
+                int idx = row + x;
+                if (binary[idx] == 0) continue;
+                uf[idx] = -1; // root with size 1
+                if (x > 0 && binary[idx - 1] != 0) union(uf, idx, idx - 1);
+                if (y > 0) {
+                    if (binary[idx - width] != 0) union(uf, idx, idx - width);
+                    if (x > 0 && binary[idx - width - 1] != 0) union(uf, idx, idx - width - 1);
+                    if (x < width - 1 && binary[idx - width + 1] != 0) union(uf, idx, idx - width + 1);
+                }
+            }
+        }
+
+        // Accumulate area + bbox per root
+        Map<Integer, long[]> roots = new HashMap<>();
+        for (int y = 0; y < height; y++) {
+            int row = y * width;
+            for (int x = 0; x < width; x++) {
+                int idx = row + x;
+                if (binary[idx] == 0) continue;
+                int root = find(uf, idx);
+                long[] acc = roots.get(root);
+                if (acc == null) {
+                    // [area, minX, minY, maxX, maxY]
+                    acc = new long[]{0, x, y, x, y};
+                    roots.put(root, acc);
+                }
+                acc[0]++;
+                if (x < acc[1]) acc[1] = x;
+                if (y < acc[2]) acc[2] = y;
+                if (x > acc[3]) acc[3] = x;
+                if (y > acc[4]) acc[4] = y;
+            }
+        }
+
+        long pageArea = (long) width * height;
+        int pageDim = Math.max(width, height);
+        long maxAreaPx = maxComponentArea > 0 ? (long) (pageArea * maxComponentArea) : Long.MAX_VALUE;
+        int maxDimPx = maxComponentDim > 0 ? (int) (pageDim * maxComponentDim) : Integer.MAX_VALUE;
+
+        int[] drop = new int[roots.size()];
+        int dropCount = 0;
+        for (Map.Entry<Integer, long[]> e : roots.entrySet()) {
+            long[] acc = e.getValue();
+            int compW = (int) (acc[3] - acc[1] + 1);
+            int compH = (int) (acc[4] - acc[2] + 1);
+            if (acc[0] > maxAreaPx || Math.max(compW, compH) > maxDimPx) {
+                drop[dropCount++] = e.getKey();
+            }
+        }
+        if (dropCount == 0) return;
+
+        for (int i = 0; i < dropCount; i++) {
+            int root = drop[i];
+            // Null out the root's size so it can never be confused with a live root
+            uf[root] = Integer.MIN_VALUE;
+        }
+
+        for (int i = 0; i < n; i++) {
+            if (binary[i] == 0) continue;
+            if (uf[find(uf, i)] == Integer.MIN_VALUE) binary[i] = 0;
+        }
+    }
+
+    private static int find(int[] uf, int x) {
+        int root = x;
+        while (uf[root] >= 0) root = uf[root];
+        while (uf[x] >= 0) {
+            int next = uf[x];
+            uf[x] = root;
+            x = next;
+        }
+        return root;
+    }
+
+    private static void union(int[] uf, int a, int b) {
+        int ra = find(uf, a);
+        int rb = find(uf, b);
+        if (ra == rb) return;
+        // Union by size: more negative = larger component
+        if (uf[ra] > uf[rb]) {
+            int t = ra;
+            ra = rb;
+            rb = t;
+        }
+        uf[ra] += uf[rb];
+        uf[rb] = ra;
+    }
+
+    /**
      * "Inpaint" fills the foreground (text) pixels with the colors of the
      * surrounding background, erasing letter shapes from the background layer.
      * This matters because the background is JPEG-compressed at low quality,
@@ -293,8 +530,10 @@ public class ImageSegmenter {
      * in the lossless JBIG2 foreground mask.
      *
      * Implementation: propagates surrounding background pixel colors inward
-     * using a two-pass Manhattan distance transform, up to {@code radius} px;
-     * foreground pixels farther away are set white.
+     * using a two-pass Manhattan distance transform. With a positive
+     * {@code radius}, foreground pixels farther away than {@code radius} px are
+     * set white; with {@code radius <= 0} (default) propagation continues to
+     * every foreground pixel, so no white blobs appear behind thick strokes.
      *
      * This replaces the O(N × R²) brute-force search with O(N) propagation
      * (4-connected manhattan distance to nearest background pixel).
@@ -374,7 +613,9 @@ public class ImageSegmenter {
             }
         }
 
-        // Build result: fillColor for foreground (within radius), white for beyond radius, origPixels for background
+        // Build result: fillColor for foreground (within radius), white for
+        // foreground beyond radius when a finite radius is set, origPixels for
+        // background. radius <= 0 propagates to every foreground pixel.
         int[] resultPixels = new int[len];
         for (int i = 0; i < len; i++) {
             if (dist[i] == 0) {
