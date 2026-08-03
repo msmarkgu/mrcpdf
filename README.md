@@ -20,6 +20,7 @@ cd mrcpdf
 A pure-MRC PDF compressor split out of the [TrulyFreeOCR](https://github.com/msmarkgu/TrulyFreeOCR) project (OCR removed — no Tesseract, no PaddleOCR, no GPU, no cloud):
 
 - **Visually lossless** — MRC splits each page into a background JPEG (downsampled + smoothed) and a razor-sharp JBIG2/CCITT foreground mask, so text stays pixel-crisp while the background compresses heavily.
+- **No OCR, no recognition errors** — searchable text is re-used from the source PDF and re-embedded, unlike OCR-based MRC pipelines (e.g. Internet Archive's `archive-pdf-tools`) that run Tesseract and layer in an OCR'd text layer.
 - **Preserves content** — existing text is re-embedded as an invisible searchable layer; bookmarks, annotations, and embedded attachments are deep-copied into the output.
 - **Business-friendly license** — Apache 2.0, no disclosure obligations. All runtime dependencies are permissively licensed.
 - **Self-contained** — single fat JAR + `bootstrap.sh`/`bootstrap.bat`. JDK, Gradle, and the JBIG2 native binary are all project-local. No sudo, no Python, no system deps. Copy the folder and it runs anywhere.
