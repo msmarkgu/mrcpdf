@@ -47,7 +47,8 @@ class SettingsTest {
         assertEquals(300, s.getInt("rendering.dpi", 0));
         assertEquals(0.95, s.getDouble("segmenter.percentile", 0), 1e-9);
         assertEquals(64, s.getInt("segmenter.tileSize", 0));
-        assertEquals(3, s.getInt("segmenter.inpaintRadius", 0));
+        assertEquals(0, s.getInt("segmenter.inpaintRadius", 0),
+            "inpaintRadius <= 0 means infinite inpainting (new default)");
         assertEquals("-p -s", s.getString("jbig2enc.flags", "DEFAULT"));
         assertEquals("HELVETICA", s.getString("pdf.font", "DEFAULT"));
         assertEquals(0.33, s.getDouble("pipeline.mrc.backgroundScale", 0), 1e-9);
