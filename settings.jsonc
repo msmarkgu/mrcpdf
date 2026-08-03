@@ -18,9 +18,37 @@
     // 0.95 = 95th percentile.  Increase for sparse text.
     "segmenter.percentile": 0.95,
 
-    // Inpainting search radius (px) for filling text regions.
-    // Should be ~1.5x the thickest text stroke.
-    "segmenter.inpaintRadius": 3,
+    // Inpainting propagation radius (px) for filling text regions.
+    // <= 0 = infinite (propagate to every foreground pixel; no white blobs).
+    // > 0 = bounded (pixels farther away are filled white).
+    "segmenter.inpaintRadius": 0,
+
+    // Thresholding mode: "sauvola" or "otsu".
+    //   sauvola (default): per-pixel local adaptive threshold from the mean/stddev
+    //     of a small window (sauvolaWindow/K/R). Use for scanned or photographed
+    //     pages with uneven illumination, shadows, gradients, or faint/low-contrast
+    //     text — it keeps thin strokes that a single global threshold would miss.
+    //   otsu: one global threshold over the whole normalized page. Faster, and good
+    //     for clean, uniformly lit, high-contrast pages (printed text on white);
+    //     it tends to drop faint text or over-segment busy backgrounds.
+    // When in doubt, start with sauvola; try otsu if sauvola captures too much
+    // background noise (speckle) on otherwise clean pages.
+    "segmenter.thresholdMode": "sauvola",
+
+    // Sauvola local window side (px). Integral images keep this cheap.
+    "segmenter.sauvolaWindow": 15,
+
+    // Sauvola sensitivity (0.1 - 0.5). Higher = more aggressive foreground.
+    "segmenter.sauvolaK": 0.20,
+
+    // Sauvola dynamic range of the image (typical 128 for 8-bit gray).
+    "segmenter.sauvolaR": 128,
+
+    // Connected-component filtering: dark regions larger than these limits are
+    // treated as pictures/logos and left in the (color) background instead of
+    // the JBIG2 mask. Fractions of page area / larger page dimension. 0 disables.
+    "segmenter.maxComponentArea": 0.005,
+    "segmenter.maxComponentDim": 0.10,
 
     // ===== Pipeline =====
     // Maximum worker threads for page preparation (rendering is always
@@ -52,6 +80,24 @@
     //   0    = no smoothing
     // Safe because text edges come from the mask, not the background.
     "pipeline.mrc.bgSmoothSigma": 0.8,
+
+    // True MRC foreground color plane: the binary mask becomes a soft mask
+    // (SMask) over a downsampled copy of the original page, so text pixels keep
+    // their original color instead of flat black.
+    //   false = black stencil (default, smaller, PDF/A compatible)
+    //   true  = color text (soft masks are NOT allowed in PDF/A-2b)
+    // Override via --fg-color CLI flag.
+    "pipeline.mrc.foregroundColor": false,
+
+    // Downsample factor for the foreground color plane (0.1 - 1.0).
+    //   0.5  = 2x downsampling (default; good balance of size and color fidelity)
+    //   0.25 = 4x downsampling (smaller, but thin dark strokes may wash out)
+    //   1.0  = full resolution (largest file, best fidelity)
+    // The full-res binary mask keeps text edges sharp regardless of this factor.
+    "pipeline.mrc.foregroundScale": 0.5,
+
+    // JPEG quality for the foreground color plane (0.1 - 1.0).
+    "pipeline.mrc.foregroundJpegQuality": 0.7,
 
     // ===== JBIG2 Compression =====
     // Flags passed to the jbig2enc binary.

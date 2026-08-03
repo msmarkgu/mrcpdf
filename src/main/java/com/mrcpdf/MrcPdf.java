@@ -74,6 +74,9 @@ public class MrcPdf implements Callable<Integer> {
     @Option(names = {"--jpeg-quality"}, description = "Background JPEG quality when a foreground mask is present (0.1 - 1.0, default 0.50)")
     private Float jpegQuality;
 
+    @Option(names = {"--fg-color"}, description = "Enable the true MRC foreground color plane (text keeps its original color via a soft mask); not compatible with --pdfa")
+    private Boolean fgColor;
+
     @Option(names = {"--pdfa"}, description = "Enable PDF/A-2b output (XMP metadata, sRGB OutputIntent)")
     private Boolean pdfa;
 
@@ -107,6 +110,15 @@ public class MrcPdf implements Callable<Integer> {
             boolean useMrc = settings.getBoolean("pipeline.mrc.enabled", true);
             boolean usePdfa = pdfa != null ? pdfa : settings.getBoolean("pdf.pdfa.enabled", false);
 
+            // True MRC foreground color plane: soft masks are not allowed in
+            // PDF/A-2b, so force the setting off and warn when both are requested.
+            boolean fgColorEnabled = fgColor != null ? fgColor
+                    : settings.getBoolean("pipeline.mrc.foregroundColor", false);
+            if (usePdfa && fgColorEnabled) {
+                System.out.println("  Note: foreground color layer disabled under PDF/A (soft masks not allowed)");
+                fgColorEnabled = false;
+            }
+
             // Font for the invisible text layer (supports CJK when a TTF/OTF is set)
             String resolvedFontPath = settings.getString("pdf.fontPath", "");
             if (resolvedFontPath.isEmpty() && usePdfa) {
@@ -120,7 +132,13 @@ public class MrcPdf implements Callable<Integer> {
             ImageSegmenter segmenter = new ImageSegmenter(
                     settings.getInt("segmenter.tileSize", 64),
                     settings.getDouble("segmenter.percentile", 0.95),
-                    settings.getInt("segmenter.inpaintRadius", 3)
+                    settings.getInt("segmenter.inpaintRadius", 0),
+                    settings.getString("segmenter.thresholdMode", "sauvola"),
+                    settings.getInt("segmenter.sauvolaWindow", 15),
+                    settings.getDouble("segmenter.sauvolaK", 0.20),
+                    settings.getInt("segmenter.sauvolaR", 128),
+                    settings.getDouble("segmenter.maxComponentArea", 0.005),
+                    settings.getDouble("segmenter.maxComponentDim", 0.10)
             );
             JBIG2Compressor compressor = new JBIG2Compressor(resolvedNative);
             PDFAssembler assembler = new PDFAssembler(
@@ -132,6 +150,9 @@ public class MrcPdf implements Callable<Integer> {
             assembler.setBgSmoothSigma((float) settings.getDouble("pipeline.mrc.bgSmoothSigma", 0.8));
             assembler.setBgJpegQuality(resolvedJpegQuality);
             assembler.setProducer(settings.getString("pdf.producer", "MrcPdf"));
+            assembler.setForegroundColorEnabled(fgColorEnabled);
+            assembler.setFgScale(settings.getDouble("pipeline.mrc.foregroundScale", 0.5));
+            assembler.setFgJpegQuality((float) settings.getDouble("pipeline.mrc.foregroundJpegQuality", 0.7));
 
             // Resolve worker thread count: CLI arg > settings cap > available processors
             int workerThreads;
@@ -143,9 +164,10 @@ public class MrcPdf implements Callable<Integer> {
                 workerThreads = maxThreads > 0 ? Math.min(avail, maxThreads) : avail;
             }
             System.out.println("  Workers: " + workerThreads + " thread(s)");
+            System.out.println("  Foreground: " + (useMrc && fgColorEnabled ? "color layer" : "black stencil"));
 
             runPipeline(inputFile, resolvedOutput, segmenter, compressor, assembler,
-                    useMrc, usePdfa, resolvedDpi, workerThreads, resolvedFontPath);
+                    useMrc, usePdfa, resolvedDpi, workerThreads, resolvedFontPath, fgColorEnabled);
             return 0;
 
         } catch (Exception e) {
@@ -159,7 +181,7 @@ public class MrcPdf implements Callable<Integer> {
                              ImageSegmenter segmenter,
                              JBIG2Compressor compressor, PDFAssembler assembler,
                              boolean useMrc, boolean usePdfa, float dpi,
-                             int workerThreads, String fontPath) throws IOException {
+                             int workerThreads, String fontPath, boolean fgColorEnabled) throws IOException {
         String inputName = inputFile.getName().replaceAll("\\.[^.]+$", "");
         File tempDir = new File("temp/" + inputName + "-" + System.nanoTime());
         tempDir.mkdirs();
@@ -225,6 +247,11 @@ public class MrcPdf implements Callable<Integer> {
                             }
                             ImageIO.write(background, "bmp",
                                     new File(tempDir, "bg-" + pageIdx + ".bmp"));
+                            // Foreground color plane = the original rendered page
+                            if (useMrc && fgColorEnabled) {
+                                ImageIO.write(page, "bmp",
+                                        new File(tempDir, "fg-" + pageIdx + ".bmp"));
+                            }
 
                             // Extract existing text (no OCR — source must be searchable)
                             PageResult r = TextPositionCollector.extractPage(source, pageIdx, dpi,
@@ -293,6 +320,8 @@ public class MrcPdf implements Callable<Integer> {
 
                     for (int i = 0; i < pageCount; i++) {
                         BufferedImage bg = ImageIO.read(new File(tempDir, "bg-" + i + ".bmp"));
+                        BufferedImage fgColor = (useMrc && fgColorEnabled)
+                                ? ImageIO.read(new File(tempDir, "fg-" + i + ".bmp")) : null;
 
                         PDPage outPage;
                         if (jbig2Batch != null && jbig2Batch.getGlobalSym().length > 0) {
@@ -300,11 +329,12 @@ public class MrcPdf implements Callable<Integer> {
                             outPage = assembler.addPageJbig2(output, source, i, bg,
                                     pageData.getData(), jbig2Batch.getGlobalSym(),
                                     pageData.getWidth(), pageData.getHeight(),
+                                    fgColor,
                                     results.get(i));
                         } else if (useMrc) {
                             // CCITT G4 foreground (no shared JBIG2 available)
                             BufferedImage mask = ImageIO.read(new File(tempDir, "mask-" + i + ".bmp"));
-                            outPage = assembler.addPage(output, source, i, bg, mask, results.get(i));
+                            outPage = assembler.addPage(output, source, i, bg, mask, fgColor, results.get(i));
                         } else {
                             outPage = assembler.addPage(output, source, i, bg, null, results.get(i));
                         }

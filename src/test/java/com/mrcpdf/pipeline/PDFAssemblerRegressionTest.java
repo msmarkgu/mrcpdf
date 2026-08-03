@@ -949,7 +949,6 @@ class PDFAssemblerRegressionTest {
         probeMask.setRGB(5, 5, 0xFF000000);
         var probeResult = probe.compress(probeMask);
         assumeTrue(probeResult.isJbig2(), "jbig2enc not available — skipping JBIG2 comparison test");
-
         // Create a 2-page source
         File pdf = new File(tempDir, "jbig2-compare-source.pdf");
         try (PDDocument d = new PDDocument()) {
@@ -996,5 +995,149 @@ class PDFAssemblerRegressionTest {
         assertTrue(jbig2File.length() < ccittFile.length(),
             "JBIG2 output (" + jbig2File.length() + " bytes) should be smaller than CCITT ("
             + ccittFile.length() + " bytes) for multi-page with repeated content");
+    }
+
+    /**
+     * True MRC foreground color plane: with foreground color enabled, the text
+     * rendered by the output must carry the original foreground color (red here)
+     * rather than the flat black stencil, and the foreground image XObject must
+     * reference a /SMask.
+     */
+    @Test
+    void foregroundColorMode_textRendersInSourceColor() throws IOException {
+        int imgW = 200;
+        int imgH = 100;
+
+        // Background: white — the downsampled JPEG stays near-white.
+        BufferedImage bg = new BufferedImage(imgW, imgH, BufferedImage.TYPE_3BYTE_BGR);
+        java.awt.Graphics2D g = bg.createGraphics();
+        g.setColor(java.awt.Color.WHITE);
+        g.fillRect(0, 0, imgW, imgH);
+        g.dispose();
+
+        // Foreground color plane: solid red (only text pixels show through the mask).
+        BufferedImage fgColor = new BufferedImage(imgW, imgH, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D cg = fgColor.createGraphics();
+        cg.setColor(java.awt.Color.RED);
+        cg.fillRect(0, 0, imgW, imgH);
+        cg.dispose();
+
+        // Mask: text rectangle opaque, rest transparent.
+        BufferedImage fgMask = new BufferedImage(imgW, imgH, BufferedImage.TYPE_BYTE_BINARY);
+        java.awt.Graphics2D mg = fgMask.createGraphics();
+        mg.setColor(java.awt.Color.WHITE);
+        mg.fillRect(0, 0, imgW, imgH);
+        mg.setColor(java.awt.Color.BLACK);
+        mg.fillRect(20, 20, 60, 30);
+        mg.dispose();
+
+        File source = createSourcePdf();
+        List<TextBlock> blocks = Collections.singletonList(
+            new TextBlock("x", new Rectangle(20, 20, 60, 30), 0.95));
+        PageResult ocr = new PageResult(1, imgW, imgH, blocks);
+
+        PDFAssembler assembler = new PDFAssembler();
+        assembler.setForegroundColorEnabled(true);
+        assembler.setFgScale(0.25);
+        assembler.setBgSmoothSigma(0f);
+
+        try (PDDocument doc = assembler.assemble(source,
+                Collections.singletonList(bg), Collections.singletonList(fgMask),
+                Collections.singletonList(fgColor),
+                Collections.singletonList(ocr), false)) {
+
+            // The foreground image must carry a /SMask.
+            boolean foundSmask = false;
+            PDPage page = doc.getPage(0);
+            for (COSName name : page.getResources().getXObjectNames()) {
+                PDXObject xobj = page.getResources().getXObject(name);
+                if (xobj instanceof PDImageXObject img) {
+                    if (!img.getCOSObject().getBoolean(COSName.IMAGE_MASK, false)
+                            && img.getCOSObject().getItem(COSName.SMASK) != null) {
+                        foundSmask = true;
+                    }
+                }
+            }
+            assertTrue(foundSmask, "Foreground color mode should attach a /SMask to the color image");
+
+            // Render at 72 DPI → 400×600. The mask rectangle (20,20)-(80,50) maps
+            // to PDF coords x:40..160, y:300..480 (see sharpness test), i.e. rendered
+            // (top-left origin) rows 120..300. Pixel (100,200) is inside → must be red.
+            PDFRenderer renderer = new PDFRenderer(doc);
+            BufferedImage rendered = renderer.renderImageWithDPI(0, 72);
+            int textPixel = rendered.getRGB(100, 200);
+            int textR = (textPixel >> 16) & 0xFF;
+            int textG = (textPixel >> 8) & 0xFF;
+            int textB = textPixel & 0xFF;
+            assertTrue(textR > 150 && textG < 100 && textB < 100,
+                "Text pixel should be red (R=" + textR + " G=" + textG + " B=" + textB
+                + "), not the black stencil");
+
+            // Background away from the text region stays white.
+            int bgPixel = rendered.getRGB(300, 500);
+            int bgR = (bgPixel >> 16) & 0xFF;
+            assertTrue(bgR > 192, "Background pixel should be light (R=" + bgR + ")");
+        }
+    }
+
+    /**
+     * Disabled foreground color mode must keep the flat black stencil: no /SMask
+     * and the rendered text is black.
+     */
+    @Test
+    void foregroundColorDisabled_usesBlackStencil() throws IOException {
+        int imgW = 200;
+        int imgH = 100;
+
+        BufferedImage bg = new BufferedImage(imgW, imgH, BufferedImage.TYPE_3BYTE_BGR);
+        java.awt.Graphics2D g = bg.createGraphics();
+        g.setColor(java.awt.Color.WHITE);
+        g.fillRect(0, 0, imgW, imgH);
+        g.dispose();
+
+        BufferedImage fgColor = new BufferedImage(imgW, imgH, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D cg = fgColor.createGraphics();
+        cg.setColor(java.awt.Color.RED);
+        cg.fillRect(0, 0, imgW, imgH);
+        cg.dispose();
+
+        BufferedImage fgMask = new BufferedImage(imgW, imgH, BufferedImage.TYPE_BYTE_BINARY);
+        java.awt.Graphics2D mg = fgMask.createGraphics();
+        mg.setColor(java.awt.Color.WHITE);
+        mg.fillRect(0, 0, imgW, imgH);
+        mg.setColor(java.awt.Color.BLACK);
+        mg.fillRect(20, 20, 60, 30);
+        mg.dispose();
+
+        File source = createSourcePdf();
+        List<TextBlock> blocks = Collections.singletonList(
+            new TextBlock("x", new Rectangle(20, 20, 60, 30), 0.95));
+        PageResult ocr = new PageResult(1, imgW, imgH, blocks);
+
+        PDFAssembler assembler = new PDFAssembler();
+        assembler.setBgSmoothSigma(0f);
+
+        try (PDDocument doc = assembler.assemble(source,
+                Collections.singletonList(bg), Collections.singletonList(fgMask),
+                Collections.singletonList(fgColor),
+                Collections.singletonList(ocr), false)) {
+
+            // No SMask anywhere in the page resources.
+            PDPage page = doc.getPage(0);
+            for (COSName name : page.getResources().getXObjectNames()) {
+                PDXObject xobj = page.getResources().getXObject(name);
+                if (xobj instanceof PDImageXObject img) {
+                    assertNull(img.getCOSObject().getItem(COSName.SMASK),
+                        "Disabled foreground color must not attach a /SMask");
+                }
+            }
+
+            // Rendered text is black.
+            PDFRenderer renderer = new PDFRenderer(doc);
+            BufferedImage rendered = renderer.renderImageWithDPI(0, 72);
+            int textPixel = rendered.getRGB(100, 200);
+            int textR = (textPixel >> 16) & 0xFF;
+            assertTrue(textR < 64, "Disabled fg-color should render black stencil text (R=" + textR + ")");
+        }
     }
 }
