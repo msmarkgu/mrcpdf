@@ -5,7 +5,10 @@ import java.io.IOException;
 import java.nio.file.Path;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -45,6 +48,45 @@ class MrcPdfIntegrationTest {
 
         int outputWords = countWords(output);
         assertTrue(outputWords > 0, "searchable text must be preserved in the output");
+    }
+
+    /**
+     * E2E over the foreground-color (soft-mask) path: the pipeline must succeed,
+     * preserve searchable text, and the assembled pages must contain a /SMask
+     * image. (Output may grow relative to the plain path because the color plane
+     * adds a layer, so no size assertion is made here.)
+     */
+    @Test
+    void scannedTextPdf_foregroundColor_preservesTextAndAddsSMask() throws Exception {
+        File input = new File("tests/scanned-text.pdf");
+        assertTrue(input.exists(),
+                "fixture tests/scanned-text.pdf not found (run ./gradlew generateTestPdfs)");
+
+        File output = tempDir.resolve("out-fgcolor.pdf").toFile();
+        int exitCode = new CommandLine(new MrcPdf()).execute(
+                input.getAbsolutePath(), "-o", output.getAbsolutePath(), "--fg-color");
+        assertEquals(0, exitCode, "mrcpdf run with --fg-color should succeed");
+
+        assertTrue(output.exists(), "output file should be written");
+
+        int outputWords = countWords(output);
+        assertTrue(outputWords > 0, "searchable text must be preserved in fg-color output");
+
+        try (PDDocument doc = Loader.loadPDF(output)) {
+            boolean foundSmask = false;
+            PDPage page = doc.getPage(0);
+            for (COSName name : page.getResources().getXObjectNames()) {
+                var xobj = page.getResources().getXObject(name);
+                if (xobj instanceof PDImageXObject img) {
+                    if (!img.getCOSObject().getBoolean(COSName.IMAGE_MASK, false)
+                            && img.getCOSObject().getItem(COSName.SMASK) != null) {
+                        foundSmask = true;
+                    }
+                }
+            }
+            assertTrue(foundSmask,
+                    "fg-color output should contain a soft-masked foreground image");
+        }
     }
 
     private static int countWords(File pdf) throws IOException {

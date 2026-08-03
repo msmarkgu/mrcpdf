@@ -98,6 +98,9 @@ public class PDFAssembler {
     private String producer;
     private int skippedGlyphCount;
     private PDStream jbig2GlobalStream;
+    private boolean foregroundColorEnabled;
+    private double fgScale;
+    private float fgJpegQuality;
 
     public PDFAssembler() {
         this("HELVETICA", 1f);
@@ -115,6 +118,9 @@ public class PDFAssembler {
         this.backgroundScale = 1.0;
         this.bgSmoothSigma = 0f;
         this.bgJpegQuality = 0.50f;
+        this.foregroundColorEnabled = false;
+        this.fgScale = 0.5;
+        this.fgJpegQuality = 0.7f;
     }
 
     public void setFont(File fontFile) {
@@ -139,6 +145,26 @@ public class PDFAssembler {
 
     public void setProducer(String producer) {
         this.producer = producer;
+    }
+
+    /**
+     * Enables the true MRC foreground color plane: the binary mask is used as a
+     * soft mask (SMask) over a (downsampled, lossy) copy of the original page,
+     * so text pixels render at their original color instead of flat black.
+     * Disabled by default (plain black stencil). Not PDF/A-2b compatible.
+     */
+    public void setForegroundColorEnabled(boolean enabled) {
+        this.foregroundColorEnabled = enabled;
+    }
+
+    /** Downsample factor for the foreground color plane (0 < scale <= 1, default 0.25). */
+    public void setFgScale(double scale) {
+        this.fgScale = Math.max(0.1, Math.min(1.0, scale));
+    }
+
+    /** JPEG quality for the foreground color plane (0.1 - 1.0, default 0.7). */
+    public void setFgJpegQuality(float quality) {
+        this.fgJpegQuality = Math.max(0.1f, Math.min(1.0f, quality));
     }
 
     private PDImageXObject encodeBackgroundJpeg(PDDocument doc, BufferedImage image, float quality, boolean hasMask) throws IOException {
@@ -166,6 +192,40 @@ public class PDFAssembler {
 
         // Step 3: Encode as JPEG with 4:2:0 chroma subsampling + progressive
         // Using ImageWriter directly instead of JPEGFactory for chroma control
+        return encodeJpeg(doc, toEncode, quality, 2, 2);
+    }
+
+    /**
+     * Encodes the foreground color plane: a downsampled (fgScale), lossy copy of
+     * the original page, at 4:4:4 chroma to keep colored text edges sharp. No
+     * Gaussian smoothing is applied — this layer is clipped by the soft mask to
+     * the exact text shapes, so pre-blur would soften the colors.
+     */
+    private PDImageXObject encodeForegroundColorJpeg(PDDocument doc, BufferedImage image) throws IOException {
+        BufferedImage toEncode = image;
+        if (fgScale < 1.0) {
+            int newW = Math.max(1, (int) Math.round(image.getWidth() * fgScale));
+            int newH = Math.max(1, (int) Math.round(image.getHeight() * fgScale));
+            BufferedImage scaled = new BufferedImage(newW, newH, BufferedImage.TYPE_3BYTE_BGR);
+            Graphics2D g = scaled.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.drawImage(image, 0, 0, newW, newH, null);
+            g.dispose();
+            toEncode = scaled;
+        }
+        return encodeJpeg(doc, toEncode, fgJpegQuality, 1, 1);
+    }
+
+    /**
+     * JPEG-encodes an image via a direct ImageWriter so chroma subsampling can
+     * be controlled. {@code hSample}/{@code vSample} (1 or 2) set the luma
+     * sampling factors; 2/2 gives 4:2:0 (background), 1/1 gives 4:4:4 (color
+     * foreground). Component IDs are bounds-checked so a nonstandard writer tree
+     * can't corrupt the encoding; on any unexpected metadata we fall back to the
+     * writer's default subsampling.
+     */
+    private PDImageXObject encodeJpeg(PDDocument doc, BufferedImage image, float quality,
+                                      int hSample, int vSample) throws IOException {
         ImageWriter writer = null;
         try {
             writer = ImageIO.getImageWritersByFormatName("JPEG").next();
@@ -174,11 +234,7 @@ public class PDFAssembler {
             param.setCompressionQuality(quality);
             param.setProgressiveMode(ImageWriteParam.MODE_DEFAULT);
 
-            // Force 4:2:0 chroma subsampling via standard JPEG metadata.
-            // Component IDs are bounds-checked so a nonstandard writer tree
-            // can't corrupt the encoding; on any unexpected metadata we just
-            // fall back to the writer's default subsampling.
-            ImageTypeSpecifier type = ImageTypeSpecifier.createFromRenderedImage(toEncode);
+            ImageTypeSpecifier type = ImageTypeSpecifier.createFromRenderedImage(image);
             IIOMetadata meta = writer.getDefaultImageMetadata(type, param);
             if (meta != null && !meta.isReadOnly()) {
                 try {
@@ -209,8 +265,8 @@ public class PDFAssembler {
                                 }
                                 if (compId < 0 || compId >= numComponents) continue;
                                 if (compId == 0) {
-                                    comp.setAttribute("HsamplingFactor", "2");
-                                    comp.setAttribute("VsamplingFactor", "2");
+                                    comp.setAttribute("HsamplingFactor", Integer.toString(hSample));
+                                    comp.setAttribute("VsamplingFactor", Integer.toString(vSample));
                                 } else {
                                     comp.setAttribute("HsamplingFactor", "1");
                                     comp.setAttribute("VsamplingFactor", "1");
@@ -227,10 +283,10 @@ public class PDFAssembler {
             ByteArrayOutputStream baos = new ByteArrayOutputStream(8192);
             try (MemoryCacheImageOutputStream mcios = new MemoryCacheImageOutputStream(baos)) {
                 writer.setOutput(mcios);
-                writer.write(null, new IIOImage(toEncode, null, meta), param);
+                writer.write(null, new IIOImage(image, null, meta), param);
             }
 
-            return PDImageXObject.createFromByteArray(doc, baos.toByteArray(), "background");
+            return PDImageXObject.createFromByteArray(doc, baos.toByteArray(), "image");
         } finally {
             if (writer != null) writer.dispose();
         }
@@ -330,6 +386,30 @@ public class PDFAssembler {
                                Iterator<BufferedImage> foregroundMasks,
                                List<PageResult> ocrResults,
                                boolean usePdfa) throws IOException {
+        return assemble(sourcePdf, backgrounds, foregroundMasks, null, ocrResults, usePdfa);
+    }
+
+    /**
+     * Assembles a searchable PDF with MRC-like foreground overlay and an
+     * optional true-color foreground plane.
+     *
+     * @param sourcePdf        Original PDF (for per-page media boxes).
+     * @param backgrounds      Per-page cleaned background images.
+     * @param foregroundMasks  Per-page binary foreground masks (TYPE_BYTE_BINARY,
+     *                         black=text, white=background), or null to skip.
+     * @param foregroundColors Per-page original (color) page images used as the
+     *                         foreground color plane when foreground color mode is
+     *                         enabled, or null to keep the black stencil.
+     * @param ocrResults       Per-page OCR results.
+     * @param usePdfa          Enable PDF/A-2b output with XMP metadata.
+     * @return A new PDDocument with foreground mask overlay and searchable text.
+     */
+    public PDDocument assemble(File sourcePdf,
+                               Iterator<BufferedImage> backgrounds,
+                               Iterator<BufferedImage> foregroundMasks,
+                               Iterator<BufferedImage> foregroundColors,
+                               List<PageResult> ocrResults,
+                               boolean usePdfa) throws IOException {
         PDDocument output = new PDDocument();
         List<PDPage> outPages = new java.util.ArrayList<>();
 
@@ -338,7 +418,8 @@ public class PDFAssembler {
             for (int i = 0; i < pageCount; i++) {
                 BufferedImage bg = backgrounds.next();
                 BufferedImage fg = foregroundMasks != null && foregroundMasks.hasNext() ? foregroundMasks.next() : null;
-                PDPage page = addPage(output, source, i, bg, fg, ocrResults.get(i));
+                BufferedImage fgColor = foregroundColors != null && foregroundColors.hasNext() ? foregroundColors.next() : null;
+                PDPage page = addPage(output, source, i, bg, fg, fgColor, ocrResults.get(i));
                 outPages.add(page);
             }
             finishAssembly(output, source, outPages, usePdfa);
@@ -359,6 +440,23 @@ public class PDFAssembler {
         return assemble(sourcePdf,
             backgrounds.iterator(),
             foregroundMasks != null ? foregroundMasks.iterator() : null,
+            null,
+            ocrResults, usePdfa);
+    }
+
+    /**
+     * Convenience overload accepting Lists for the foreground color plane too.
+     */
+    public PDDocument assemble(File sourcePdf,
+                               List<BufferedImage> backgrounds,
+                               List<BufferedImage> foregroundMasks,
+                               List<BufferedImage> foregroundColors,
+                               List<PageResult> ocrResults,
+                               boolean usePdfa) throws IOException {
+        return assemble(sourcePdf,
+            backgrounds.iterator(),
+            foregroundMasks != null ? foregroundMasks.iterator() : null,
+            foregroundColors != null ? foregroundColors.iterator() : null,
             ocrResults, usePdfa);
     }
 
@@ -376,6 +474,28 @@ public class PDFAssembler {
      */
     public PDPage addPage(PDDocument output, PDDocument source, int pageIndex,
                           BufferedImage background, BufferedImage foregroundMask,
+                          PageResult ocr) throws IOException {
+        return addPage(output, source, pageIndex, background, foregroundMask, null, ocr);
+    }
+
+    /**
+     * Renders one page into the output document.  Call repeatedly for
+     * each page of the source, then call {@link #finishAssembly}.
+     *
+     * @param output          The output PDDocument being built.
+     * @param source          The source PDDocument (already loaded).
+     * @param pageIndex       0-based page index in source.
+     * @param background      Cleaned background image for this page.
+     * @param foregroundMask  Binary mask or null to skip the stencil layer.
+     * @param foregroundColor Original (color) page image used for the foreground
+     *                        color plane when foreground color mode is enabled,
+     *                        or null to keep the black stencil.
+     * @param ocr             OCR result for this page.
+     * @return The newly created PDPage added to output.
+     */
+    public PDPage addPage(PDDocument output, PDDocument source, int pageIndex,
+                          BufferedImage background, BufferedImage foregroundMask,
+                          BufferedImage foregroundColor,
                           PageResult ocr) throws IOException {
         PDPage sourcePage = source.getPage(pageIndex);
         // Use crop box dimensions so the output page matches the visible area
@@ -412,22 +532,46 @@ public class PDFAssembler {
             cs.drawImage(bgXObject, 0, 0, pageW, pageH);
 
             // Layer 2: foreground mask as CCITT G4 stencil overlay (JBIG2 when available)
+            // or, in foreground-color mode, as a soft mask (SMask) over a color plane.
             if (foregroundMask != null) {
-                PDImageXObject fgImage;
-                if (compressor != null) {
-                    JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
-                    if (result.isJbig2()) {
-                        fgImage = createJbig2ImageXObject(output, result);
+                if (foregroundColorEnabled && foregroundColor != null) {
+                    PDImageXObject maskXObject;
+                    if (compressor != null) {
+                        JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
+                        if (result.isJbig2()) {
+                            maskXObject = createJbig2SmaskXObject(output, result);
+                        } else {
+                            maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
+                        }
+                    } else {
+                        maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
+                    }
+                    // 1-bit DeviceGray mask: text samples decode to black (0), so
+                    // Decode [1 0] inverts them to white = opaque alpha.
+                    maskXObject.getCOSObject().setBoolean(COSName.IMAGE_MASK, false);
+                    maskXObject.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
+                    maskXObject.getCOSObject().setItem(COSName.DECODE, maskDecode());
+
+                    PDImageXObject fgColorXObject = encodeForegroundColorJpeg(output, foregroundColor);
+                    fgColorXObject.getCOSObject().setItem(COSName.SMASK, maskXObject.getCOSObject());
+                    cs.drawImage(fgColorXObject, 0, 0, pageW, pageH);
+                } else {
+                    PDImageXObject fgImage;
+                    if (compressor != null) {
+                        JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
+                        if (result.isJbig2()) {
+                            fgImage = createJbig2ImageXObject(output, result);
+                        } else {
+                            fgImage = CCITTFactory.createFromImage(output, foregroundMask);
+                        }
                     } else {
                         fgImage = CCITTFactory.createFromImage(output, foregroundMask);
                     }
-                } else {
-                    fgImage = CCITTFactory.createFromImage(output, foregroundMask);
+                    fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
+                    fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    cs.drawImage(fgImage, 0, 0, pageW, pageH);
                 }
-                fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
-                fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
-                cs.setNonStrokingColor(0f, 0f, 0f);
-                cs.drawImage(fgImage, 0, 0, pageW, pageH);
             }
 
             // Layer 3: invisible OCR text
@@ -502,6 +646,57 @@ public class PDFAssembler {
     }
 
     /**
+     * Creates a 1-bit DeviceGray JBIG2 XObject for use as a soft mask (SMask),
+     * instead of the black ImageMask stencil. Text samples decode to black (0),
+     * so a Decode [1 0] array inverts them: text becomes white (255) = opaque
+     * alpha, background becomes black (0) = transparent.
+     */
+    private PDImageXObject createJbig2SmaskXObject(PDDocument doc, JBIG2Compressor.CompressionResult result) throws IOException {
+        PDImageXObject img = new PDImageXObject(doc);
+        img.setWidth(result.getWidth());
+        img.setHeight(result.getHeight());
+        img.setBitsPerComponent(1);
+        img.setStencil(false);
+        img.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
+        img.getCOSObject().setItem(COSName.DECODE, maskDecode());
+        try (OutputStream os = img.getStream().createOutputStream()) {
+            os.write(result.getData());
+        }
+        img.getCOSObject().setItem(COSName.FILTER, COSName.JBIG2_DECODE);
+        return img;
+    }
+
+    private PDImageXObject createJbig2SmaskXObject(PDDocument doc,
+                                                    byte[] combinedData,
+                                                    int width,
+                                                    int height) throws IOException {
+        PDImageXObject img = new PDImageXObject(doc);
+        img.setWidth(width);
+        img.setHeight(height);
+        img.setBitsPerComponent(1);
+        img.setStencil(false);
+        img.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
+        img.getCOSObject().setItem(COSName.DECODE, maskDecode());
+        try (OutputStream os = img.getStream().createOutputStream()) {
+            os.write(combinedData);
+        }
+        img.getCOSObject().setItem(COSName.FILTER, COSName.JBIG2_DECODE);
+        return img;
+    }
+
+    /**
+     * Decode array [1 0] for a 1-bit soft-mask XObject: inverts the bilevel
+     * samples so text (sample 0) maps to opaque white and background (sample 1)
+     * maps to transparent black.
+     */
+    private static org.apache.pdfbox.cos.COSArray maskDecode() {
+        org.apache.pdfbox.cos.COSArray decode = new org.apache.pdfbox.cos.COSArray();
+        decode.add(org.apache.pdfbox.cos.COSInteger.get(1));
+        decode.add(org.apache.pdfbox.cos.COSInteger.get(0));
+        return decode;
+    }
+
+    /**
      * Adds one page to the output document using pre-compressed JBIG2
      * foreground data with a shared global symbol dictionary.
      */
@@ -509,6 +704,20 @@ public class PDFAssembler {
                                BufferedImage background,
                                byte[] jbig2PageData, byte[] jbig2GlobalSym,
                                int fgWidth, int fgHeight,
+                               PageResult ocr) throws IOException {
+        return addPageJbig2(output, source, pageIndex, background, jbig2PageData, jbig2GlobalSym,
+                fgWidth, fgHeight, null, ocr);
+    }
+
+    /**
+     * Adds one page using pre-compressed JBIG2 foreground data, optionally with
+     * a true-color foreground plane (the JBIG2 mask then acts as a soft mask).
+     */
+    public PDPage addPageJbig2(PDDocument output, PDDocument source, int pageIndex,
+                               BufferedImage background,
+                               byte[] jbig2PageData, byte[] jbig2GlobalSym,
+                               int fgWidth, int fgHeight,
+                               BufferedImage foregroundColor,
                                PageResult ocr) throws IOException {
         PDPage sourcePage = source.getPage(pageIndex);
         PDRectangle cropBox = sourcePage.getCropBox();
@@ -532,25 +741,39 @@ public class PDFAssembler {
             PDImageXObject bgXObject = encodeBackgroundJpeg(output, background, bgJpegQuality, true);
             cs.drawImage(bgXObject, 0, 0, pageW, pageH);
 
-            // Layer 2: JBIG2 foreground mask — store global symbol dictionary
+            // Layer 2: JBIG2 foreground — store global symbol dictionary
             // as a separate stream and reference it via /JBIG2Globals in decode parms.
+            // In foreground-color mode the JBIG2 mask is used as a soft mask over a
+            // color plane; otherwise it is a black ImageMask stencil.
             if (jbig2PageData != null && jbig2GlobalSym != null) {
-                // Create and cache the global symbol stream once per document
                 if (jbig2GlobalStream == null) {
                     jbig2GlobalStream = new PDStream(output);
                     try (OutputStream os = jbig2GlobalStream.createOutputStream()) {
                         os.write(jbig2GlobalSym);
                     }
                 }
-                PDImageXObject fgImage = createJbig2ImageXObject(output,
-                    jbig2PageData, fgWidth, fgHeight);
                 COSDictionary decodeParms = new COSDictionary();
                 decodeParms.setItem(COSName.JBIG2_GLOBALS, jbig2GlobalStream);
-                fgImage.getCOSObject().setItem(COSName.DECODE_PARMS, decodeParms);
-                fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
-                fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
-                cs.setNonStrokingColor(0f, 0f, 0f);
-                cs.drawImage(fgImage, 0, 0, pageW, pageH);
+
+                if (foregroundColorEnabled && foregroundColor != null) {
+                    PDImageXObject maskXObject = createJbig2SmaskXObject(output,
+                            jbig2PageData, fgWidth, fgHeight);
+                    maskXObject.getCOSObject().setItem(COSName.DECODE_PARMS, decodeParms);
+                    maskXObject.getCOSObject().setBoolean(COSName.IMAGE_MASK, false);
+                    maskXObject.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
+
+                    PDImageXObject fgColorXObject = encodeForegroundColorJpeg(output, foregroundColor);
+                    fgColorXObject.getCOSObject().setItem(COSName.SMASK, maskXObject.getCOSObject());
+                    cs.drawImage(fgColorXObject, 0, 0, pageW, pageH);
+                } else {
+                    PDImageXObject fgImage = createJbig2ImageXObject(output,
+                            jbig2PageData, fgWidth, fgHeight);
+                    fgImage.getCOSObject().setItem(COSName.DECODE_PARMS, decodeParms);
+                    fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
+                    fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    cs.drawImage(fgImage, 0, 0, pageW, pageH);
+                }
             }
 
             // Layer 3: invisible OCR text
