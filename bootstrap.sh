@@ -34,20 +34,57 @@ fi
 JDK_DIR="$SCRIPT_DIR/deps/jdk"
 mkdir -p "$JDK_DIR"
 
-if [ "$FORCE_DOWNLOAD" = true ] || [ -z "$(ls -A "$JDK_DIR" 2>/dev/null)" ]; then
-  echo "Downloading OpenJDK 21 LTS for $OS/$ARCH..."
+# Download + extract a JDK archive; returns 0 only if a runnable java appears.
+download_jdk() {
+  local url="$1" src="$2"
+  echo ""
+  echo "  URL: $url"
+  echo "  Downloading OpenJDK 21 LTS for $OS/$ARCH from $src..."
+  if ! curl -fsSL -o "$SCRIPT_DIR/$JDK_ARCHIVE" "$url"; then
+    echo "  Failed to download from $src"
+    rm -f "$SCRIPT_DIR/$JDK_ARCHIVE"
+    return 1
+  fi
+  if ! tar -xzf "$SCRIPT_DIR/$JDK_ARCHIVE" -C "$JDK_DIR" --strip-components=1 2>/dev/null && \
+     ! tar -xzf "$SCRIPT_DIR/$JDK_ARCHIVE" -C "$JDK_DIR"; then
+    echo "  Extraction failed from $src"
+    rm -f "$SCRIPT_DIR/$JDK_ARCHIVE"
+    return 1
+  fi
+  rm -f "$SCRIPT_DIR/$JDK_ARCHIVE"
+  local java_bin
+  if [ "$OS" = "mac" ]; then
+    java_bin=$(ls "$JDK_DIR"/jdk-*/Contents/Home/bin/java "$JDK_DIR/Contents/Home/bin/java" 2>/dev/null | head -1)
+  else
+    java_bin=$(ls "$JDK_DIR"/jdk-*/bin/java "$JDK_DIR/bin/java" 2>/dev/null | head -1)
+  fi
+  [ -n "$java_bin" ]
+}
 
+if [ "$FORCE_DOWNLOAD" = true ] || [ -z "$(ls -A "$JDK_DIR" 2>/dev/null)" ]; then
   API_URL="https://api.adoptium.net/v3/binary/latest/21/ga/$OS/$ARCH/jdk/hotspot/normal/eclipse"
   case "$OS" in
-    mac)  JDK_ARCHIVE="openjdk21-mac.tar.gz" ;;
-    linux) JDK_ARCHIVE="openjdk21-linux.tar.gz" ;;
+    mac)
+      JDK_ARCHIVE="openjdk21-mac.tar.gz"
+      ARCHIVE_SUFFIX="macos-$ARCH" ;;
+    linux)
+      JDK_ARCHIVE="openjdk21-linux.tar.gz"
+      ARCHIVE_SUFFIX="linux-$ARCH" ;;
   esac
+  FALLBACK_URL="https://download.java.net/java/GA/jdk21.0.2/f2283984656d49d69e91c558476027ac/13/GPL/openjdk-21.0.2_${ARCHIVE_SUFFIX}_bin.tar.gz"
 
-  curl -fsSL -o "$SCRIPT_DIR/$JDK_ARCHIVE" "$API_URL"
-  tar -xzf "$SCRIPT_DIR/$JDK_ARCHIVE" -C "$JDK_DIR" --strip-components=1 2>/dev/null || \
-    tar -xzf "$SCRIPT_DIR/$JDK_ARCHIVE" -C "$JDK_DIR"
-  rm -f "$SCRIPT_DIR/$JDK_ARCHIVE"
-  echo "OpenJDK 21 downloaded to $JDK_DIR"
+  if download_jdk "$API_URL" "Adoptium"; then
+    echo "OpenJDK 21 downloaded to $JDK_DIR"
+  else
+    echo "WARNING: Adoptium download failed; falling back to jdk.java.net/archive..."
+    JDK_ARCHIVE="openjdk21-fallback-$OS.tar.gz"
+    if download_jdk "$FALLBACK_URL" "jdk.java.net/archive"; then
+      echo "OpenJDK 21 downloaded to $JDK_DIR (from jdk.java.net/archive)"
+    else
+      echo "ERROR: Could not download OpenJDK 21 from either source."
+      exit 1
+    fi
+  fi
 else
   echo "OpenJDK already present in $JDK_DIR"
 fi
@@ -75,7 +112,9 @@ export MRCPDF_JAVA_HOME="$JAVA_HOME_PATH"
 GRADLE_DIR="$SCRIPT_DIR/deps/gradle"
 GRADLE_VERSION="8.0.1"
 if [ "$FORCE_DOWNLOAD" = true ] || [ ! -x "$GRADLE_DIR/bin/gradle" ]; then
+  echo ""
   echo "Downloading Gradle $GRADLE_VERSION..."
+  echo "  URL: https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
   rm -rf "$GRADLE_DIR"
   mkdir -p "$GRADLE_DIR"
   curl -fsSL -o "$SCRIPT_DIR/gradle-bin.zip" \
@@ -108,7 +147,10 @@ case "$OS" in
       if [ "$ARCH" != "x64" ]; then
         echo "WARNING: No prebuilt jbig2enc for $ARCH; using CCITT G4 fallback."
       else
+        echo ""
         echo "Downloading jbig2enc (Debian 11 prebuilt) for $OS/$ARCH..."
+        echo "  URL: https://sourceforge.net/projects/jbig2enc/files/deb/jbig2enc_0.29-deb11_amd64.deb/download"
+        echo "  URL: https://sourceforge.net/projects/jbig2enc/files/deb/libjbig2enc0_0.29-deb11_amd64.deb/download"
         TMPDIR=$(mktemp -d)
         if curl -fSL -o "$TMPDIR/jbig2enc.deb" \
               "https://sourceforge.net/projects/jbig2enc/files/deb/jbig2enc_0.29-deb11_amd64.deb/download" \
@@ -163,7 +205,9 @@ CJK_FONT="$FONTS_DIR/NotoSansSC-Regular.ttf"
 CJK_FONT_URL="https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf"
 mkdir -p "$FONTS_DIR"
 if [ "$FORCE_DOWNLOAD" = true ] || [ ! -f "$CJK_FONT" ]; then
+  echo ""
   echo "Downloading Noto Sans SC CJK font (~34 MB)..."
+  echo "  URL: $CJK_FONT_URL"
   curl -fsSL -o "$CJK_FONT" "$CJK_FONT_URL"
   echo "Noto Sans SC downloaded to $CJK_FONT ($(du -h "$CJK_FONT" | cut -f1))"
 else
