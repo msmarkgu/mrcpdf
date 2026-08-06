@@ -49,6 +49,11 @@ Apache License 2.0
 https://github.com/agl/jbig2enc
 Copyright (c) 2012 Adam Langley
 Apache License 2.0
+Linux binary bundled from prebuilt Debian 11 packages (zvezdochiot's SourceForge project).
+
+### leptonica
+https://github.com/DanBloomberg/leptonica
+Leptonica is not bundled; mrcpdf uses the system `liblept5` package (BSD 2-Clause License).
 
 ### jai-imageio-jpeg2000
 https://github.com/jai-imageio/jai-imageio-jpeg2000

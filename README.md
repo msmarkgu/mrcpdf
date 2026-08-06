@@ -56,7 +56,7 @@ A pure-MRC PDF compressor split out of the [TrulyFreeOCR](https://github.com/msm
 
 - OpenJDK 21 LTS → `deps/jdk/`
 - Gradle 8.0.1 → `deps/gradle/`
-- jbig2enc for JBIG2 foreground compression → `deps/jbig2enc/$OS/`
+- jbig2enc for JBIG2 foreground compression → `deps/jbig2enc/$OS/` (prebuilt Debian 11 binary; uses host leptonica)
 - Noto Sans SC CJK font (SIL OFL 1.1) → `deps/fonts/`
 
 </details>

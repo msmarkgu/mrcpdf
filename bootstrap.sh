@@ -18,15 +18,6 @@ esac
 
 echo "Detected: $OS / $ARCH"
 
-# Derive Debian architecture for dynamic package URLs
-DEB_ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-case "$DEB_ARCH" in
-  amd64) LIB_ARCH="x86_64-linux-gnu" ;;
-  arm64) LIB_ARCH="aarch64-linux-gnu" ;;
-  *)     echo "Warning: unknown Debian arch '$DEB_ARCH', assuming amd64"
-         DEB_ARCH="amd64"; LIB_ARCH="x86_64-linux-gnu" ;;
-esac
-
 # ── Flag parsing ────────────────────────────────────────────────────────────
 FORCE_DOWNLOAD=false
 for arg in "$@"; do
@@ -103,40 +94,48 @@ else
 fi
 
 # ── 3. Download jbig2enc (Linux) ─────────────────────────────────────────────
-# Linux: extracted from Debian/Ubuntu packages (jbig2enc + liblept).
+# Linux/amd64: prebuilt Debian 11 (glibc 2.31) jbig2enc + libjbig2enc0 from
+# SourceForge — runs on Ubuntu 20.04+ and Debian 11+ (backward-compatible).
+# leptonica (liblept5) is NOT bundled: it's provided by the host on all target
+# distros, and Debian 11's liblept pulls old-SONAME deps (libjpeg.so.62 etc.)
+# missing on Ubuntu 24.04+, which would break the binary there.
 JBIG2ENC_DIR="$SCRIPT_DIR/deps/jbig2enc/$OS"
-mkdir -p "$JBIG2ENC_DIR/lib"
+JBIG2_BIN="$JBIG2ENC_DIR/jbig2.bin"
 
-if [ "$FORCE_DOWNLOAD" = true ] || [ ! -x "$JBIG2ENC_DIR/jbig2.bin" ]; then
-  echo "Downloading jbig2enc for $OS/$ARCH..."
-  case "$OS" in
-    linux)
-      TMPDIR=$(mktemp -d)
-      if command -v apt-get &>/dev/null; then
-        cd "$TMPDIR"
-        apt-get download jbig2 libjbig2enc0t64 liblept5 2>/dev/null || {
-          curl -fsSL -o jbig2.deb \
-            "http://archive.ubuntu.com/ubuntu/pool/universe/j/jbig2enc/jbig2_0.29-2.1build1_${DEB_ARCH}.deb"
-          curl -fsSL -o libjbig2enc0t64.deb \
-            "http://archive.ubuntu.com/ubuntu/pool/universe/j/jbig2enc/libjbig2enc0t64_0.29-2.1build1_${DEB_ARCH}.deb"
-          curl -fsSL -o liblept5.deb \
-            "http://archive.ubuntu.com/ubuntu/pool/main/l/leptonlib/liblept5_1.82.0-3build3_${DEB_ARCH}.deb"
-        }
-        for deb in "$TMPDIR"/*.deb; do [ -f "$deb" ] && dpkg-deb -x "$deb" "$TMPDIR/extract" 2>/dev/null; done
-        if [ -f "$TMPDIR/extract/usr/bin/jbig2" ]; then
-          cp "$TMPDIR/extract/usr/bin/jbig2" "$JBIG2ENC_DIR/jbig2.bin"
-          cp -a "$TMPDIR/extract/usr/lib/"*.so* "$JBIG2ENC_DIR/lib/" 2>/dev/null || true
-          cp -a "$TMPDIR/extract/usr/lib/${LIB_ARCH}/"*.so* "$JBIG2ENC_DIR/lib/" 2>/dev/null || true
-          chmod +x "$JBIG2ENC_DIR/jbig2.bin"
-          echo "jbig2enc installed to $JBIG2ENC_DIR"
+case "$OS" in
+  linux)
+    if [ "$FORCE_DOWNLOAD" = true ] || [ ! -x "$JBIG2_BIN" ]; then
+      if [ "$ARCH" != "x64" ]; then
+        echo "WARNING: No prebuilt jbig2enc for $ARCH; using CCITT G4 fallback."
+      else
+        echo "Downloading jbig2enc (Debian 11 prebuilt) for $OS/$ARCH..."
+        TMPDIR=$(mktemp -d)
+        if curl -fSL -o "$TMPDIR/jbig2enc.deb" \
+              "https://sourceforge.net/projects/jbig2enc/files/deb/jbig2enc_0.29-deb11_amd64.deb/download" \
+            && curl -fSL -o "$TMPDIR/libjbig2enc0.deb" \
+              "https://sourceforge.net/projects/jbig2enc/files/deb/libjbig2enc0_0.29-deb11_amd64.deb/download"; then
+          mkdir -p "$TMPDIR/extract"
+          for deb in "$TMPDIR"/*.deb; do
+            dpkg-deb -x "$deb" "$TMPDIR/extract" 2>/dev/null || true
+          done
+          if [ -f "$TMPDIR/extract/usr/bin/jbig2" ]; then
+            mkdir -p "$JBIG2ENC_DIR/lib"
+            cp "$TMPDIR/extract/usr/bin/jbig2" "$JBIG2_BIN"
+            chmod +x "$JBIG2_BIN"
+            # Bundle only libjbig2enc (not on host); leptonica comes from the host
+            cp -a "$TMPDIR/extract/usr/lib/x86_64-linux-gnu/libjbig2enc"*.so* "$JBIG2ENC_DIR/lib/" 2>/dev/null || true
+            echo "jbig2enc installed to $JBIG2ENC_DIR"
+          else
+            echo "WARNING: Could not extract jbig2enc; using CCITT G4 fallback."
+          fi
         else
-          echo "WARNING: Could not extract jbig2enc."
+          echo "WARNING: Failed to download jbig2enc; using CCITT G4 fallback."
         fi
+        rm -rf "$TMPDIR"
       fi
-      ;;
-  esac
-  rm -rf "$TMPDIR"
-fi
+    fi
+    ;;
+esac
 
 # Create the jbig2enc wrapper (Java looks for 'jbig2enc', binary is 'jbig2.bin')
 if [ ! -f "$JBIG2ENC_DIR/jbig2enc" ] && [ -x "$JBIG2ENC_DIR/jbig2.bin" ]; then
@@ -148,6 +147,12 @@ exec "\$SCRIPT_DIR/jbig2.bin" "\$@"
 WRAPPER
   chmod +x "$JBIG2ENC_DIR/jbig2enc"
   echo "Created jbig2enc wrapper at $JBIG2ENC_DIR/jbig2enc"
+fi
+
+# Runtime verification: if the wrapper can't run, treat as uninstalled (CCITT G4)
+if [ -x "$JBIG2_BIN" ] && ! "$JBIG2ENC_DIR/jbig2enc" -h >/dev/null 2>&1; then
+  echo "WARNING: jbig2enc failed to run; removing it and using CCITT G4 fallback."
+  rm -rf "$JBIG2ENC_DIR"
 fi
 
 # ── 4. Download bundled CJK font for invisible text layer ────────────────────
