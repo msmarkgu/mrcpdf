@@ -61,13 +61,44 @@ if not exist "%GRADLE_DIR%\bin\gradle.bat" (
   echo Gradle already present
 )
 
-rem ── 3. jbig2enc — not available as precompiled Windows binary ──────────
-rem JBIG2 compression will be unavailable; CCITT G4 fallback is used.
+rem ── 3. jbig2enc (Windows x64) ──────────────────────────────────────────
+rem Static MSVC v0.32 from upstream agl/jbig2enc releases (Apache 2.0).
+rem No DLLs needed; leptonica is linked in. If download/verify fails, fall
+rem back to CCITT G4 (same "never abort" guarantee as bootstrap.sh).
 set "JBIG2ENC_DIR=%SCRIPT_DIR%deps\jbig2enc\win"
+set "JBIG2_EXE=%JBIG2ENC_DIR%\jbig2enc.exe"
+set "WIN_ZIP_URL=https://github.com/agl/jbig2enc/releases/download/0.32/jbig2enc-0.32-Windows-X64-MSVC.zip"
+
 if not exist "%JBIG2ENC_DIR%" mkdir "%JBIG2ENC_DIR%"
-if not exist "%JBIG2ENC_DIR%\jbig2enc.exe" (
-  echo NOTE: jbig2enc is not available for Windows.
-  echo       JBIG2 compression disabled; using CCITT G4 fallback.
+if "%FORCE_DOWNLOAD%"=="true" (
+  if exist "%JBIG2_EXE%" del /Q "%JBIG2_EXE%"
+)
+
+if not exist "%JBIG2_EXE%" (
+  echo Downloading jbig2enc v0.32 (MSVC x64) for Windows...
+  powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri '%WIN_ZIP_URL%' -OutFile '%SCRIPT_DIR%jbig2enc-win.zip'" 2>nul
+  if exist "%SCRIPT_DIR%jbig2enc-win.zip" (
+    powershell -NoProfile -Command "Expand-Archive -Path '%SCRIPT_DIR%jbig2enc-win.zip' -DestinationPath '%SCRIPT_DIR%deps\jbig2enc\win-tmp' -Force" 2>nul
+    if exist "%SCRIPT_DIR%deps\jbig2enc\win-tmp\bin\jbig2.exe" (
+      copy /Y "%SCRIPT_DIR%deps\jbig2enc\win-tmp\bin\jbig2.exe" "%JBIG2_EXE%" >nul
+    )
+    rmdir /S /Q "%SCRIPT_DIR%deps\jbig2enc\win-tmp" 2>nul
+    del /Q "%SCRIPT_DIR%jbig2enc-win.zip" 2>nul
+  )
+  if exist "%JBIG2_EXE%" (
+    echo jbig2enc installed to %JBIG2ENC_DIR%
+  ) else (
+    echo WARNING: Failed to download jbig2enc; using CCITT G4 fallback.
+  )
+)
+
+rem Runtime verification: if the exe can't run, treat as uninstalled (CCITT G4)
+if exist "%JBIG2_EXE%" (
+  "%JBIG2_EXE%" -h >nul 2>&1
+  if errorlevel 1 (
+    echo WARNING: jbig2enc failed to run; removing it and using CCITT G4 fallback.
+    del /Q "%JBIG2_EXE%"
+  )
 )
 
 rem ── 4. Download bundled CJK font for invisible text layer ──────────────

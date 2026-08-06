@@ -49,7 +49,11 @@ Apache License 2.0
 https://github.com/agl/jbig2enc
 Copyright (c) 2012 Adam Langley
 Apache License 2.0
-Linux binary bundled from prebuilt Debian 11 packages (zvezdochiot's SourceForge project).
+
+- Linux binary bundled from prebuilt Debian 11 packages (zvezdochiot's SourceForge project).
+- Windows binary bundled as a static MSVC build from the upstream agl/jbig2enc v0.32 release (x64).
+
+JBIG2 may be subject to patents in some jurisdictions; see the project's PATENTS notice.
 
 ### leptonica
 https://github.com/DanBloomberg/leptonica
