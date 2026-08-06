@@ -22,17 +22,18 @@ set "JAVA_EXE="
 if exist "%JDK_DIR%\bin\java.exe" set "JAVA_EXE=%JDK_DIR%\bin\java.exe"
 
 if not defined JAVA_EXE (
+  echo.
   echo Downloading OpenJDK 21 for Windows x64...
-  powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri 'https://api.adoptium.net/v3/binary/latest/21/ga/win/x64/jdk/hotspot/normal/eclipse' -OutFile '%SCRIPT_DIR%openjdk21-win.zip'"
-  powershell -NoProfile -Command "Expand-Archive -Path '%SCRIPT_DIR%openjdk21-win.zip' -DestinationPath '%JDK_DIR%'"
-  del "%SCRIPT_DIR%openjdk21-win.zip"
-  rem Flatten versioned folder (jdk-*) so java.exe is at %JDK_DIR%\bin\java.exe
-  for /d %%d in ("%JDK_DIR%\jdk-*") do (
-    xcopy /E /Y "%%d\*" "%JDK_DIR%\" >nul
-    rmdir /S /Q "%%d"
+  call :installJdk "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" "Adoptium"
+  if not defined JAVA_EXE (
+    echo WARNING: Adoptium download failed; falling back to jdk.java.net/archive...
+    call :installJdk "https://download.java.net/java/GA/jdk21.0.2/f2283984656d49d69e91c558476027ac/13/GPL/openjdk-21.0.2_windows-x64_bin.zip" "jdk.java.net/archive"
   )
-  if exist "%JDK_DIR%\bin\java.exe" set "JAVA_EXE=%JDK_DIR%\bin\java.exe"
-  echo OpenJDK 21 downloaded to %JDK_DIR%
+  if not defined JAVA_EXE (
+    echo ERROR: Could not download OpenJDK 21 from either source.
+    exit /b 1
+  )
+  echo OpenJDK 21 installed to %JDK_DIR%
 ) else (
   echo OpenJDK already present
 )
@@ -44,7 +45,9 @@ if "%FORCE_DOWNLOAD%"=="true" (
   if exist "%GRADLE_DIR%" rmdir /S /Q "%GRADLE_DIR%" 2>nul
 )
 if not exist "%GRADLE_DIR%\bin\gradle.bat" (
+  echo.
   echo Downloading Gradle %GRADLE_VERSION% for Windows...
+  echo   URL: https://services.gradle.org/distributions/gradle-%GRADLE_VERSION%-bin.zip
   if not exist "%GRADLE_DIR%" mkdir "%GRADLE_DIR%"
   powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri 'https://services.gradle.org/distributions/gradle-%GRADLE_VERSION%-bin.zip' -OutFile '%SCRIPT_DIR%gradle-bin.zip'"
   powershell -NoProfile -Command "Expand-Archive -Path '%SCRIPT_DIR%gradle-bin.zip' -DestinationPath '%SCRIPT_DIR%deps'"
@@ -75,7 +78,9 @@ if "%FORCE_DOWNLOAD%"=="true" (
 )
 
 if not exist "%JBIG2_EXE%" (
+  echo.
   echo Downloading jbig2enc v0.32 (MSVC x64) for Windows...
+  echo   URL: %WIN_ZIP_URL%
   powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri '%WIN_ZIP_URL%' -OutFile '%SCRIPT_DIR%jbig2enc-win.zip'" 2>nul
   if exist "%SCRIPT_DIR%jbig2enc-win.zip" (
     powershell -NoProfile -Command "Expand-Archive -Path '%SCRIPT_DIR%jbig2enc-win.zip' -DestinationPath '%SCRIPT_DIR%deps\jbig2enc\win-tmp' -Force" 2>nul
@@ -106,7 +111,9 @@ rem Noto Sans SC (SIL OFL 1.1) — covers Latin + CJK with TrueType outlines
 set "FONTS_DIR=%SCRIPT_DIR%deps\fonts"
 if not exist "%FONTS_DIR%" mkdir "%FONTS_DIR%"
 if not exist "%FONTS_DIR%\NotoSansSC-Regular.ttf" (
+  echo.
   echo Downloading Noto Sans SC CJK font ^(~34 MB^)...
+  echo   URL: https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%%5Bwght%%5D.ttf
   powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%%5Bwght%%5D.ttf' -OutFile '%FONTS_DIR%\NotoSansSC-Regular.ttf'"
   echo Noto Sans SC downloaded to %FONTS_DIR%
 ) else (
@@ -118,3 +125,37 @@ echo.
 echo Bootstrap complete.
 echo Run:  run.bat input.pdf -o output.pdf
 echo Flags: --force  force re-download of all dependencies
+goto :eof
+
+rem ── JDK install subroutine ────────────────────────────────────────────
+rem Downloads an OpenJDK 21 archive, flattens the versioned folder so
+rem java.exe lands at %JDK_DIR%\bin\java.exe. Sets JAVA_EXE on success;
+rem leaves it unset (after cleaning up) on failure so the caller can retry.
+:installJdk
+set "JDK_URL=%~1"
+set "JDK_SRC=%~2"
+set "JDK_OK=false"
+echo   URL: %JDK_URL%
+echo   Downloading from %JDK_SRC%...
+if exist "%JDK_DIR%" rmdir /S /Q "%JDK_DIR%" 2>nul
+mkdir "%JDK_DIR%" 2>nul
+powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri '%JDK_URL%' -OutFile '%SCRIPT_DIR%openjdk21-win.zip'" 2>nul
+if exist "%SCRIPT_DIR%openjdk21-win.zip" (
+  powershell -NoProfile -Command "Expand-Archive -Path '%SCRIPT_DIR%openjdk21-win.zip' -DestinationPath '%JDK_DIR%'" 2>nul
+  del /Q "%SCRIPT_DIR%openjdk21-win.zip" 2>nul
+  rem Flatten versioned folder (jdk-*) so java.exe is at %JDK_DIR%\bin\java.exe
+  for /d %%d in ("%JDK_DIR%\jdk-*") do (
+    xcopy /E /Y "%%d\*" "%JDK_DIR%\" >nul 2>nul
+    rmdir /S /Q "%%d"
+  )
+  if exist "%JDK_DIR%\bin\java.exe" (
+    set "JAVA_EXE=%JDK_DIR%\bin\java.exe"
+    set "JDK_OK=true"
+  )
+)
+if not "%JDK_OK%"=="true" (
+  echo   Failed to install JDK from %JDK_SRC%.
+  if exist "%JDK_DIR%" rmdir /S /Q "%JDK_DIR%" 2>nul
+  mkdir "%JDK_DIR%" 2>nul
+)
+exit /b 0
