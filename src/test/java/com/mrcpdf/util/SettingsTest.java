@@ -53,5 +53,6 @@ class SettingsTest {
         assertEquals("HELVETICA", s.getString("pdf.font", "DEFAULT"));
         assertEquals(0.33, s.getDouble("pipeline.mrc.backgroundScale", 0), 1e-9);
         assertEquals(0.50, s.getDouble("pipeline.mrc.jpegQuality", 0), 1e-9);
+        assertEquals(0.85, s.getDouble("pipeline.jpegQuality", 0), 1e-9);
     }
 }

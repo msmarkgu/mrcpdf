@@ -524,11 +524,11 @@ public class PDFAssembler {
             // Layer 1: background image
             // When a foreground mask is present, the background can be lossy JPEG
             // because the foreground stencil preserves text pixels at full sharpness.
-            // When no mask exists, the background is the only visual layer, so JPEG
-            // at a moderate quality is used directly.
+            // When no mask exists, the background is the only visual layer, so a
+            // higher JPEG quality is used (default pipeline.jpegQuality = 0.85).
+            // The quality passed in (bgJpegQuality) is resolved per mode by the caller.
             boolean hasMask = foregroundMask != null;
-            float bgQuality = hasMask ? bgJpegQuality : 0.85f;
-            PDImageXObject bgXObject = encodeBackgroundJpeg(output, background, bgQuality, hasMask);
+            PDImageXObject bgXObject = encodeBackgroundJpeg(output, background, bgJpegQuality, hasMask);
             cs.drawImage(bgXObject, 0, 0, pageW, pageH);
 
             // Layer 2: foreground mask as CCITT G4 stencil overlay (JBIG2 when available)

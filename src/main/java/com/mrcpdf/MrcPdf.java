@@ -100,15 +100,26 @@ public class MrcPdf implements Callable<Integer> {
                     : new File(settings.getString("output.file", "output.pdf"));
             String resolvedNative = settings.getString("native.dir", "./deps/jbig2enc");
 
+            boolean useMrc = settings.getBoolean("pipeline.mrc.enabled", true);
+            boolean usePdfa = pdfa != null ? pdfa : settings.getBoolean("pdf.pdfa.enabled", false);
+
             float resolvedDpi = dpi != null ? dpi
                     : (float) settings.getDouble("rendering.dpi", 300);
             double resolvedBgScale = bgScale != null ? bgScale
                     : settings.getDouble("pipeline.mrc.backgroundScale", 0.33);
-            float resolvedJpegQuality = jpegQuality != null ? jpegQuality
-                    : (float) settings.getDouble("pipeline.mrc.jpegQuality", 0.50);
-
-            boolean useMrc = settings.getBoolean("pipeline.mrc.enabled", true);
-            boolean usePdfa = pdfa != null ? pdfa : settings.getBoolean("pdf.pdfa.enabled", false);
+            // Background JPEG quality. Applies to both modes: when a foreground
+            // mask is present (MRC on) the default is pipeline.mrc.jpegQuality
+            // (0.50); without a mask (MRC off) the background is the only visual
+            // layer, so the default is the higher pipeline.jpegQuality (0.85).
+            // --jpeg-quality overrides the active mode's default.
+            float resolvedJpegQuality;
+            if (jpegQuality != null) {
+                resolvedJpegQuality = jpegQuality;
+            } else if (useMrc) {
+                resolvedJpegQuality = (float) settings.getDouble("pipeline.mrc.jpegQuality", 0.50);
+            } else {
+                resolvedJpegQuality = (float) settings.getDouble("pipeline.jpegQuality", 0.85);
+            }
 
             // True MRC foreground color plane: soft masks are not allowed in
             // PDF/A-2b, so force the setting off and warn when both are requested.

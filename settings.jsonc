@@ -79,6 +79,13 @@
     // Override via --jpeg-quality CLI flag.
     "pipeline.mrc.jpegQuality": 0.50,
 
+    // Background JPEG quality when MRC is OFF (no foreground mask, so the
+    // background is the only visual layer). 0.1 - 1.0.
+    //   0.85 = default (good fidelity for full-resolution page images)
+    //   1.0  = near-lossless, larger file
+    // Ignored when "pipeline.mrc.enabled" is true. Override via --jpeg-quality.
+    "pipeline.jpegQuality": 0.85,
+
     // Pre-encode Gaussian blur sigma for MRC background (0 = off).
     //   0.8  = mild smoothing (reduces JPEG artifacts, improves compression)
     //   0    = no smoothing
