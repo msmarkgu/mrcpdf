@@ -7,6 +7,8 @@
     // DPI for rendering PDF pages to images before compression.
     //   300 = standard quality
     //   200 = faster, smaller output
+    //   600 = high resolution (≈4x the memory of 300; raise the JVM heap and/or
+    //         lower pipeline.maxThreads to avoid running out of memory)
     "rendering.dpi": 300,
 
     // ===== Image Segmentation =====
@@ -54,6 +56,8 @@
     // Maximum worker threads for page preparation (rendering is always
     // sequential; segmentation + text extraction + image IO run in parallel).
     // 0 = auto (use all available processors).  Override via --threads.
+    // The pipeline keeps up to (threads + 2) pages in memory at once; at high
+    // DPI (e.g. 600) each page needs ~1 GB, so cap this and raise the JVM heap.
     "pipeline.maxThreads": 0,
 
     // ===== MRC =====
@@ -74,6 +78,13 @@
     //   0.90 = higher quality background, larger file
     // Override via --jpeg-quality CLI flag.
     "pipeline.mrc.jpegQuality": 0.50,
+
+    // Background JPEG quality when MRC is OFF (no foreground mask, so the
+    // background is the only visual layer). 0.1 - 1.0.
+    //   0.85 = default (good fidelity for full-resolution page images)
+    //   1.0  = near-lossless, larger file
+    // Ignored when "pipeline.mrc.enabled" is true. Override via --jpeg-quality.
+    "pipeline.jpegQuality": 0.85,
 
     // Pre-encode Gaussian blur sigma for MRC background (0 = off).
     //   0.8  = mild smoothing (reduces JPEG artifacts, improves compression)
