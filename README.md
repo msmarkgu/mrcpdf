@@ -89,6 +89,19 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 
 The jbig2enc binary and CJK font bundled in `deps/` are used automatically; all defaults are configurable via [`settings.jsonc`](settings.jsonc), and CLI flags take precedence.
 
+### High DPI & memory
+
+Rendering memory scales with **DPI²**: going from 300 to 600 DPI quadruples the pixel count, so each page needs ~4× the memory. At 600 DPI a US Letter page is ≈ 5100×6600 px and needs roughly **1 GB per page in flight** (the pipeline keeps about `--threads` + 2 pages in memory at once).
+
+Recommendations for high DPI:
+
+| Setting | Linux / macOS | Windows |
+|---------|---------------|---------|
+| 300 DPI (default) | `./run.sh input.pdf -o out.pdf` | `run.bat input.pdf -o out.pdf` (2 GB default) |
+| 600 DPI | `MRCPDF_HEAP=8g ./run.sh --dpi 600 --threads 2 input.pdf -o out.pdf` | `set MRCPDF_HEAP=8g` then `run.bat --dpi 600 --threads 2 input.pdf -o out.pdf` |
+
+Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pipeline.maxThreads` in `settings.jsonc`) so `(threads + 2) × per-page` fits your RAM. The default heap is 2 GB (`MRCPDF_HEAP`) on Linux/mac, and 2 GB on Windows after the `run.bat` change.
+
 ---
 
 ## Mixed Raster Content (MRC) Compression

@@ -20,4 +20,6 @@ rem Run from the repo root so bundled deps (jbig2enc, fonts, settings.jsonc)
 rem resolve correctly regardless of the calling directory.
 cd /d "%SCRIPT_DIR%"
 
-"%JAVA%" -jar "%FAT_JAR%" %*
+rem Default JVM heap; override with MRCPDF_HEAP (e.g. "8g") for high DPI.
+if not defined MRCPDF_HEAP set "MRCPDF_HEAP=2g"
+"%JAVA%" -Xmx%MRCPDF_HEAP% -jar "%FAT_JAR%" %*
