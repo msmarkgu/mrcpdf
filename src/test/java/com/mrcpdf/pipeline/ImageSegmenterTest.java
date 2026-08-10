@@ -6,33 +6,40 @@ import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
 
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.rendering.PDFRenderer;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import com.mrcpdf.model.SegmentedImage;
 
-    /**
-     * Tests for ImageSegmenter (pure-Java binarization pipeline).
-     *
-     * Verifies that segment() returns non-null outputs, preserves dimensions,
-     * produces a foreground mask, correctly identifies text vs blank pages,
-     * and inpaints foreground pixels in the cleaned background.
-     */
+/**
+ * Tests for ImageSegmenter (pure-Java binarization pipeline).
+ *
+ * Verifies that segment() returns non-null outputs, preserves dimensions,
+ * produces a foreground mask, correctly identifies text vs blank pages,
+ * and inpaints foreground pixels in the cleaned background.
+ */
 class ImageSegmenterTest {
 
-    static PageExtractor extractor;
     static ImageSegmenter segmenter;
 
     @BeforeAll
     static void setup() {
-        extractor = new PageExtractor(150f);
         segmenter = new ImageSegmenter();
+    }
+
+    private static BufferedImage renderPage(String pdfPath) throws IOException {
+        try (PDDocument doc = Loader.loadPDF(new File(pdfPath))) {
+            return new PDFRenderer(doc).renderImageWithDPI(0, 150);
+        }
     }
 
     @Test
     void segment_blankPage_returnsNonNull() throws IOException {
-        var pages = extractor.extractPages(new File("tests/blank.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/blank.pdf");
+        SegmentedImage result = segmenter.segment(page);
         assertNotNull(result);
         assertNotNull(result.getForegroundMask());
         assertNotNull(result.getCleanedBackground());
@@ -40,8 +47,7 @@ class ImageSegmenterTest {
 
     @Test
     void segment_preservesDimensions() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        BufferedImage page = pages.get(0);
+        BufferedImage page = renderPage("tests/simple-text.pdf");
         SegmentedImage result = segmenter.segment(page);
         assertEquals(page.getWidth(), result.getForegroundMask().getWidth());
         assertEquals(page.getHeight(), result.getForegroundMask().getHeight());
@@ -51,16 +57,16 @@ class ImageSegmenterTest {
 
     @Test
     void segment_foregroundMaskIsBinary() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/simple-text.pdf");
+        SegmentedImage result = segmenter.segment(page);
         BufferedImage mask = result.getForegroundMask();
         assertEquals(BufferedImage.TYPE_BYTE_BINARY, mask.getType());
     }
 
     @Test
     void segment_blankPage_hasLittleForeground() throws IOException {
-        var pages = extractor.extractPages(new File("tests/blank.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/blank.pdf");
+        SegmentedImage result = segmenter.segment(page);
         BufferedImage mask = result.getForegroundMask();
         int width = mask.getWidth();
         int height = mask.getHeight();
@@ -80,8 +86,8 @@ class ImageSegmenterTest {
 
     @Test
     void segment_simpleText_hasForegroundPixels() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/simple-text.pdf");
+        SegmentedImage result = segmenter.segment(page);
         BufferedImage mask = result.getForegroundMask();
         int width = mask.getWidth();
         int height = mask.getHeight();
@@ -101,8 +107,7 @@ class ImageSegmenterTest {
 
     @Test
     void segment_cleanedBackground_reducesTextNoise() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        BufferedImage page = pages.get(0);
+        BufferedImage page = renderPage("tests/simple-text.pdf");
         SegmentedImage result = segmenter.segment(page);
         BufferedImage cleaned = result.getCleanedBackground();
 
@@ -132,13 +137,13 @@ class ImageSegmenterTest {
 
     @Test
     void otsuMode_remainsFunctional() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
+        BufferedImage page = renderPage("tests/simple-text.pdf");
         ImageSegmenter otsu = new ImageSegmenter(64, 0.95, 0, "otsu", 15, 0.20, 128, 0.005, 0.10);
-        SegmentedImage result = otsu.segment(pages.get(0));
+        SegmentedImage result = otsu.segment(page);
 
         assertEquals(BufferedImage.TYPE_BYTE_BINARY, result.getForegroundMask().getType());
         int blackPixels = countBlackPixels(result.getForegroundMask());
-        assertTrue((double) blackPixels / (pages.get(0).getWidth() * pages.get(0).getHeight()) > 0.001,
+        assertTrue((double) blackPixels / (page.getWidth() * page.getHeight()) > 0.001,
                 "Otsu mode should still detect text as foreground");
     }
 

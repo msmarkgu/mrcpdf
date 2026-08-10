@@ -123,7 +123,7 @@ public class ImageSegmenter {
         if ("otsu".equals(thresholdMode)) {
             int threshold = otsuThreshold(bgNormalized);
             for (int i = 0; i < binary.length; i++) {
-                binary[i] = (gray[i] <= threshold) ? 1 : 0;
+                binary[i] = (bgNormalized[i] <= threshold) ? 1 : 0;
             }
         } else {
             int[] thresholds = sauvolaThreshold(bgNormalized, width, height, sauvolaWindow, sauvolaK, sauvolaR);

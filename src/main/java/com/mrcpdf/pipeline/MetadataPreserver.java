@@ -10,6 +10,7 @@ import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSBase;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.cos.COSObject;
 import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
@@ -35,7 +36,6 @@ import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlin
  *   - XML metadata stream (XMP)
  *
  * Limitations:
- *   - Annotation page references (e.g. link destinations) are not remapped.
  *   - Named destinations are preserved but may reference missing pages.
  */
 public class MetadataPreserver {
@@ -164,12 +164,52 @@ public class MetadataPreserver {
                 // Strip /P (parent page) — the cloned annotation dictionary should not
                 // carry a reference back to the source page.
                 cloned.removeItem(COSName.P);
+                remapAnnotationDest(cloned, source, outputPages);
                 dstAnnots.add(cloned);
             }
             dstPage.getCOSObject().setItem(COSName.ANNOTS, dstAnnots);
             totalAnnotations += annotations.size();
         }
         return totalAnnotations;
+    }
+
+    /**
+     * Remaps page references inside a cloned annotation dictionary from source
+     * pages to the corresponding output pages. Handles /Dest (explicit or array
+     * form) and /A → /D (action destination).
+     */
+    private void remapAnnotationDest(COSDictionary annot, PDDocument source, List<PDPage> outputPages) {
+        COSBase dest = annot.getDictionaryObject(COSName.DEST);
+        if (dest != null) {
+            COSBase remapped = resolvePageRef(dest, source, outputPages);
+            if (remapped != dest) annot.setItem(COSName.DEST, remapped);
+        }
+        COSBase action = annot.getDictionaryObject(COSName.A);
+        if (action instanceof COSDictionary actionDict) {
+            COSBase aDest = actionDict.getDictionaryObject(COSName.D);
+            if (aDest != null) {
+                COSBase remapped = resolvePageRef(aDest, source, outputPages);
+                if (remapped != aDest) actionDict.setItem(COSName.D, remapped);
+            }
+        }
+    }
+
+    /**
+     * If {@code value} is a COSObject whose referent is a source page dictionary,
+     * returns the matching output page's COSObject. Otherwise returns {@code value}
+     * unchanged. Identity-based: compares the underlying COSObject, not page index,
+     * because annotations may hold indirect references to the page object.
+     */
+    private COSBase resolvePageRef(COSBase value, PDDocument source, List<PDPage> outputPages) {
+        if (!(value instanceof COSObject cosObj)) return value;
+        COSBase referent = cosObj.getObject();
+        if (!(referent instanceof COSDictionary)) return value;
+        for (int i = 0; i < outputPages.size(); i++) {
+            if (source.getPage(i).getCOSObject() == referent) {
+                return outputPages.get(i).getCOSObject();
+            }
+        }
+        return value;
     }
 
     private int copyEmbeddedFiles(PDDocument source, PDDocument output) throws IOException {

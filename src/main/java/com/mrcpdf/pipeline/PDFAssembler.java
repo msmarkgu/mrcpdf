@@ -1,61 +1,32 @@
 package com.mrcpdf.pipeline;
 
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.StringWriter;
-import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
-import javax.imageio.IIOImage;
-import javax.imageio.ImageIO;
-import javax.imageio.ImageTypeSpecifier;
-import javax.imageio.ImageWriteParam;
-import javax.imageio.ImageWriter;
-import javax.imageio.metadata.IIOMetadata;
-import javax.imageio.stream.MemoryCacheImageOutputStream;
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
-
-import org.apache.fontbox.ttf.TrueTypeCollection;
-import org.apache.fontbox.ttf.TrueTypeFont;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.common.PDStream;
-import org.apache.pdfbox.pdmodel.PDDocumentCatalog;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
-import org.apache.pdfbox.pdmodel.common.PDMetadata;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDFont;
-import org.apache.pdfbox.pdmodel.font.PDType0Font;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
-import org.apache.pdfbox.pdmodel.graphics.color.PDOutputIntent;
 import org.apache.pdfbox.pdmodel.graphics.image.CCITTFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.graphics.state.RenderingMode;
 import org.apache.pdfbox.util.Matrix;
-import org.w3c.dom.Document;
-import org.w3c.dom.Element;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
 
 import com.mrcpdf.model.PageResult;
 import com.mrcpdf.model.TextBlock;
@@ -101,6 +72,8 @@ public class PDFAssembler {
     private boolean foregroundColorEnabled;
     private double fgScale;
     private float fgJpegQuality;
+    private final Map<Integer, Boolean> glyphEncodeCache = new HashMap<>();
+    private final Map<String, Float> stringWidthCache = new HashMap<>();
 
     public PDFAssembler() {
         this("HELVETICA", 1f);
@@ -167,32 +140,16 @@ public class PDFAssembler {
         this.fgJpegQuality = Math.max(0.1f, Math.min(1.0f, quality));
     }
 
+    public double getBackgroundScale() { return backgroundScale; }
+    public float getBgSmoothSigma() { return bgSmoothSigma; }
+    public float getBgJpegQuality() { return bgJpegQuality; }
+    public boolean isForegroundColorEnabled() { return foregroundColorEnabled; }
+    public double getFgScale() { return fgScale; }
+    public float getFgJpegQuality() { return fgJpegQuality; }
+
     private PDImageXObject encodeBackgroundJpeg(PDDocument doc, BufferedImage image, float quality, boolean hasMask) throws IOException {
-        BufferedImage toEncode = image;
-
-        // Step 1: Downsample background (text sharpness preserved by mask).
-        // Do this FIRST so subsequent Gaussian blur runs at reduced resolution (~9x fewer pixels).
-        if (hasMask && backgroundScale < 1.0) {
-            int newW = Math.max(1, (int) Math.round(image.getWidth() * backgroundScale));
-            int newH = Math.max(1, (int) Math.round(image.getHeight() * backgroundScale));
-            BufferedImage scaled = new BufferedImage(newW, newH, BufferedImage.TYPE_3BYTE_BGR);
-            Graphics2D g = scaled.createGraphics();
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.drawImage(image, 0, 0, newW, newH, null);
-            g.dispose();
-            toEncode = scaled;
-        }
-
-        // Step 2: Pre-encode smoothing (reduces JPEG artifacts, improves compression)
-        // Scale sigma inversely with backgroundScale so blur is proportional to original resolution.
-        if (hasMask && bgSmoothSigma > 0f) {
-            float effectiveSigma = bgSmoothSigma / (float) backgroundScale;
-            toEncode = gaussianBlur(toEncode, effectiveSigma);
-        }
-
-        // Step 3: Encode as JPEG with 4:2:0 chroma subsampling + progressive
-        // Using ImageWriter directly instead of JPEGFactory for chroma control
-        return encodeJpeg(doc, toEncode, quality, 2, 2);
+        byte[] jpegBytes = ImageEncoder.encodeBackground(image, quality, hasMask, backgroundScale, bgSmoothSigma);
+        return PDImageXObject.createFromByteArray(doc, jpegBytes, "image");
     }
 
     /**
@@ -202,94 +159,8 @@ public class PDFAssembler {
      * the exact text shapes, so pre-blur would soften the colors.
      */
     private PDImageXObject encodeForegroundColorJpeg(PDDocument doc, BufferedImage image) throws IOException {
-        BufferedImage toEncode = image;
-        if (fgScale < 1.0) {
-            int newW = Math.max(1, (int) Math.round(image.getWidth() * fgScale));
-            int newH = Math.max(1, (int) Math.round(image.getHeight() * fgScale));
-            BufferedImage scaled = new BufferedImage(newW, newH, BufferedImage.TYPE_3BYTE_BGR);
-            Graphics2D g = scaled.createGraphics();
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.drawImage(image, 0, 0, newW, newH, null);
-            g.dispose();
-            toEncode = scaled;
-        }
-        return encodeJpeg(doc, toEncode, fgJpegQuality, 1, 1);
-    }
-
-    /**
-     * JPEG-encodes an image via a direct ImageWriter so chroma subsampling can
-     * be controlled. {@code hSample}/{@code vSample} (1 or 2) set the luma
-     * sampling factors; 2/2 gives 4:2:0 (background), 1/1 gives 4:4:4 (color
-     * foreground). Component IDs are bounds-checked so a nonstandard writer tree
-     * can't corrupt the encoding; on any unexpected metadata we fall back to the
-     * writer's default subsampling.
-     */
-    private PDImageXObject encodeJpeg(PDDocument doc, BufferedImage image, float quality,
-                                      int hSample, int vSample) throws IOException {
-        ImageWriter writer = null;
-        try {
-            writer = ImageIO.getImageWritersByFormatName("JPEG").next();
-            ImageWriteParam param = writer.getDefaultWriteParam();
-            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
-            param.setCompressionQuality(quality);
-            param.setProgressiveMode(ImageWriteParam.MODE_DEFAULT);
-
-            ImageTypeSpecifier type = ImageTypeSpecifier.createFromRenderedImage(image);
-            IIOMetadata meta = writer.getDefaultImageMetadata(type, param);
-            if (meta != null && !meta.isReadOnly()) {
-                try {
-                    Element tree = (Element) meta.getAsTree("javax_imageio_jpeg_image_1.0");
-                    NodeList markers = tree.getElementsByTagName("markerSequence");
-                    if (markers.getLength() > 0) {
-                        Element markerSeq = (Element) markers.item(0);
-                        NodeList sofList = markerSeq.getElementsByTagName("sof");
-                        if (sofList.getLength() > 0) {
-                            Element sof = (Element) sofList.item(0);
-                            int numComponents;
-                            try {
-                                numComponents = Integer.parseInt(sof.getAttribute("numFrameComponents"));
-                            } catch (NumberFormatException e) {
-                                numComponents = 4; // sane default; loop still bounds-checks IDs
-                            }
-                            Element marker = (Element) sof.getParentNode();
-                            NodeList childNodes = marker.getChildNodes();
-                            for (int ci = 0; ci < childNodes.getLength(); ci++) {
-                                Node child = childNodes.item(ci);
-                                if (child.getNodeType() != Node.ELEMENT_NODE) continue;
-                                Element comp = (Element) child;
-                                int compId;
-                                try {
-                                    compId = Integer.parseInt(comp.getAttribute("componentId"));
-                                } catch (NumberFormatException e) {
-                                    continue;
-                                }
-                                if (compId < 0 || compId >= numComponents) continue;
-                                if (compId == 0) {
-                                    comp.setAttribute("HsamplingFactor", Integer.toString(hSample));
-                                    comp.setAttribute("VsamplingFactor", Integer.toString(vSample));
-                                } else {
-                                    comp.setAttribute("HsamplingFactor", "1");
-                                    comp.setAttribute("VsamplingFactor", "1");
-                                }
-                            }
-                        }
-                    }
-                    meta.setFromTree("javax_imageio_jpeg_image_1.0", tree);
-                } catch (Exception e) {
-                    // Unexpected metadata tree — keep the writer's default subsampling.
-                }
-            }
-
-            ByteArrayOutputStream baos = new ByteArrayOutputStream(8192);
-            try (MemoryCacheImageOutputStream mcios = new MemoryCacheImageOutputStream(baos)) {
-                writer.setOutput(mcios);
-                writer.write(null, new IIOImage(image, null, meta), param);
-            }
-
-            return PDImageXObject.createFromByteArray(doc, baos.toByteArray(), "image");
-        } finally {
-            if (writer != null) writer.dispose();
-        }
+        byte[] jpegBytes = ImageEncoder.encodeForegroundColor(image, fgJpegQuality, fgScale);
+        return PDImageXObject.createFromByteArray(doc, jpegBytes, "image");
     }
 
     static BufferedImage gaussianBlur(BufferedImage image, float sigma) {
@@ -498,88 +369,140 @@ public class PDFAssembler {
                           BufferedImage foregroundColor,
                           PageResult ocr) throws IOException {
         PDPage sourcePage = source.getPage(pageIndex);
-        // Use crop box dimensions so the output page matches the visible area
-        // that PDFRenderer.renderImageWithDPI() renders.  When the source crop
-        // box differs from the media box this keeps text coordinates aligned.
         PDRectangle cropBox = sourcePage.getCropBox();
         float pageW = cropBox.getWidth();
         float pageH = cropBox.getHeight();
-        // The background image is rendered in display orientation, which swaps
-        // width and height for rotated (90/270) pages.  Match those display
-        // dimensions so the background is drawn undistorted and the text-layer
-        // scale factors stay consistent.  The output page keeps /Rotate 0
-        // because the background is already pre-rotated.
         if (sourcePage.getRotation() % 180 != 0) {
             float tmp = pageW;
             pageW = pageH;
             pageH = tmp;
         }
 
-        // Create page with [0,0,pageW,pageH] so user space origin aligns
-        // with the crop-box-relative coordinates from text extraction.
         PDPage outPage = new PDPage(new PDRectangle(pageW, pageH));
         output.addPage(outPage);
 
         try (PDPageContentStream cs = new PDPageContentStream(output, outPage)) {
-            // Layer 1: background image
-            // When a foreground mask is present, the background can be lossy JPEG
-            // because the foreground stencil preserves text pixels at full sharpness.
-            // When no mask exists, the background is the only visual layer, so a
-            // higher JPEG quality is used (default pipeline.jpegQuality = 0.85).
-            // The quality passed in (bgJpegQuality) is resolved per mode by the caller.
             boolean hasMask = foregroundMask != null;
             PDImageXObject bgXObject = encodeBackgroundJpeg(output, background, bgJpegQuality, hasMask);
             cs.drawImage(bgXObject, 0, 0, pageW, pageH);
 
-            // Layer 2: foreground mask as CCITT G4 stencil overlay (JBIG2 when available)
-            // or, in foreground-color mode, as a soft mask (SMask) over a color plane.
-            if (foregroundMask != null) {
-                if (foregroundColorEnabled && foregroundColor != null) {
-                    PDImageXObject maskXObject;
-                    if (compressor != null) {
-                        JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
-                        if (result.isJbig2()) {
-                            maskXObject = createJbig2SmaskXObject(output, result);
-                        } else {
-                            maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
-                        }
-                    } else {
-                        maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
-                    }
-                    // 1-bit DeviceGray mask: text samples decode to black (0), so
-                    // Decode [1 0] inverts them to white = opaque alpha.
-                    maskXObject.getCOSObject().setBoolean(COSName.IMAGE_MASK, false);
-                    maskXObject.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
-                    maskXObject.getCOSObject().setItem(COSName.DECODE, maskDecode());
+            drawForegroundLayers(cs, output, foregroundMask, foregroundColor, pageW, pageH);
 
-                    PDImageXObject fgColorXObject = encodeForegroundColorJpeg(output, foregroundColor);
-                    fgColorXObject.getCOSObject().setItem(COSName.SMASK, maskXObject.getCOSObject());
-                    cs.drawImage(fgColorXObject, 0, 0, pageW, pageH);
-                } else {
-                    PDImageXObject fgImage;
-                    if (compressor != null) {
-                        JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
-                        if (result.isJbig2()) {
-                            fgImage = createJbig2ImageXObject(output, result);
-                        } else {
-                            fgImage = CCITTFactory.createFromImage(output, foregroundMask);
-                        }
-                    } else {
-                        fgImage = CCITTFactory.createFromImage(output, foregroundMask);
-                    }
-                    fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
-                    fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
-                    cs.setNonStrokingColor(0f, 0f, 0f);
-                    cs.drawImage(fgImage, 0, 0, pageW, pageH);
-                }
-            }
-
-            // Layer 3: invisible OCR text
             PDFont pageFont = resolveFont(output);
             writeTextLayer(cs, ocr, pageW, pageH, pageFont);
         }
 
         return outPage;
+    }
+
+    /**
+     * Adds a page using pre-encoded JPEG byte arrays for background and
+     * foreground color, eliminating the intermediate BMP disk round-trip.
+     */
+    public PDPage addPage(PDDocument output, PDDocument source, int pageIndex,
+                          byte[] bgJpegBytes, byte[] fgColorJpegBytes,
+                          BufferedImage foregroundMask, PageResult ocr) throws IOException {
+        PDPage sourcePage = source.getPage(pageIndex);
+        PDRectangle cropBox = sourcePage.getCropBox();
+        float pageW = cropBox.getWidth();
+        float pageH = cropBox.getHeight();
+        if (sourcePage.getRotation() % 180 != 0) {
+            float tmp = pageW;
+            pageW = pageH;
+            pageH = tmp;
+        }
+
+        PDPage outPage = new PDPage(new PDRectangle(pageW, pageH));
+        output.addPage(outPage);
+
+        try (PDPageContentStream cs = new PDPageContentStream(output, outPage)) {
+            PDImageXObject bgXObject = PDImageXObject.createFromByteArray(output, bgJpegBytes, "background");
+            cs.drawImage(bgXObject, 0, 0, pageW, pageH);
+
+            if (fgColorJpegBytes != null && foregroundColorEnabled) {
+                PDImageXObject maskXObject;
+                if (compressor != null) {
+                    JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
+                    if (result.isJbig2()) {
+                        maskXObject = createJbig2SmaskXObject(output, result);
+                    } else {
+                        maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
+                    }
+                } else {
+                    maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
+                }
+                maskXObject.getCOSObject().setBoolean(COSName.IMAGE_MASK, false);
+                maskXObject.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
+                maskXObject.getCOSObject().setItem(COSName.DECODE, maskDecode());
+
+                PDImageXObject fgColorXObject = PDImageXObject.createFromByteArray(output, fgColorJpegBytes, "foreground-color");
+                fgColorXObject.getCOSObject().setItem(COSName.SMASK, maskXObject.getCOSObject());
+                cs.drawImage(fgColorXObject, 0, 0, pageW, pageH);
+            } else if (foregroundMask != null) {
+                PDImageXObject fgImage;
+                if (compressor != null) {
+                    JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
+                    if (result.isJbig2()) {
+                        fgImage = createJbig2ImageXObject(output, result);
+                    } else {
+                        fgImage = CCITTFactory.createFromImage(output, foregroundMask);
+                    }
+                } else {
+                    fgImage = CCITTFactory.createFromImage(output, foregroundMask);
+                }
+                fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
+                fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
+                cs.setNonStrokingColor(0f, 0f, 0f);
+                cs.drawImage(fgImage, 0, 0, pageW, pageH);
+            }
+
+            PDFont pageFont = resolveFont(output);
+            writeTextLayer(cs, ocr, pageW, pageH, pageFont);
+        }
+
+        return outPage;
+    }
+
+    private void drawForegroundLayers(PDPageContentStream cs, PDDocument output,
+                                       BufferedImage foregroundMask, BufferedImage foregroundColor,
+                                       float pageW, float pageH) throws IOException {
+        if (foregroundMask == null) return;
+        if (foregroundColorEnabled && foregroundColor != null) {
+            PDImageXObject maskXObject;
+            if (compressor != null) {
+                JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
+                if (result.isJbig2()) {
+                    maskXObject = createJbig2SmaskXObject(output, result);
+                } else {
+                    maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
+                }
+            } else {
+                maskXObject = CCITTFactory.createFromImage(output, foregroundMask);
+            }
+            maskXObject.getCOSObject().setBoolean(COSName.IMAGE_MASK, false);
+            maskXObject.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
+            maskXObject.getCOSObject().setItem(COSName.DECODE, maskDecode());
+
+            PDImageXObject fgColorXObject = encodeForegroundColorJpeg(output, foregroundColor);
+            fgColorXObject.getCOSObject().setItem(COSName.SMASK, maskXObject.getCOSObject());
+            cs.drawImage(fgColorXObject, 0, 0, pageW, pageH);
+        } else {
+            PDImageXObject fgImage;
+            if (compressor != null) {
+                JBIG2Compressor.CompressionResult result = compressor.compress(foregroundMask);
+                if (result.isJbig2()) {
+                    fgImage = createJbig2ImageXObject(output, result);
+                } else {
+                    fgImage = CCITTFactory.createFromImage(output, foregroundMask);
+                }
+            } else {
+                fgImage = CCITTFactory.createFromImage(output, foregroundMask);
+            }
+            fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
+            fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
+            cs.setNonStrokingColor(0f, 0f, 0f);
+            cs.drawImage(fgImage, 0, 0, pageW, pageH);
+        }
     }
 
     /**
@@ -592,7 +515,7 @@ public class PDFAssembler {
                                List<PDPage> outPages, boolean usePdfa) throws IOException {
         MetadataPreserver.PreserveResult preserved = preserver.preserve(source, output, outPages);
         if (usePdfa) {
-            addPdfaMetadata(output);
+            PdfaWriter.addPdfaMetadata(output);
         }
         if (producer != null) {
             PDDocumentInformation info = output.getDocumentInformation();
@@ -608,6 +531,8 @@ public class PDFAssembler {
         }
         dynamicFont = null;
         jbig2GlobalStream = null;
+        glyphEncodeCache.clear();
+        stringWidthCache.clear();
         if (skippedGlyphCount > 0) {
             System.out.printf("  Warning: %d characters dropped from invisible text layer — unsupported glyphs for font.%n", skippedGlyphCount);
             System.out.println("  Set pdf.fontPath in settings.jsonc to a CJK TTF/OTF file (e.g., NotoSansCJKsc-Regular.otf).");
@@ -785,6 +710,70 @@ public class PDFAssembler {
     }
 
     /**
+     * Adds a page using pre-compressed JBIG2 foreground data with pre-encoded
+     * JPEG byte arrays for background and foreground color (no disk round-trip).
+     */
+    public PDPage addPageJbig2(PDDocument output, PDDocument source, int pageIndex,
+                               byte[] bgJpegBytes, byte[] fgColorJpegBytes,
+                               byte[] jbig2PageData, byte[] jbig2GlobalSym,
+                               int fgWidth, int fgHeight,
+                               PageResult ocr) throws IOException {
+        PDPage sourcePage = source.getPage(pageIndex);
+        PDRectangle cropBox = sourcePage.getCropBox();
+        float pageW = cropBox.getWidth();
+        float pageH = cropBox.getHeight();
+        if (sourcePage.getRotation() % 180 != 0) {
+            float tmp = pageW;
+            pageW = pageH;
+            pageH = tmp;
+        }
+
+        PDPage outPage = new PDPage(new PDRectangle(pageW, pageH));
+        output.addPage(outPage);
+
+        try (PDPageContentStream cs = new PDPageContentStream(output, outPage)) {
+            PDImageXObject bgXObject = PDImageXObject.createFromByteArray(output, bgJpegBytes, "background");
+            cs.drawImage(bgXObject, 0, 0, pageW, pageH);
+
+            if (jbig2PageData != null && jbig2GlobalSym != null) {
+                if (jbig2GlobalStream == null) {
+                    jbig2GlobalStream = new PDStream(output);
+                    try (OutputStream os = jbig2GlobalStream.createOutputStream()) {
+                        os.write(jbig2GlobalSym);
+                    }
+                }
+                COSDictionary decodeParms = new COSDictionary();
+                decodeParms.setItem(COSName.JBIG2_GLOBALS, jbig2GlobalStream);
+
+                if (foregroundColorEnabled && fgColorJpegBytes != null) {
+                    PDImageXObject maskXObject = createJbig2SmaskXObject(output,
+                            jbig2PageData, fgWidth, fgHeight);
+                    maskXObject.getCOSObject().setItem(COSName.DECODE_PARMS, decodeParms);
+                    maskXObject.getCOSObject().setBoolean(COSName.IMAGE_MASK, false);
+                    maskXObject.getCOSObject().setItem(COSName.COLORSPACE, COSName.DEVICEGRAY);
+
+                    PDImageXObject fgColorXObject = PDImageXObject.createFromByteArray(output, fgColorJpegBytes, "foreground-color");
+                    fgColorXObject.getCOSObject().setItem(COSName.SMASK, maskXObject.getCOSObject());
+                    cs.drawImage(fgColorXObject, 0, 0, pageW, pageH);
+                } else {
+                    PDImageXObject fgImage = createJbig2ImageXObject(output,
+                            jbig2PageData, fgWidth, fgHeight);
+                    fgImage.getCOSObject().setItem(COSName.DECODE_PARMS, decodeParms);
+                    fgImage.getCOSObject().setBoolean(COSName.IMAGE_MASK, true);
+                    fgImage.getCOSObject().removeItem(COSName.COLORSPACE);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    cs.drawImage(fgImage, 0, 0, pageW, pageH);
+                }
+            }
+
+            PDFont pageFont = resolveFont(output);
+            writeTextLayer(cs, ocr, pageW, pageH, pageFont);
+        }
+
+        return outPage;
+    }
+
+    /**
      * Draws the invisible, searchable text layer for a page.
      *
      * Each word is stretched horizontally to fill its detected bounding box, so
@@ -813,11 +802,18 @@ public class PDFAssembler {
             // of a text-matrix horizontal scale so that any viewer — whether or
             // not it applies text-matrix scaling when hit-testing — computes the
             // same word boxes. The rendered advance widths are identical.
+            Float cachedWidth = stringWidthCache.get(safeWord);
             float naturalWidth;
-            try {
-                naturalWidth = pageFont.getStringWidth(safeWord) / 1000f * fontSize;
-            } catch (IllegalArgumentException e) {
-                naturalWidth = safeWord.length() * fontSize * 0.5f;
+            if (cachedWidth != null) {
+                naturalWidth = cachedWidth * fontSize;
+            } else {
+                try {
+                    float widthAtPt = pageFont.getStringWidth(safeWord) / 1000f;
+                    naturalWidth = widthAtPt * fontSize;
+                    stringWidthCache.put(safeWord, widthAtPt);
+                } catch (IllegalArgumentException e) {
+                    naturalWidth = safeWord.length() * fontSize * 0.5f;
+                }
             }
             float targetWidth = tb.getBbox().width * scaleX;
             float sx = naturalWidth > 0 ? targetWidth / naturalWidth : 1.0f;
@@ -841,13 +837,23 @@ public class PDFAssembler {
      */
     private String filterSupportedChars(PDFont font, String word) {
         StringBuilder sb = new StringBuilder(word.length());
+        int fontKey = System.identityHashCode(font);
         for (int i = 0; i < word.length(); i++) {
             String ch = word.substring(i, i + 1);
-            try {
-                font.encode(ch);
-                sb.append(ch);
-            } catch (Exception e) {
-                skippedGlyphCount++;
+            int cacheKey = fontKey ^ ch.hashCode();
+            Boolean cached = glyphEncodeCache.get(cacheKey);
+            if (cached != null) {
+                if (cached) sb.append(ch);
+                else skippedGlyphCount++;
+            } else {
+                try {
+                    font.encode(ch);
+                    glyphEncodeCache.put(cacheKey, Boolean.TRUE);
+                    sb.append(ch);
+                } catch (Exception e) {
+                    glyphEncodeCache.put(cacheKey, Boolean.FALSE);
+                    skippedGlyphCount++;
+                }
             }
         }
         return sb.toString();
@@ -890,41 +896,13 @@ public class PDFAssembler {
      * via fontFile being set.
      */
     private PDFont resolveFont(PDDocument output) {
-        // Explicit font path (set via pdf.fontPath or pdf.pdfa.fontPath)
         if (fontFile != null && fontFile.exists()) {
             if (dynamicFont == null) {
-                dynamicFont = loadFont(output, fontFile);
+                dynamicFont = FontResolver.loadFont(output, fontFile);
             }
             if (dynamicFont != null) return dynamicFont;
         }
         return font;
-    }
-
-    /**
-     * Loads a TTF/OTF/TTC font file as a PDType0Font.
-     * Handles TrueType Collection (.ttc) files by loading the first font.
-     */
-    private static PDFont loadFont(PDDocument output, File file) {
-        try {
-            String name = file.getName().toLowerCase();
-            if (name.endsWith(".ttc")) {
-                try (TrueTypeCollection ttc = new TrueTypeCollection(file)) {
-                    // Get the first font in the collection
-                    final TrueTypeFont[] firstFont = new TrueTypeFont[1];
-                    ttc.processAllFonts(font -> {
-                        if (firstFont[0] == null) firstFont[0] = font;
-                    });
-                    if (firstFont[0] != null) {
-                        return PDType0Font.load(output, firstFont[0], true);
-                    }
-                }
-            } else {
-                return PDType0Font.load(output, file);
-            }
-        } catch (IOException e) {
-            System.out.printf("  Warning: could not load font '%s' — may be OTF/CFF (unsupported). Using built-in Helvetica instead.%n", file.getName());
-        }
-        return null;
     }
 
     /**
@@ -975,114 +953,6 @@ public class PDFAssembler {
             }
         }
         return null;
-    }
-
-    private void addPdfaMetadata(PDDocument doc) throws IOException {
-        PDDocumentCatalog catalog = doc.getDocumentCatalog();
-
-        // Merge PDF/A identification into existing XMP metadata,
-        // preserving source document metadata (author, title, etc.).
-        PDMetadata existingMeta = catalog.getMetadata();
-        if (existingMeta != null) {
-            try {
-                byte[] existingBytes;
-                try (InputStream is = existingMeta.createInputStream()) {
-                    existingBytes = is.readAllBytes();
-                }
-                String xmpStr = new String(existingBytes, StandardCharsets.UTF_8);
-
-                int xmpStart = xmpStr.indexOf("<x:xmpmeta");
-                int xmpEnd = xmpStr.lastIndexOf("</x:xmpmeta>");
-                if (xmpStart >= 0 && xmpEnd > xmpStart) {
-                    String rawXml = xmpStr.substring(xmpStart, xmpEnd + "</x:xmpmeta>".length());
-
-                    DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-                    factory.setNamespaceAware(true);
-                    DocumentBuilder builder = factory.newDocumentBuilder();
-                    Document xmlDoc = builder.parse(
-                            new ByteArrayInputStream(rawXml.getBytes(StandardCharsets.UTF_8)));
-
-                    NodeList descList = xmlDoc.getElementsByTagNameNS(
-                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#", "Description");
-                    if (descList.getLength() > 0) {
-                        Element desc = (Element) descList.item(0);
-                        desc.setAttributeNS("http://www.w3.org/2000/xmlns/",
-                                "xmlns:pdfaid", "http://www.aiim.org/pdfa/ns/id/");
-
-                        NodeList partList = xmlDoc.getElementsByTagNameNS(
-                                "http://www.aiim.org/pdfa/ns/id/", "part");
-                        if (partList.getLength() == 0) {
-                            Element partEl = xmlDoc.createElementNS(
-                                    "http://www.aiim.org/pdfa/ns/id/", "pdfaid:part");
-                            partEl.setTextContent("2");
-                            desc.appendChild(partEl);
-                        }
-
-                        NodeList confList = xmlDoc.getElementsByTagNameNS(
-                                "http://www.aiim.org/pdfa/ns/id/", "conformance");
-                        if (confList.getLength() == 0) {
-                            Element confEl = xmlDoc.createElementNS(
-                                    "http://www.aiim.org/pdfa/ns/id/", "pdfaid:conformance");
-                            confEl.setTextContent("B");
-                            desc.appendChild(confEl);
-                        }
-                    }
-
-                    TransformerFactory tf = TransformerFactory.newInstance();
-                    Transformer transformer = tf.newTransformer();
-                    transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
-                    transformer.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
-                    StringWriter sw = new StringWriter();
-                    transformer.transform(new DOMSource(xmlDoc), new StreamResult(sw));
-                    String modifiedXml = sw.toString();
-
-                    String wrapped = "<?xpacket begin=\"\uFEFF\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
-                            + modifiedXml + "\n<?xpacket end=\"w\"?>";
-
-                    PDMetadata metadata = new PDMetadata(doc);
-                    metadata.importXMPMetadata(wrapped.getBytes(StandardCharsets.UTF_8));
-                    catalog.setMetadata(metadata);
-                }
-            } catch (Exception e) {
-                setStaticPdfaMetadata(catalog, doc);
-            }
-        } else {
-            setStaticPdfaMetadata(catalog, doc);
-        }
-
-        // sRGB output intent
-        try (InputStream srgbStream = getClass().getResourceAsStream("/sRGB Color Space Profile.icm")) {
-            if (srgbStream != null) {
-                PDOutputIntent intent = new PDOutputIntent(doc, srgbStream);
-                intent.setInfo("sRGB IEC61966-2.1");
-                intent.setOutputCondition("sRGB IEC61966-2.1");
-                intent.setOutputConditionIdentifier("sRGB IEC61966-2.1");
-                intent.setRegistryName("http://www.color.org");
-                catalog.addOutputIntent(intent);
-            }
-        }
-    }
-
-    private void setStaticPdfaMetadata(PDDocumentCatalog catalog, PDDocument doc) throws IOException {
-        String xmp = """
-                <?xpacket begin="\\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>
-                <x:xmpmeta xmlns:x="adobe:ns:meta/">
-                  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-                    <rdf:Description rdf:about=""
-                      xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
-                      <pdfaid:part>2</pdfaid:part>
-                      <pdfaid:conformance>B</pdfaid:conformance>
-                    </rdf:Description>
-                    <rdf:Description rdf:about=""
-                      xmlns:dc="http://purl.org/dc/elements/1.1/">
-                      <dc:format>application/pdf</dc:format>
-                    </rdf:Description>
-                  </rdf:RDF>
-                </x:xmpmeta>
-                <?xpacket end="w"?>""".stripIndent();
-        PDMetadata metadata = new PDMetadata(doc);
-        metadata.importXMPMetadata(xmp.getBytes(StandardCharsets.UTF_8));
-        catalog.setMetadata(metadata);
     }
 
 }

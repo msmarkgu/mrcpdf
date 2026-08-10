@@ -14,6 +14,7 @@ import org.apache.pdfbox.pdmodel.graphics.image.CCITTFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 
 import com.mrcpdf.util.PlatformUtils;
+import com.mrcpdf.util.PlatformUtils.Arch;
 import com.mrcpdf.util.PlatformUtils.Os;
 import com.mrcpdf.util.Settings;
 import com.mrcpdf.util.SubprocessRunner;
@@ -102,7 +103,7 @@ public class JBIG2Compressor {
 
         List<String> imagePaths = new ArrayList<>(pageCount);
         for (int i = 0; i < pageCount; i++) {
-            imagePaths.add(new File(maskDir, "mask-" + i + ".bmp").getAbsolutePath());
+            imagePaths.add(new File(maskDir, "mask-" + i + ".png").getAbsolutePath());
         }
 
         // Use a UUID-scoped basename to keep JBIG2 output files (.sym, .0000, ...)
@@ -166,24 +167,47 @@ public class JBIG2Compressor {
     }
 
     /**
-     * Locates the jbig2enc binary for the current OS.
+     * Locates the jbig2enc binary for the current OS and architecture.
      *
-     * Searches deps/jbig2enc/{os}/jbig2enc (or jbig2enc.exe on Windows).
-     * The base path can be overridden via system property "mrcpdf.native.dir"
-     * (defaults to "native").
+     * Search order:
+     *   1. System property "mrcpdf.jbig2enc.binary" (full path to a custom binary).
+     *   2. {nativeDir}/{os}-{arch}/jbig2enc (e.g. linux-arm64, mac-arm64).
+     *   3. {nativeDir}/{os}/jbig2enc (legacy single-arch layout).
+     * On Windows the binary name is "jbig2enc.exe".
      *
      * @return The executable File, or null if not found.
      */
     private File findJbig2enc() {
-        Os os = PlatformUtils.detectOs();
-        String dirName;
-        switch (os) {
-            case WINDOWS: dirName = "win"; break;
-            case MAC: dirName = "mac"; break;
-            default: dirName = "linux";
+        String custom = System.getProperty("mrcpdf.jbig2enc.binary");
+        if (custom != null && !custom.isEmpty()) {
+            File f = new File(custom);
+            if (f.canExecute()) return f;
         }
-        File exe = new File(nativeDir + "/" + dirName, os == Os.WINDOWS ? "jbig2enc.exe" : "jbig2enc");
+
+        Os os = PlatformUtils.detectOs();
+        Arch arch = PlatformUtils.detectArch();
+        String osName;
+        switch (os) {
+            case WINDOWS: osName = "win"; break;
+            case MAC: osName = "mac"; break;
+            default: osName = "linux";
+        }
+        String archName;
+        switch (arch) {
+            case AARCH64: archName = "arm64"; break;
+            default: archName = "x64";
+        }
+        String exeName = (os == Os.WINDOWS) ? "jbig2enc.exe" : "jbig2enc";
+
+        File exe = new File(nativeDir + "/" + osName + "-" + archName, exeName);
         if (exe.canExecute()) return exe;
+        exe = new File(nativeDir + "/" + osName, exeName);
+        if (exe.canExecute()) return exe;
+
+        System.out.println(
+            "  Warning: jbig2enc not found for " + osName + "-" + archName
+                + " — using CCITT G4 fallback. Install jbig2enc or set"
+                + " -Dmrcpdf.jbig2enc.binary=<path>.");
         return null;
     }
 
