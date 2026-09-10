@@ -66,6 +66,10 @@ public class PDFAssembler {
     private double backgroundScale;
     private float bgSmoothSigma;
     private float bgJpegQuality;
+    // JPEG quality used when a page is routed to the fidelity path (quality gate
+    // skipped MRC): no foreground mask, so the background is the only visual
+    // layer and must carry the page at full resolution.
+    private float fidelityJpegQuality;
     private String producer;
     private int skippedGlyphCount;
     private PDStream jbig2GlobalStream;
@@ -91,6 +95,7 @@ public class PDFAssembler {
         this.backgroundScale = 1.0;
         this.bgSmoothSigma = 0f;
         this.bgJpegQuality = 0.50f;
+        this.fidelityJpegQuality = 0.85f;
         this.foregroundColorEnabled = false;
         this.fgScale = 0.5;
         this.fgJpegQuality = 0.7f;
@@ -114,6 +119,11 @@ public class PDFAssembler {
 
     public void setBgJpegQuality(float quality) {
         this.bgJpegQuality = Math.max(0.1f, Math.min(1.0f, quality));
+    }
+
+    /** JPEG quality for the fidelity (non-MRC, no mask) background layer. */
+    public void setFidelityJpegQuality(float quality) {
+        this.fidelityJpegQuality = Math.max(0.1f, Math.min(1.0f, quality));
     }
 
     public void setProducer(String producer) {
@@ -455,6 +465,48 @@ public class PDFAssembler {
                 cs.setNonStrokingColor(0f, 0f, 0f);
                 cs.drawImage(fgImage, 0, 0, pageW, pageH);
             }
+
+PDFont pageFont = resolveFont(output);
+            writeTextLayer(cs, ocr, pageW, pageH, pageFont);
+        }
+
+        return outPage;
+    }
+
+    /**
+     * Renders one page with the fidelity-preserving (non-MRC) path: the
+     * original page image as the only visual layer at full resolution and
+     * higher JPEG quality, no foreground mask.  Used when the per-page text
+     * quality gate decides MRC compression would degrade the page.
+     *
+     * @param output    The output PDDocument being built.
+     * @param source    The source PDDocument (already loaded).
+     * @param pageIndex 0-based page index in source.
+     * @param background Original (un-segmented) page image.
+     * @param ocr       OCR result for this page.
+     * @return The newly created PDPage added to output.
+     */
+    public PDPage addPageFidelity(PDDocument output, PDDocument source, int pageIndex,
+                                  BufferedImage background, PageResult ocr) throws IOException {
+        PDPage sourcePage = source.getPage(pageIndex);
+        PDRectangle cropBox = sourcePage.getCropBox();
+        float pageW = cropBox.getWidth();
+        float pageH = cropBox.getHeight();
+        if (sourcePage.getRotation() % 180 != 0) {
+            float tmp = pageW;
+            pageW = pageH;
+            pageH = tmp;
+        }
+
+        PDPage outPage = new PDPage(new PDRectangle(pageW, pageH));
+        output.addPage(outPage);
+
+        try (PDPageContentStream cs = new PDPageContentStream(output, outPage)) {
+            // No foreground mask: hasMask=false keeps the full-resolution
+            // background without downsampling/smoothing, encoded at the higher
+            // fidelity JPEG quality.
+            PDImageXObject bgXObject = encodeBackgroundJpeg(output, background, fidelityJpegQuality, false);
+            cs.drawImage(bgXObject, 0, 0, pageW, pageH);
 
             PDFont pageFont = resolveFont(output);
             writeTextLayer(cs, ocr, pageW, pageH, pageFont);

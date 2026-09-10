@@ -3,16 +3,21 @@ package com.mrcpdf.model;
 import java.awt.image.BufferedImage;
 import java.util.List;
 
+import com.mrcpdf.quality.TextQualityScore;
+
 /**
  * Immutable result of page processing for a single page.
  *
  * pageNumber  0-based page index within the document.
  * width       Page image width  in pixels (from the rendered BufferedImage).
  * height      Page image height in pixels.
- * textBlocks  List of extracted words with bounding boxes and confidences.
+ * textBlocks  List of recognised words with bounding boxes and confidences.
  * bgJpeg      Pre-encoded JPEG bytes of the cleaned background layer (null when unused).
  * fgColorJpeg Pre-encoded JPEG bytes of the foreground color plane (null when unused).
  * mask        1-bit foreground mask image for JBIG2 compression.
+ * quality     Optional per-page text-quality score (null when not scored).
+ * mrcSkip     True when the quality gate decided to skip MRC compression for
+ *             this page so it keeps the fidelity-preserving full-res path.
  */
 public class PageResult {
 
@@ -23,13 +28,26 @@ public class PageResult {
     private final byte[] bgJpeg;
     private final byte[] fgColorJpeg;
     private final BufferedImage mask;
+    private final TextQualityScore quality;
+    private final boolean mrcSkip;
 
     public PageResult(int pageNumber, int width, int height, List<TextBlock> textBlocks) {
         this(pageNumber, width, height, textBlocks, null, null, null);
     }
 
     public PageResult(int pageNumber, int width, int height, List<TextBlock> textBlocks,
+                      TextQualityScore quality, boolean mrcSkip) {
+        this(pageNumber, width, height, textBlocks, null, null, null, quality, mrcSkip);
+    }
+
+    public PageResult(int pageNumber, int width, int height, List<TextBlock> textBlocks,
                       byte[] bgJpeg, byte[] fgColorJpeg, BufferedImage mask) {
+        this(pageNumber, width, height, textBlocks, bgJpeg, fgColorJpeg, mask, null, false);
+    }
+
+    public PageResult(int pageNumber, int width, int height, List<TextBlock> textBlocks,
+                      byte[] bgJpeg, byte[] fgColorJpeg, BufferedImage mask,
+                      TextQualityScore quality, boolean mrcSkip) {
         this.pageNumber = pageNumber;
         this.width = width;
         this.height = height;
@@ -37,6 +55,8 @@ public class PageResult {
         this.bgJpeg = bgJpeg;
         this.fgColorJpeg = fgColorJpeg;
         this.mask = mask;
+        this.quality = quality;
+        this.mrcSkip = mrcSkip;
     }
 
     public int getPageNumber() { return pageNumber; }
@@ -46,4 +66,10 @@ public class PageResult {
     public byte[] getBgJpeg() { return bgJpeg; }
     public byte[] getFgColorJpeg() { return fgColorJpeg; }
     public BufferedImage getMask() { return mask; }
+
+    /** Per-page text-quality score, or null when quality gating is disabled. */
+    public TextQualityScore getQuality() { return quality; }
+
+    /** True when the quality gate routed this page to the full-res fidelity path. */
+    public boolean isMrcSkip() { return mrcSkip; }
 }

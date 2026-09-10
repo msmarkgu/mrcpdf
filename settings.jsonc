@@ -66,6 +66,18 @@
     //   false = original images (JPEG) + text layer only (no MRC compression)
     "pipeline.mrc.enabled": true,
 
+    // Per-page text-quality gate (only applies when MRC is enabled).
+    // Each page is scored by TextQualityScorer; pages scoring below the
+    // threshold keep the fidelity-preserving path (full-resolution original
+    // image, no JBIG2 mask) because MRC would degrade their text.
+    //   false = compress every page with MRC, ignore the score
+    "pipeline.quality.gateEnabled": true,
+
+    // Composite text-quality threshold in [0, 1] (higher = better).
+    // Pages scoring below this value skip MRC. 0.5 is a provisional Phase-1
+    // default; clean pages score well above it, blank/degraded pages below.
+    "pipeline.quality.threshold": 0.5,
+
     // Background downscale factor for MRC (0.1 - 1.0).
     //   0.33 = 3x downsampling (e.g., 300 DPI → ~100 DPI background)
     //   1.0  = no downsampling (full resolution)

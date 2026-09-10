@@ -35,7 +35,7 @@ tasks.named<Test>("test") {
     outputs.upToDateWhen { false }
     maxParallelForks = 2
     minHeapSize = "512m"
-    maxHeapSize = "2g"
+    maxHeapSize = "3g"
     useJUnitPlatform()
     testLogging {
         events("passed", "skipped", "failed")

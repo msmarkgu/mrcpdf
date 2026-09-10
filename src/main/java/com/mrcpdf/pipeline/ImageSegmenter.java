@@ -151,31 +151,9 @@ public class ImageSegmenter {
         return new SegmentedImage(foregroundMask, cleanedBackground);
     }
 
-    /**
-     * Converts a flat ARGB int array to a grayscale int array (0 = black, 255 = white)
-     * using ITU-R BT.601 luma with integer arithmetic.
-     *
-     * Integer coefficients (scaled by 256):
-     *   0.299 * 256 ≈ 77
-     *   0.587 * 256 ≈ 150
-     *   0.114 * 256 ≈ 29
-     *   Sum: 77 + 150 + 29 = 256 (exact), so (R=G=B) maps to itself.
-     *
-     * Bit shifts in RGB extraction:
-     *   (rgb >> 16) & 0xFF  — extract the red  byte (bits 16-23 of 0xAARRGGBB)
-     *   (rgb >>  8) & 0xFF  — extract the green byte (bits  8-15)
-     *   rgb        & 0xFF  — extract the blue byte (bits  0-7)
-     */
+    /** Delegates to {@link com.mrcpdf.util.ImageOps#toGrayscale(int[])}. */
     private int[] toGrayscale(int[] rgba) {
-        int[] gray = new int[rgba.length];
-        for (int i = 0; i < rgba.length; i++) {
-            int rgb = rgba[i];
-            int r = (rgb >> 16) & 0xFF;
-            int g = (rgb >> 8) & 0xFF;
-            int b = rgb & 0xFF;
-            gray[i] = (77 * r + 150 * g + 29 * b) >> 8;
-        }
-        return gray;
+        return com.mrcpdf.util.ImageOps.toGrayscale(rgba);
     }
 
     /**
@@ -313,39 +291,7 @@ public class ImageSegmenter {
      *     uses them as the product to give heavier weight to balanced splits.
      */
     private int otsuThreshold(int[] pixels) {
-        int[] histogram = new int[256];
-        for (int p : pixels) {
-            histogram[p]++;
-        }
-
-        int total = pixels.length;
-        double sum = 0;
-        for (int i = 0; i < 256; i++) {
-            sum += (double) i * histogram[i];
-        }
-
-        double sumB = 0;
-        int wB = 0;
-        double maxVariance = 0;
-        int threshold = 0;
-
-        for (int i = 0; i < 256; i++) {
-            wB += histogram[i];
-            if (wB == 0) continue;
-            int wF = total - wB;
-            if (wF == 0) break;
-
-            sumB += (double) i * histogram[i];
-            double meanB = sumB / wB;
-            double meanF = (sum - sumB) / wF;
-            double variance = (double) wB * wF * (meanB - meanF) * (meanB - meanF);
-
-            if (variance > maxVariance) {
-                maxVariance = variance;
-                threshold = i;
-            }
-        }
-        return threshold;
+        return com.mrcpdf.util.ImageOps.otsuStats(pixels).threshold();
     }
 
     /**

@@ -40,6 +40,8 @@ import com.mrcpdf.pipeline.ImageSegmenter;
 import com.mrcpdf.pipeline.JBIG2Compressor;
 import com.mrcpdf.pipeline.PDFAssembler;
 import com.mrcpdf.pipeline.TextExtractor;
+import com.mrcpdf.quality.TextQualityScore;
+import com.mrcpdf.quality.TextQualityScorer;
 import com.mrcpdf.util.Settings;
 
 /**
@@ -171,6 +173,15 @@ public class MrcPdf implements Callable<Integer> {
             assembler.setForegroundColorEnabled(fgColorEnabled);
             assembler.setFgScale(settings.getDouble("pipeline.mrc.foregroundScale", 0.5));
             assembler.setFgJpegQuality((float) settings.getDouble("pipeline.mrc.foregroundJpegQuality", 0.7));
+            // Fidelity-path background JPEG quality (no mask -> background is the
+            // only visual layer), defaults to the non-MRC pipeline.jpegQuality.
+            assembler.setFidelityJpegQuality((float) settings.getDouble("pipeline.jpegQuality", 0.85));
+
+            // Per-page text-quality gate: pages scoring below the threshold keep
+            // their full-res fidelity path instead of MRC compression.
+            boolean qualityGateEnabled = settings.getBoolean("pipeline.quality.gateEnabled", true);
+            double qualityGateThreshold = settings.getDouble("pipeline.quality.threshold",
+                    TextQualityScorer.DEFAULT_GATE_THRESHOLD);
 
             // Resolve worker thread count: CLI arg > settings cap > available processors
             int workerThreads;
@@ -183,10 +194,12 @@ public class MrcPdf implements Callable<Integer> {
             }
             System.out.println("  Workers: " + workerThreads + " thread(s)");
             System.out.println("  Foreground: " + (useMrc && fgColorEnabled ? "color layer" : "black stencil"));
+            System.out.println("  Quality gate: " + (useMrc && qualityGateEnabled
+                    ? String.format("on (threshold %.2f)", qualityGateThreshold) : "off"));
 
             runPipeline(inputFile, resolvedOutput, segmenter, compressor, assembler,
                     useMrc, usePdfa, resolvedDpi, workerThreads, resolvedFontPath, fgColorEnabled,
-                    resolvedBgScale, resolvedJpegQuality);
+                    resolvedBgScale, resolvedJpegQuality, qualityGateEnabled, qualityGateThreshold);
             return 0;
 
         } catch (Exception e) {
@@ -201,7 +214,8 @@ public class MrcPdf implements Callable<Integer> {
                              JBIG2Compressor compressor, PDFAssembler assembler,
                              boolean useMrc, boolean usePdfa, float dpi,
                              int workerThreads, String fontPath, boolean fgColorEnabled,
-                             double resolvedBgScale, float resolvedJpegQuality) throws IOException {
+                             double resolvedBgScale, float resolvedJpegQuality,
+                             boolean qualityGateEnabled, double qualityGateThreshold) throws IOException {
         Path tempDir = createTempDir(inputFile.getName().replaceAll("\\.[^.]+$", ""));
 
         try (PDDocument source = Loader.loadPDF(inputFile)) {
@@ -230,6 +244,8 @@ public class MrcPdf implements Callable<Integer> {
                 byte[] bgJpeg;
                 byte[] fgColorJpeg;
                 BufferedImage mask;
+                TextQualityScore qualityScore;
+                boolean gateSkip;
             }
             PageData[] pageData = new PageData[pageCount];
             AtomicInteger threadCounter = new AtomicInteger(1);
@@ -239,6 +255,9 @@ public class MrcPdf implements Callable<Integer> {
                 List<Future<Void>> futures = new ArrayList<>(pageCount);
                 long pipelineStart = System.nanoTime();
                 String perPageFmt = "    [prep-%d] page %d: %4.1fs%n";
+
+                // Thread-safe (stateless) page-quality scorer for the gate.
+                TextQualityScorer scorer = new TextQualityScorer(dpi);
 
                 Semaphore semaphore = new Semaphore(workerThreads + 2);
 
@@ -261,7 +280,23 @@ public class MrcPdf implements Callable<Integer> {
                             pd.imgW = page.getWidth();
                             pd.imgH = page.getHeight();
 
-                            if (useMrc) {
+// Per-page text-quality gate: score the rendered page
+                            // and, when quality is low, keep the fidelity path
+                            // (full-res page, no MRC segmentation).  Scoring uses
+                            // whole-page metrics: the PDFBox-derived text layer
+                            // pins confidence to exactly 100.0, so text-layer
+                            // glyph scoring is not engaged by this pipeline.
+                            if (useMrc && qualityGateEnabled) {
+                                TextQualityScore score = scorer.compute(page, null);
+                                pd.gateSkip = score.getComposite() < qualityGateThreshold;
+                                pd.qualityScore = score;
+                                if (pd.gateSkip) {
+                                    System.out.printf("    [quality] page %d: %.2f — MRC skipped (fidelity path)%n",
+                                            pageIdx + 1, score.getComposite());
+                                }
+                            }
+
+                            if (useMrc && !pd.gateSkip) {
                                 SegmentedImage seg = segmenter.segment(page);
                                 pd.mask = seg.getForegroundMask();
                                 // Write mask as PNG for jbig2enc (lossless, compact)
@@ -274,6 +309,18 @@ public class MrcPdf implements Callable<Integer> {
                                     pd.fgColorJpeg = ImageEncoder.encodeForegroundColor(page,
                                             assembler.getFgJpegQuality(), assembler.getFgScale());
                                 }
+                            } else if (useMrc) {
+                                // Gate-skipped: no segmentation; write an empty
+                                // white mask so the JBIG2 batch stays index-aligned.
+                                BufferedImage emptyMask = new BufferedImage(
+                                        page.getWidth(), page.getHeight(),
+                                        BufferedImage.TYPE_BYTE_BINARY);
+                                emptyMask.getGraphics().setColor(java.awt.Color.WHITE);
+                                emptyMask.getGraphics().fillRect(0, 0,
+                                        page.getWidth(), page.getHeight());
+                                emptyMask.getGraphics().dispose();
+                                ImageIO.write(emptyMask, "png",
+                                        new File(tempDir.toFile(), "mask-" + pageIdx + ".png"));
                             } else {
                                 pd.bgJpeg = ImageEncoder.encodeBackground(page,
                                         resolvedJpegQuality, false, 1.0, 0f);
@@ -317,7 +364,8 @@ public class MrcPdf implements Callable<Integer> {
                     PageData pd = pageData[i];
                     TextExtractor.extractTextBlocks(source, i, dpi, pd.imgW, pd.imgH, textBlocksOut);
                     results.add(new PageResult(i, pd.imgW, pd.imgH, textBlocksOut[0],
-                            pd.bgJpeg, pd.fgColorJpeg, pd.mask));
+                            pd.bgJpeg, pd.fgColorJpeg, pd.mask,
+                            pd.qualityScore, pd.gateSkip));
                 }
 
                 // ── Font resolution for the invisible text layer ──
@@ -356,11 +404,17 @@ public class MrcPdf implements Callable<Integer> {
                 System.out.println("  Assembling PDF...");
                 try (PDDocument output = new PDDocument()) {
                     List<PDPage> outPages = new ArrayList<>(pageCount);
+                    int fidelityPages = 0;
 
                     for (int i = 0; i < pageCount; i++) {
                         PageResult pr = results.get(i);
                         PDPage outPage;
-                        if (jbig2Batch != null && jbig2Batch.getGlobalSym().length > 0) {
+                        if (pr.isMrcSkip()) {
+                            // Quality gate: original page as the only visual layer.
+                            BufferedImage bg = renderer.renderImageWithDPI(i, dpi);
+                            outPage = assembler.addPageFidelity(output, source, i, bg, pr);
+                            fidelityPages++;
+                        } else if (jbig2Batch != null && jbig2Batch.getGlobalSym().length > 0) {
                             JBIG2Compressor.CompressionResult jbig2Page = jbig2Batch.getPages().get(i);
                             outPage = assembler.addPageJbig2(output, source, i,
                                     pr.getBgJpeg(), pr.getFgColorJpeg(),
@@ -377,6 +431,10 @@ public class MrcPdf implements Callable<Integer> {
                         }
 
                         outPages.add(outPage);
+                    }
+                    if (fidelityPages > 0) {
+                        System.out.println("  Fidelity pages: " + fidelityPages
+                                + " kept at full resolution (quality gate)");
                     }
 
                     // Finalize: copy metadata, add PDF/A if needed
