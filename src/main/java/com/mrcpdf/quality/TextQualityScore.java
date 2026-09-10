@@ -10,6 +10,11 @@ package com.mrcpdf.quality;
  * Phase 1 implements the geometric-mean composite only.  Sub-metrics marked
  * "not yet scored" hold a neutral 1.0 until their estimators land in a later
  * phase, so adding them later never changes the current behavior.
+ *
+ * Phase 2 adds the model-gate decision: when a {@link TextQualityScorer} was
+ * built with a QualityModel artifact, {@link #getModelProbability()} carries
+ * the logistic degraded probability and {@link #isModelSkip()} decides the MRC
+ * fidelity gate, superseding the geometric threshold for the scorer's gating.
  */
 public final class TextQualityScore {
 
@@ -40,6 +45,10 @@ public final class TextQualityScore {
     private final String weakestGroup;
     private final boolean usesTextLayer;
 
+    // ---- Phase-2 model decision (negative = no model / not applicable) ----
+    private final double modelProbability;
+    private final double modelThreshold;
+
     TextQualityScore(double blurSigma, double highFreqEnergy, double tileSharpnessVariance,
                      double otsuSeparability, double globalContrast,
                      double backgroundUniformity, double snr,
@@ -47,7 +56,8 @@ public final class TextQualityScore {
                      double phaseCongruency, double ocrConfidence, double ocrConsistency,
                      double sharpness, double contrast, double noise,
                      double structure, double perceptual, double ocr,
-                     double composite, String weakestGroup, boolean usesTextLayer) {
+                     double composite, String weakestGroup, boolean usesTextLayer,
+                     double modelProbability, double modelThreshold) {
         this.blurSigma = blurSigma;
         this.highFreqEnergy = highFreqEnergy;
         this.tileSharpnessVariance = tileSharpnessVariance;
@@ -71,6 +81,8 @@ public final class TextQualityScore {
         this.composite = composite;
         this.weakestGroup = weakestGroup;
         this.usesTextLayer = usesTextLayer;
+        this.modelProbability = modelProbability;
+        this.modelThreshold = modelThreshold;
     }
 
     public double getBlurSigma() { return blurSigma; }
@@ -116,5 +128,20 @@ public final class TextQualityScore {
      */
     public boolean isBelow(double threshold) {
         return composite < threshold;
+    }
+
+    /**
+     * Phase-2 model decision: degraded probability, or &lt; 0 when no model was
+     * attached (e.g. artifact absent, or an uninformative text layer under the
+     * text-layer variant).
+     */
+    public double getModelProbability() { return modelProbability; }
+
+    /** Decision threshold the model was calibrated at (degraded-recall ~0.9). */
+    public double getModelThreshold() { return modelThreshold; }
+
+    /** True when the model gate says "degraded → keep fidelity". */
+    public boolean isModelSkip() {
+        return modelProbability >= 0 && modelProbability >= modelThreshold;
     }
 }

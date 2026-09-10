@@ -78,6 +78,13 @@
     // default; clean pages score well above it, blank/degraded pages below.
     "pipeline.quality.threshold": 0.5,
 
+    // Phase-2 gate model: when true (and the bundled quality-model.json
+    // artifact is present) the worker's skip decision uses the logistic
+    // degraded probability from TextQualityScorer instead of the geometric
+    // composite threshold above. The geometric threshold remains the
+    // fallback when no model is available.
+    "pipeline.quality.model.enabled": true,
+
     // Background downscale factor for MRC (0.1 - 1.0).
     //   0.33 = 3x downsampling (e.g., 300 DPI → ~100 DPI background)
     //   1.0  = no downsampling (full resolution)

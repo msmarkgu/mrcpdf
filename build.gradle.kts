@@ -60,6 +60,16 @@ tasks.register<JavaExec>("generateTestPdfs") {
     args("--force")
 }
 
+// Regenerates the committed Phase-2 quality-gate artifact from the synthetic
+// corpus.  Run after changing FeatureExtractor or the corpus generator.
+tasks.register<JavaExec>("trainQualityModel") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.tools.TrainModel")
+    args("--generate", "build/quality-corpus.csv",
+         "--out", "src/main/resources/quality-model.json",
+         "--variant", "image-only", "--docs", "20", "--seed", "42")
+}
+
 tasks {
     shadowJar {
         archiveBaseName.set("mrcpdf")

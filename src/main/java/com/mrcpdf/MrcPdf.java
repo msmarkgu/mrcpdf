@@ -42,6 +42,7 @@ import com.mrcpdf.pipeline.PDFAssembler;
 import com.mrcpdf.pipeline.TextExtractor;
 import com.mrcpdf.quality.TextQualityScore;
 import com.mrcpdf.quality.TextQualityScorer;
+import com.mrcpdf.quality.model.QualityModel;
 import com.mrcpdf.util.Settings;
 
 /**
@@ -183,6 +184,20 @@ public class MrcPdf implements Callable<Integer> {
             double qualityGateThreshold = settings.getDouble("pipeline.quality.threshold",
                     TextQualityScorer.DEFAULT_GATE_THRESHOLD);
 
+            // Phase-2 gate model (logistic regression on image features).  When
+            // loaded it supersedes the geometric threshold in the worker's
+            // gate decision; absent, the geometric gate runs unchanged.
+            boolean modelEnabled = settings.getBoolean("pipeline.quality.model.enabled", true);
+            QualityModel qualityModel = null;
+            if (modelEnabled) {
+                qualityModel = QualityModel.loadDefault();
+                if (qualityModel != null) {
+                    System.out.printf("  Model:  %s gate, %d features, threshold p(degraded)>=%.3f (val AUC %.3f)%n",
+                            qualityModel.variant(), qualityModel.featureNames().size(),
+                            qualityModel.threshold(), qualityModel.auc());
+                }
+            }
+
             // Resolve worker thread count: CLI arg > settings cap > available processors
             int workerThreads;
             if (threads != null) {
@@ -194,12 +209,22 @@ public class MrcPdf implements Callable<Integer> {
             }
             System.out.println("  Workers: " + workerThreads + " thread(s)");
             System.out.println("  Foreground: " + (useMrc && fgColorEnabled ? "color layer" : "black stencil"));
-            System.out.println("  Quality gate: " + (useMrc && qualityGateEnabled
-                    ? String.format("on (threshold %.2f)", qualityGateThreshold) : "off"));
+            if (!useMrc) {
+                System.out.println("  Quality gate: off (MRC disabled)");
+            } else if (!qualityGateEnabled) {
+                System.out.println("  Quality gate: off (disabled in settings)");
+            } else if (qualityModel != null) {
+                System.out.printf("  Quality gate: model (%s, %d features, threshold %.3f)%n",
+                        qualityModel.variant(), qualityModel.featureNames().size(),
+                        qualityModel.threshold());
+            } else {
+                System.out.printf("  Quality gate: geometric (threshold %.2f)%n", qualityGateThreshold);
+            }
 
             runPipeline(inputFile, resolvedOutput, segmenter, compressor, assembler,
                     useMrc, usePdfa, resolvedDpi, workerThreads, resolvedFontPath, fgColorEnabled,
-                    resolvedBgScale, resolvedJpegQuality, qualityGateEnabled, qualityGateThreshold);
+                    resolvedBgScale, resolvedJpegQuality, qualityGateEnabled, qualityGateThreshold,
+                    qualityModel);
             return 0;
 
         } catch (Exception e) {
@@ -215,7 +240,8 @@ public class MrcPdf implements Callable<Integer> {
                              boolean useMrc, boolean usePdfa, float dpi,
                              int workerThreads, String fontPath, boolean fgColorEnabled,
                              double resolvedBgScale, float resolvedJpegQuality,
-                             boolean qualityGateEnabled, double qualityGateThreshold) throws IOException {
+                             boolean qualityGateEnabled, double qualityGateThreshold,
+                             QualityModel qualityModel) throws IOException {
         Path tempDir = createTempDir(inputFile.getName().replaceAll("\\.[^.]+$", ""));
 
         try (PDDocument source = Loader.loadPDF(inputFile)) {
@@ -257,7 +283,7 @@ public class MrcPdf implements Callable<Integer> {
                 String perPageFmt = "    [prep-%d] page %d: %4.1fs%n";
 
                 // Thread-safe (stateless) page-quality scorer for the gate.
-                TextQualityScorer scorer = new TextQualityScorer(dpi);
+                TextQualityScorer scorer = new TextQualityScorer(dpi, qualityModel);
 
                 Semaphore semaphore = new Semaphore(workerThreads + 2);
 
@@ -288,11 +314,19 @@ public class MrcPdf implements Callable<Integer> {
                             // glyph scoring is not engaged by this pipeline.
                             if (useMrc && qualityGateEnabled) {
                                 TextQualityScore score = scorer.compute(page, null);
-                                pd.gateSkip = score.getComposite() < qualityGateThreshold;
+                                // Model gate when a decision is available; the
+                                // geometric threshold is the fallback (no model
+                                // or text-layer variant with uninformative layer).
+                                pd.gateSkip = score.isModelSkip()
+                                        || (score.getModelProbability() < 0
+                                            && score.isBelow(qualityGateThreshold));
                                 pd.qualityScore = score;
                                 if (pd.gateSkip) {
-                                    System.out.printf("    [quality] page %d: %.2f — MRC skipped (fidelity path)%n",
-                                            pageIdx + 1, score.getComposite());
+                                    System.out.printf("    [quality] page %d: composite %.2f, p(degraded)=%s — MRC skipped (fidelity path)%n",
+                                            pageIdx + 1, score.getComposite(),
+                                            score.getModelProbability() >= 0
+                                                    ? String.format("%.2f", score.getModelProbability())
+                                                    : "n/a");
                                 }
                             }
 

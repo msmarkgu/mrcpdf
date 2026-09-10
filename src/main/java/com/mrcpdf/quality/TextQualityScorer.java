@@ -7,6 +7,8 @@ import java.util.Arrays;
 import java.util.List;
 
 import com.mrcpdf.model.TextBlock;
+import com.mrcpdf.quality.model.FeatureExtractor;
+import com.mrcpdf.quality.model.QualityModel;
 import com.mrcpdf.util.ImageOps;
 
 /**
@@ -84,17 +86,29 @@ public class TextQualityScorer {
     private static final double[] FALLBACK_WEIGHTS = {0.40, 0.27, 0.20, 0.13};
 
     private final double dpi; // reserved for DPI-scaled estimates in later phases
+    private final QualityModel model; // Phase-2 gate model, or null
 
     public TextQualityScorer() {
-        this(300);
+        this(300, null);
     }
 
     public TextQualityScorer(double dpi) {
+        this(dpi, null);
+    }
+
+    /** Constructs a scorer with an optional Phase-2 gate model attached. */
+    public TextQualityScorer(double dpi, QualityModel model) {
         this.dpi = Math.max(1, dpi);
+        this.model = model;
     }
 
     public double getDpi() {
         return dpi;
+    }
+
+    /** The attached gate model, or null when geometric gating is in effect. */
+    public QualityModel getModel() {
+        return model;
     }
 
     /**
@@ -107,7 +121,7 @@ public class TextQualityScorer {
         int h = image.getHeight();
         if (w < 3 || h < 3) {
             return new TextQualityScore(0, 0, 1, 0, 0, 1, 0,
-                    1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, "Blank", false);
+                    1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, "Blank", false, -1, -1);
         }
 
         int[] gray = ImageOps.toGrayscale(image);
@@ -198,13 +212,46 @@ public class TextQualityScorer {
         }
         composite = Math.exp(composite);
 
+        // ── Phase-2 model gate ──
+        double modelProbability = -1;
+        double modelThreshold = model != null ? model.threshold() : -1;
+        if (model != null) {
+            double[] features = modelFeatures(gray, w, h, layer, usesTextLayer);
+            if (features != null) {
+                modelProbability = model.predict(features);
+            }
+        }
+
         return new TextQualityScore(crisp, highFreq, glyphSharpnessVar,
                 otsu.separability(), globalContrast,
                 backgroundUniformity, snr,
                 fragmentation, strokeWidthUniformity,
                 phaseCongruency, ocrConfidence, ocrConsistency,
                 sharpness, contrast, noise, structure, phaseCongruency, ocr,
-                composite, composite <= LOG_FLOOR ? "Blank" : weakest, usesTextLayer);
+                composite, composite <= LOG_FLOOR ? "Blank" : weakest, usesTextLayer,
+                modelProbability, modelThreshold);
+    }
+
+    /**
+     * Model feature vector for the page, or null when the attached model's
+     * variant cannot be evaluated (text-layer variant without an informative
+     * layer).  The image-only variant reuses {@code gray} directly, so no
+     * second grayscale pass is needed.
+     */
+    private double[] modelFeatures(int[] gray, int w, int h,
+                                   List<TextBlock> layer, boolean usesTextLayer) {
+        if (model.isImageOnly()) {
+            return FeatureExtractor.extractImage(gray, w, h, dpi);
+        }
+        if (!usesTextLayer || layer.size() < 2) return null;
+        float[] mag = FeatureExtractor.gradientMagnitudes(gray, w, h);
+        double[] text = FeatureExtractor.extractText(gray, mag, w, h, layer);
+        if (text == null) return null;
+        double[] image = FeatureExtractor.extractImage(gray, w, h, dpi);
+        double[] all = new double[image.length + text.length];
+        System.arraycopy(image, 0, all, 0, image.length);
+        System.arraycopy(text, 0, all, image.length, text.length);
+        return all;
     }
 
     // ──────────────────────────────────────────────────────────────────────
