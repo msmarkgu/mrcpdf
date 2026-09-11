@@ -70,6 +70,14 @@ tasks.register<JavaExec>("trainQualityModel") {
          "--variant", "image-only", "--docs", "20", "--seed", "42")
 }
 
+// Emits build/synthetic-pages.pdf: one labeled preview sheet per synthetic doc
+// (all clean/mild/degraded variants) so the training pages can be eyeballed.
+tasks.register<JavaExec>("dumpSyntheticPages") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.SynthPageDump")
+    args("--docs", "20", "--seed", "42", "--out", "build/synthetic-pages.pdf")
+}
+
 tasks {
     shadowJar {
         archiveBaseName.set("mrcpdf")

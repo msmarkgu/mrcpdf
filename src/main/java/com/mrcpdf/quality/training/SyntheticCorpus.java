@@ -11,6 +11,7 @@ import java.awt.image.ConvolveOp;
 import java.awt.image.Kernel;
 import java.io.IOException;
 import java.io.File;
+import java.io.PrintStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -79,49 +80,133 @@ public final class SyntheticCorpus {
      * variant.
      */
     public static void generate(Path out, String variant, int docCount, long seed) throws IOException {
+        generate(out, variant, docCount, seed, null, null);
+    }
+
+    /**
+     * As the four-arg form, but additionally emits a viewable preview PDF (one
+     * labeled sheet per doc showing every clean/mild/degraded variant) when
+     * {@code previewPdf} is non-null, streaming progress to {@code progress}
+     * if provided.  The corpus CSV is byte-identical with or without a preview.
+     */
+    public static void generate(Path out, String variant, int docCount, long seed,
+                                Path previewPdf, PrintStream progress) throws IOException {
         List<String> featureNames = new ArrayList<>(List.of(FeatureExtractor.IMAGE_FEATURE_NAMES));
         if (QualityModel.VARIANT_TEXT_LAYER.equals(variant)) {
             featureNames.addAll(List.of(FeatureExtractor.TEXT_FEATURE_NAMES));
         }
 
         List<Dataset.Row> rows = new ArrayList<>();
-        for (int d = 0; d < docCount; d++) {
-            long rngSeed = seed ^ (d * 0x9E3779B97F4A7C15L);
-            Page page = renderPage(rngSeed);
-            double dpi = RENDER_DPI;
-            int w = page.image.getWidth();
-            int h = page.image.getHeight();
-            int[] gray = ImageOps.toGrayscale(page.image);
-            rows.add(featureRow(gray, w, h, page.blocks, variant, "doc" + d, 0, dpi));
+        try (PDDocument preview = previewPdf == null ? null : new PDDocument()) {
+            for (int d = 0; d < docCount; d++) {
+                long rngSeed = seed ^ (d * 0x9E3779B97F4A7C15L);
+                Page page = renderPage(rngSeed);
+                double dpi = RENDER_DPI;
+                int w = page.image.getWidth();
+                int h = page.image.getHeight();
+                int[] gray = ImageOps.toGrayscale(page.image);
+                rows.add(featureRow(gray, w, h, page.blocks, variant, "doc" + d, 0, dpi));
 
-            int[] sigmaBlur = {1, 3};
-            for (double s : sigmaBlur) {
-                int[] g = grayOf(gaussianBlur(page.image, s));
-                rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, s >= 2.5 ? 1 : 0, dpi));
+                List<Variant> variants = buildVariants(page, rngSeed);
+                for (Variant v : variants) {
+                    int[] g = grayOf(v.image());
+                    rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, v.label(), dpi));
+                }
+
+                if (preview != null) {
+                    List<Variant> sheets = new ArrayList<>();
+                    sheets.add(new Variant("clean", page.image, 0));
+                    sheets.addAll(variants);
+                    addPreviewSheet(preview, sheets, d);
+                    if (progress != null) {
+                        progress.println("  doc" + d + ": " + sheets.size() + " variants -> preview");
+                    }
+                }
             }
-            int[] noiseLevels = {6, 24};
-            for (int sigma : noiseLevels) {
-                int[] g = grayOf(addNoise(page.image, sigma, new java.util.Random(rngSeed ^ 0x51a)));
-                rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, sigma >= 24 ? 1 : 0, dpi));
-            }
-            float[] qualities = {0.75f, 0.30f};
-            for (float q : qualities) {
-                int[] g = grayOf(recompressJpeg(page.image, q));
-                rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, q < 0.5f ? 1 : 0, dpi));
-            }
-            double[] scales = {0.75, 0.45};
-            for (double s : scales) {
-                int[] g = grayOf(downscale(page.image, s));
-                rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, s < 0.55 ? 1 : 0, dpi));
-            }
-            int[] breakFractions = {4, 14};
-            for (int frac : breakFractions) {
-                int[] g = grayOf(breakStrokes(page.image, page.blocks, frac, new java.util.Random(rngSeed ^ 0xb10b)));
-                rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, frac >= 14 ? 1 : 0, dpi));
+            if (preview != null) {
+                preview.save(previewPdf.toFile());
             }
         }
-        Dataset.writeCsv(out, rows, featureNames);
+        if (out != null) {
+            Dataset.writeCsv(out, rows, featureNames);
+        }
     }
+
+    private record Variant(String name, BufferedImage image, int label) {
+    }
+
+    private static List<Variant> buildVariants(Page page, long rngSeed) {
+        BufferedImage base = page.image();
+        List<Variant> out = new ArrayList<>();
+        out.add(new Variant("blur-1.0", gaussianBlur(base, 1), 0));
+        out.add(new Variant("blur-3.0", gaussianBlur(base, 3), 1));
+        out.add(new Variant("noise-6", addNoise(base, 6, new java.util.Random(rngSeed ^ 0x51a)), 0));
+        out.add(new Variant("noise-24", addNoise(base, 24, new java.util.Random(rngSeed ^ 0x51a)), 1));
+        out.add(new Variant("jpeg-0.75", recompressJpeg(base, 0.75f), 0));
+        out.add(new Variant("jpeg-0.30", recompressJpeg(base, 0.30f), 1));
+        out.add(new Variant("scale-0.75", downscale(base, 0.75), 0));
+        out.add(new Variant("scale-0.45", downscale(base, 0.45), 1));
+        out.add(new Variant("strokes-4", breakStrokes(base, page.blocks(), 4, new java.util.Random(rngSeed ^ 0xb10b)), 0));
+        out.add(new Variant("strokes-14", breakStrokes(base, page.blocks(), 14, new java.util.Random(rngSeed ^ 0xb10b)), 1));
+        return out;
+    }
+
+    private static void addPreviewSheet(PDDocument preview, List<Variant> variants, int docIdx)
+            throws IOException {
+        int cols = 6;
+        int pad = 6;
+        int titleH = 26;
+        int cellW = TILE_W + 2 * pad;
+        int cellH = TILE_H + LABEL_H + pad;
+        int cw = cols * cellW + pad;
+        int ch = titleH + 2 * cellH + pad;
+        BufferedImage sheet = new BufferedImage(cw, ch, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g2 = sheet.createGraphics();
+        try {
+            g2.setColor(Color.WHITE);
+            g2.fillRect(0, 0, cw, ch);
+            g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
+            g2.setColor(Color.BLACK);
+            g2.drawString("doc" + docIdx + "  (top: label 0 clean/mild  |  bottom: label 1 degraded)",
+                    pad, 18);
+            int[] mild = {0, 1, 3, 5, 7, 9};
+            int[] severe = {2, 4, 6, 8, 10};
+            int[][] order = {mild, severe};
+            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            for (int r = 0; r < 2; r++) {
+                int i = 0;
+                for (int v : order[r]) {
+                    if (v >= variants.size()) continue;
+                    Variant var = variants.get(v);
+                    int tx = pad + i * cellW;
+                    int ty = titleH + r * cellH;
+                    g2.drawImage(var.image(), tx, ty, TILE_W, TILE_H, null);
+                    g2.setColor(var.label() == 0 ? new Color(0, 120, 0) : new Color(180, 20, 20));
+                    g2.fillRect(tx, ty + TILE_H, TILE_W, LABEL_H);
+                    g2.setColor(Color.WHITE);
+                    g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 10));
+                    g2.drawString(var.name() + " (" + var.label() + ")", tx + 4, ty + TILE_H + 16);
+                    i++;
+                }
+            }
+        } finally {
+            g2.dispose();
+        }
+
+        PDPage pdPage = new PDPage(new PDRectangle(612, 792));
+        preview.addPage(pdPage);
+        double scale = Math.min(612.0 / cw, 792.0 / ch);
+        int dw = (int) Math.round(cw * scale);
+        int dh = (int) Math.round(ch * scale);
+        try (PDPageContentStream cs = new PDPageContentStream(preview, pdPage)) {
+            PDImageXObject img = JPEGFactory.createFromImage(preview, sheet, 0.92f);
+            cs.drawImage(img, (612 - dw) / 2.0f, (792 - dh) / 2.0f, dw, dh);
+        }
+    }
+
+    private static final int TILE_W = 170;
+    private static final int TILE_H = 220;
+    private static final int LABEL_H = 24;
 
     private static int[] grayOf(BufferedImage image) {
         return ImageOps.toGrayscale(image);
