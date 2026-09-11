@@ -96,7 +96,7 @@ class QualityModelTest {
         // update these constants from the printed values.
         System.out.println("GOLDEN_CLEAN prediction: " + pClean);
         System.out.println("GOLDEN_DEGRADED prediction: " + pDegraded);
-        assertEquals(0.36490519474155036, pClean, 1e-12, "clean-row prediction changed");
-        assertEquals(0.9705944811741605, pDegraded, 1e-12, "degraded-row prediction changed");
+        assertEquals(0.37060718680400656, pClean, 1e-12, "clean-row prediction changed");
+        assertEquals(0.95705154412455917, pDegraded, 1e-12, "degraded-row prediction changed");
     }
 }

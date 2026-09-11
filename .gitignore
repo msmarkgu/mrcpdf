@@ -35,3 +35,6 @@ output*.*
 *.class
 *.log
 .editorconfig
+
+# Eval corpus (large scanned PDFs, downloaded/generated)
+eval/
