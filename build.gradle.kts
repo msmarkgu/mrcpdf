@@ -78,6 +78,18 @@ tasks.register<JavaExec>("dumpSyntheticPages") {
     args("--docs", "20", "--seed", "42", "--out", "build/synthetic-pages.pdf")
 }
 
+// Merges the synthetic corpus with the real clean-page rows into
+// build/quality-corpus-real.csv, the corpus the committed artifact is trained
+// on.  Run after regenerating the synthetic corpus (e.g. after a generator
+// change) before trainQualityModel --corpus.
+tasks.register<JavaExec>("buildMergedCorpus") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.tools.BuildMergedCorpus")
+    args("--synthetic", "build/quality-corpus.csv",
+         "--features", "eval/real-world/features",
+         "--out", "build/quality-corpus-real.csv")
+}
+
 tasks {
     shadowJar {
         archiveBaseName.set("mrcpdf")

@@ -43,7 +43,7 @@ import com.mrcpdf.util.ImageOps;
  * inputs.
  *
  * Production pages pass through: a Java-AWT raster of text (per-page 612×792
- * grayscale scan, font 14, JPEG q~0.95) embedded in a PDF, then re-rendered at
+ * grayscale scan, font 11, JPEG q~0.95) embedded in a PDF, then re-rendered at
  * 300 DPI by PDFRenderer.  The corpus reproduces that exact chain, so clean
  * corpus pages share the anti-aliasing / upscale / JPEG statistics of real
  * scans, and the trained gate transfers without re-training.
@@ -67,9 +67,10 @@ public final class SyntheticCorpus {
     private static final int SRC_W = 612;
     private static final int SRC_H = 792;
     private static final int MARGIN = 50;
-    private static final int LINE_HEIGHT = 22;
+    private static final int LINE_HEIGHT = 17;
 
-    private static final int FONT_SIZE = 14;
+    /** Typical printed body text is 10-12pt. */
+    private static final int FONT_SIZE = 11;
 
     private SyntheticCorpus() {
     }
@@ -117,9 +118,11 @@ public final class SyntheticCorpus {
                     List<Variant> sheets = new ArrayList<>();
                     sheets.add(new Variant("clean", page.image, 0));
                     sheets.addAll(variants);
-                    addPreviewSheet(preview, sheets, d);
+                    int before = preview.getNumberOfPages();
+                    addPreviewPages(preview, sheets, d);
                     if (progress != null) {
-                        progress.println("  doc" + d + ": " + sheets.size() + " variants -> preview");
+                        progress.println("  doc" + d + ": " + sheets.size() + " variants -> preview pages "
+                                + (before + 1) + "-" + preview.getNumberOfPages());
                     }
                 }
             }
@@ -151,7 +154,21 @@ public final class SyntheticCorpus {
         return out;
     }
 
-    private static void addPreviewSheet(PDDocument preview, List<Variant> variants, int docIdx)
+    /**
+     * Emits the preview pages for one doc: an overview sheet of every variant
+     * at a glance, then one legible full page per variant.  Variant pages are
+     * rasterized at 2x density so body text reads at roughly its true point
+     * size when the sheet displays at 612x792 pt.
+     */
+    private static void addPreviewPages(PDDocument preview, List<Variant> variants, int docIdx)
+            throws IOException {
+        addOverviewSheet(preview, variants, docIdx);
+        for (int v = 0; v < variants.size(); v++) {
+            addVariantPage(preview, variants.get(v), docIdx, v + 1);
+        }
+    }
+
+    private static void addOverviewSheet(PDDocument preview, List<Variant> variants, int docIdx)
             throws IOException {
         int cols = 6;
         int pad = 6;
@@ -184,23 +201,64 @@ public final class SyntheticCorpus {
                     g2.setColor(var.label() == 0 ? new Color(0, 120, 0) : new Color(180, 20, 20));
                     g2.fillRect(tx, ty + TILE_H, TILE_W, LABEL_H);
                     g2.setColor(Color.WHITE);
-                    g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 10));
-                    g2.drawString(var.name() + " (" + var.label() + ")", tx + 4, ty + TILE_H + 16);
+                    g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 9));
+                    g2.drawString("p" + (v + 1) + " " + var.name() + " (" + var.label() + ")",
+                            tx + 4, ty + TILE_H + 15);
                     i++;
                 }
             }
         } finally {
             g2.dispose();
         }
+        embedSheet(preview, sheet);
+    }
 
+    /**
+     * One variant at legible scale: the full page fills the sheet (2x raster,
+     * 612x792 pt) with the label rendered as an overlay band in the page's
+     * bottom margin, where no glyphs are drawn.
+     */
+    private static void addVariantPage(PDDocument preview, Variant var, int docIdx, int pageNo)
+            throws IOException {
+        int cw = 2 * 612;
+        int ch = 2 * 792;
+        double scale = Math.min((double) cw / var.image().getWidth(), (double) ch / var.image().getHeight());
+        int dw = (int) Math.round(var.image().getWidth() * scale);
+        int dh = (int) Math.round(var.image().getHeight() * scale);
+        int dx = (cw - dw) / 2;
+        int dy = (ch - dh) / 2;
+
+        BufferedImage sheet = new BufferedImage(cw, ch, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g2 = sheet.createGraphics();
+        try {
+            g2.setColor(Color.WHITE);
+            g2.fillRect(0, 0, cw, ch);
+            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g2.drawImage(var.image(), dx, dy, dw, dh, null);
+
+            int bandH = 40;
+            int bandY = dy + dh - bandH;
+            boolean overlay = bandY < ch;
+            if (overlay) {
+                g2.setColor(var.label() == 0 ? new Color(0, 120, 0) : new Color(180, 20, 20));
+                g2.fillRect(dx, bandY, dw, bandH);
+                g2.setColor(Color.WHITE);
+                g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 22));
+                g2.drawString("doc" + docIdx + "  p" + pageNo + "  " + var.name() + "  (label "
+                        + var.label() + ")", dx + 12, bandY + 28);
+            }
+        } finally {
+            g2.dispose();
+        }
+        embedSheet(preview, sheet);
+    }
+
+    private static void embedSheet(PDDocument preview, BufferedImage sheet) throws IOException {
         PDPage pdPage = new PDPage(new PDRectangle(612, 792));
         preview.addPage(pdPage);
-        double scale = Math.min(612.0 / cw, 792.0 / ch);
-        int dw = (int) Math.round(cw * scale);
-        int dh = (int) Math.round(ch * scale);
         try (PDPageContentStream cs = new PDPageContentStream(preview, pdPage)) {
-            PDImageXObject img = JPEGFactory.createFromImage(preview, sheet, 0.92f);
-            cs.drawImage(img, (612 - dw) / 2.0f, (792 - dh) / 2.0f, dw, dh);
+            PDImageXObject img = JPEGFactory.createFromImage(preview, sheet, 0.85f);
+            cs.drawImage(img, 0, 0, 612, 792);
         }
     }
 
