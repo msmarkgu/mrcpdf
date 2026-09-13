@@ -90,6 +90,70 @@ tasks.register<JavaExec>("buildMergedCorpus") {
          "--out", "build/quality-corpus-real.csv")
 }
 
+// Dumps the raw 300-DPI corpus variant pages into a plain PDF (one page per
+// variant, same order as synthetic-pages.pdf) plus a page->variant map CSV,
+// so a gate-off MRC pass can be labeled and joined back to corpus rows.
+tasks.register<JavaExec>("dumpSyntheticSrc") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.SynthSrcDump")
+    args("--docs", "20", "--seed", "42",
+         "--out", "build/synthetic-src.pdf",
+         "--map", "build/synthetic-variant-map.csv")
+}
+
+// Runs the real MRC pipeline over build/synthetic-src.pdf with the quality
+// gate disabled (build/gate-off.jsonc), so every page is compressed both ways
+// for labeling.  jbig2enc is currently absent -> CCITT G4 fallback (same
+// visuals, larger file).
+tasks.register<JavaExec>("mrcSyntheticSrc") {
+    dependsOn("dumpSyntheticSrc")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.MrcPdf")
+    jvmArgs("-Xmx3g")
+    args("--settings", "build/gate-off.jsonc", "--threads", "4",
+         "build/synthetic-src.pdf", "-o", "build/synthetic-mrc.pdf")
+}
+
+// Renders the side-by-side original | MRC labeling doc from the src and MRC
+// PDFs (240 pages; page i corresponds to variant-map row i).
+tasks.register<JavaExec>("buildSyntheticPairs") {
+    dependsOn("mrcSyntheticSrc")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.BuildSyntheticPairs")
+    jvmArgs("-Xmx3g")
+    args("--src", "build/synthetic-src.pdf",
+         "--mrc", "build/synthetic-mrc.pdf",
+         "--map", "build/synthetic-variant-map.csv",
+         "--out", "build/synthetic-pairs.pdf")
+}
+
+// Vendors a pinned pdfjs legacy UMD build into build/label/vendor/pdfjs so the
+// static labeling page can render PDFs over file:// (classic script, not ES
+// modules).  Requires network; one-time fetch.
+tasks.register("downloadPdfjs") {
+    val dir = project.layout.buildDirectory.dir("label/vendor/pdfjs").get().asFile
+    dir.mkdirs()
+    val ver = "3.11.174"
+    val base = "https://unpkg.com/pdfjs-dist@$ver/legacy/build"
+    inputs.property("pdfjsVersion", ver)
+    outputs.files(dir.resolve("pdf.min.js"), dir.resolve("pdf.worker.min.js"))
+    doLast {
+        exec { workingDir = dir; commandLine("curl", "-fsSL", "-o", "pdf.min.js", "$base/pdf.min.js") }
+        exec { workingDir = dir; commandLine("curl", "-fsSL", "-o", "pdf.worker.min.js", "$base/pdf.worker.min.js") }
+    }
+}
+
+// Emits build/label/index.html: the static PDF.js labeling page for the
+// synthetic corpus (original | MRC per row, readability checkboxes, autosave
+// to localStorage, CSV/state export).  Retraining steps are deferred.
+tasks.register<JavaExec>("exportLabelHtml") {
+    dependsOn("downloadPdfjs")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.ExportLabelHtml")
+    args("--map", "build/synthetic-variant-map.csv",
+         "--out", "build/label/index.html")
+}
+
 tasks {
     shadowJar {
         archiveBaseName.set("mrcpdf")

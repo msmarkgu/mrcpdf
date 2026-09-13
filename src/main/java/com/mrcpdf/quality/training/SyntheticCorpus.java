@@ -49,11 +49,14 @@ import com.mrcpdf.util.ImageOps;
  * scans, and the trained gate transfers without re-training.
  *
  * Each document renders its own page (deterministic per seed) and derives a
- * clean row plus mild and severe versions of each degradation (Gaussian blur,
+ * clean row plus mild and heavy versions of each degradation (Gaussian blur,
  * additive sensor noise, JPEG recompression, low-resolution downscale, broken
  * strokes).  Every variant of one source page shares its {@code doc} id so the
- * train/val split stays document-aware.  Mild degradations label 0 (fine) and
- * severe ones label 1 (degraded → skip MRC).
+ * train/val split stays document-aware.  Label 1 is reserved for the
+ * unambiguously degraded pages MRC must not touch (heavy blur, heavy
+ * downscale, broken strokes).  Heavy background corruptions that leave text
+ * crisp (noise, JPEG blocking) stay label 0 as hard negatives, and the mild
+ * version of every corruption is label 0.
  */
 public final class SyntheticCorpus {
 
@@ -71,6 +74,17 @@ public final class SyntheticCorpus {
 
     /** Typical printed body text is 10-12pt. */
     private static final int FONT_SIZE = 11;
+
+    // Severities of the unambiguously degraded (label=1, skip MRC) corruptions,
+    // calibrated so a human reads them as clearly hard to read.  The heavy
+    // background corruptions below are calibrated to stay label=0 hard
+    // negatives: crisp text on a corrupted background is acceptable.
+    private static final double SEVERE_BLUR_SIGMA = 4.5;
+    private static final double SEVERE_SCALE = 0.30;
+    private static final int SEVERE_STROKE_PERCENT = 50;
+    private static final int HEAVY_NOISE_SIGMA = 40;
+    private static final float HEAVY_JPEG_QUALITY = 0.10f;
+    private static final int HEAVY_STROKE_PERCENT = 25;
 
     private SyntheticCorpus() {
     }
@@ -135,82 +149,38 @@ public final class SyntheticCorpus {
         }
     }
 
-    private record Variant(String name, BufferedImage image, int label) {
+    record Variant(String name, BufferedImage image, int label) {
     }
 
-    private static List<Variant> buildVariants(Page page, long rngSeed) {
+    static List<Variant> buildVariants(Page page, long rngSeed) {
         BufferedImage base = page.image();
         List<Variant> out = new ArrayList<>();
         out.add(new Variant("blur-1.0", gaussianBlur(base, 1), 0));
-        out.add(new Variant("blur-3.0", gaussianBlur(base, 3), 1));
+        out.add(new Variant("blur-" + SEVERE_BLUR_SIGMA, gaussianBlur(base, SEVERE_BLUR_SIGMA), 1));
         out.add(new Variant("noise-6", addNoise(base, 6, new java.util.Random(rngSeed ^ 0x51a)), 0));
-        out.add(new Variant("noise-24", addNoise(base, 24, new java.util.Random(rngSeed ^ 0x51a)), 1));
+        out.add(new Variant("noise-" + HEAVY_NOISE_SIGMA, addNoise(base, HEAVY_NOISE_SIGMA, new java.util.Random(rngSeed ^ 0x51a)), 0));
         out.add(new Variant("jpeg-0.75", recompressJpeg(base, 0.75f), 0));
-        out.add(new Variant("jpeg-0.30", recompressJpeg(base, 0.30f), 1));
+        out.add(new Variant("jpeg-" + HEAVY_JPEG_QUALITY, recompressJpeg(base, HEAVY_JPEG_QUALITY), 0));
         out.add(new Variant("scale-0.75", downscale(base, 0.75), 0));
-        out.add(new Variant("scale-0.45", downscale(base, 0.45), 1));
+        out.add(new Variant("scale-" + SEVERE_SCALE, downscale(base, SEVERE_SCALE), 1));
         out.add(new Variant("strokes-4", breakStrokes(base, page.blocks(), 4, new java.util.Random(rngSeed ^ 0xb10b)), 0));
-        out.add(new Variant("strokes-14", breakStrokes(base, page.blocks(), 14, new java.util.Random(rngSeed ^ 0xb10b)), 1));
+        out.add(new Variant("strokes-" + HEAVY_STROKE_PERCENT,
+                breakStrokes(base, page.blocks(), HEAVY_STROKE_PERCENT, new java.util.Random(rngSeed ^ 0xb10b)), 0));
+        out.add(new Variant("strokes-" + SEVERE_STROKE_PERCENT,
+                breakStrokes(base, page.blocks(), SEVERE_STROKE_PERCENT, new java.util.Random(rngSeed ^ 0xb10b)), 1));
         return out;
     }
 
     /**
-     * Emits the preview pages for one doc: an overview sheet of every variant
-     * at a glance, then one legible full page per variant.  Variant pages are
-     * rasterized at 2x density so body text reads at roughly its true point
-     * size when the sheet displays at 612x792 pt.
+     * Emits the preview pages for one doc: one legible full page per variant.
+     * Variant pages are rasterized at 2x density so body text reads at roughly
+     * its true point size when the sheet displays at 612x792 pt.
      */
     private static void addPreviewPages(PDDocument preview, List<Variant> variants, int docIdx)
             throws IOException {
-        addOverviewSheet(preview, variants, docIdx);
         for (int v = 0; v < variants.size(); v++) {
             addVariantPage(preview, variants.get(v), docIdx, v + 1);
         }
-    }
-
-    private static void addOverviewSheet(PDDocument preview, List<Variant> variants, int docIdx)
-            throws IOException {
-        int cols = 6;
-        int pad = 6;
-        int titleH = 26;
-        int cellW = TILE_W + 2 * pad;
-        int cellH = TILE_H + LABEL_H + pad;
-        int cw = cols * cellW + pad;
-        int ch = titleH + 2 * cellH + pad;
-        BufferedImage sheet = new BufferedImage(cw, ch, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g2 = sheet.createGraphics();
-        try {
-            g2.setColor(Color.WHITE);
-            g2.fillRect(0, 0, cw, ch);
-            g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 14));
-            g2.setColor(Color.BLACK);
-            g2.drawString("doc" + docIdx + "  (top: label 0 clean/mild  |  bottom: label 1 degraded)",
-                    pad, 18);
-            int[] mild = {0, 1, 3, 5, 7, 9};
-            int[] severe = {2, 4, 6, 8, 10};
-            int[][] order = {mild, severe};
-            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            for (int r = 0; r < 2; r++) {
-                int i = 0;
-                for (int v : order[r]) {
-                    if (v >= variants.size()) continue;
-                    Variant var = variants.get(v);
-                    int tx = pad + i * cellW;
-                    int ty = titleH + r * cellH;
-                    g2.drawImage(var.image(), tx, ty, TILE_W, TILE_H, null);
-                    g2.setColor(var.label() == 0 ? new Color(0, 120, 0) : new Color(180, 20, 20));
-                    g2.fillRect(tx, ty + TILE_H, TILE_W, LABEL_H);
-                    g2.setColor(Color.WHITE);
-                    g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 9));
-                    g2.drawString("p" + (v + 1) + " " + var.name() + " (" + var.label() + ")",
-                            tx + 4, ty + TILE_H + 15);
-                    i++;
-                }
-            }
-        } finally {
-            g2.dispose();
-        }
-        embedSheet(preview, sheet);
     }
 
     /**
@@ -262,10 +232,6 @@ public final class SyntheticCorpus {
         }
     }
 
-    private static final int TILE_W = 170;
-    private static final int TILE_H = 220;
-    private static final int LABEL_H = 24;
-
     private static int[] grayOf(BufferedImage image) {
         return ImageOps.toGrayscale(image);
     }
@@ -292,13 +258,13 @@ public final class SyntheticCorpus {
     // chain so feature distributions match pipeline inputs.
     // ──────────────────────────────────────────────────────────────────────
 
-    private record Page(BufferedImage image, List<TextBlock> blocks) {
+    record Page(BufferedImage image, List<TextBlock> blocks) {
     }
 
     private record WordBox(String word, Rectangle box) {
     }
 
-    private static Page renderPage(long seed) throws IOException {
+    static Page renderPage(long seed) throws IOException {
         // 1. Source "scan": AWT text on a 612x792 grayscale raster, JPEG'd.
         BufferedImage src = new BufferedImage(SRC_W, SRC_H, BufferedImage.TYPE_BYTE_GRAY);
         Graphics2D g = src.createGraphics();
