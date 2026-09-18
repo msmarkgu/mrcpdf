@@ -20,14 +20,14 @@ import org.junit.jupiter.api.Assumptions;
 class QualityModelTest {
 
     private static final String[] GOLDEN_CLEAN = {
-            // a clean corpus row (doc0, label 0) from the realistic 300-DPI corpus
-            "2.666667", "94.581473", "12.774456", "10.350242", "0.896633",
-            "0.720109", "1.000000", "0.005391", "4.013003", "7.906264", "0.102103"
+            // a clean corpus row (doc0, label 0) from the scanner-simulated 300-DPI corpus
+            "2.666667", "0.129994", "12.829327", "10.089706", "0.918952",
+            "0.700092", "0.996078", "0.005152", "3.586328", "8.118833", "0.070324"
     };
     private static final String[] GOLDEN_DEGRADED = {
-            // a degraded corpus row (doc0, label 1, severe blur)
-            "16.682955", "8.052883", "9.470054", "4.200741", "0.846695",
-            "0.255043", "0.611765", "0.007981", "0.091475", "14.015953", "0.209062"
+            // a degraded corpus row (doc0, label 1) from the scanner-simulated 300-DPI corpus
+            "6.245275", "0.863158", "7.487757", "4.691683", "0.537629",
+            "0.014238", "0.062745", "0.016595", "1.008388", "3.854570", "0.752910"
     };
 
     private static double[] parse(String[] s) {
@@ -102,7 +102,7 @@ class QualityModelTest {
         // update these constants from the printed values.
         System.out.println("GOLDEN_CLEAN prediction: " + pClean);
         System.out.println("GOLDEN_DEGRADED prediction: " + pDegraded);
-        assertEquals(0.34094764069188027, pClean, 1e-12, "clean-row prediction changed");
-        assertEquals(0.9432073147521334, pDegraded, 1e-12, "degraded-row prediction changed");
+        assertEquals(0.002775149376186915, pClean, 1e-12, "clean-row prediction changed");
+        assertEquals(0.9999542984745883, pDegraded, 1e-12, "degraded-row prediction changed");
     }
 }

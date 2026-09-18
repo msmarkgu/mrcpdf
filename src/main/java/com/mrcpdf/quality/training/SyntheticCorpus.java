@@ -7,21 +7,12 @@ import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
-import java.awt.image.ConvolveOp;
-import java.awt.image.Kernel;
 import java.io.IOException;
 import java.io.File;
 import java.io.PrintStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-
-import javax.imageio.IIOImage;
-import javax.imageio.ImageIO;
-import javax.imageio.ImageWriteParam;
-import javax.imageio.ImageWriter;
-import javax.imageio.stream.ImageOutputStream;
-import javax.imageio.stream.MemoryCacheImageOutputStream;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -42,21 +33,26 @@ import com.mrcpdf.util.ImageOps;
  * model, engineered to live in the same feature space as the pipeline's real
  * inputs.
  *
- * Production pages pass through: a Java-AWT raster of text (per-page 612×792
- * grayscale scan, font 11, JPEG q~0.95) embedded in a PDF, then re-rendered at
- * 300 DPI by PDFRenderer.  The corpus reproduces that exact chain, so clean
- * corpus pages share the anti-aliasing / upscale / JPEG statistics of real
- * scans, and the trained gate transfers without re-training.
+ * <p>Production pages pass through: a Java-AWT raster of text (per-page 612×792
+ * grayscale scan, JPEG q~0.95) embedded in a PDF, then re-rendered at 300 DPI
+ * by PDFRenderer.  The corpus reproduces that exact chain, so clean corpus
+ * pages share the anti-aliasing / upscale / JPEG statistics of real scans, and
+ * the trained gate transfers without re-training.
  *
- * Each document renders its own page (deterministic per seed) and derives a
- * clean row plus mild and heavy versions of each degradation (Gaussian blur,
- * additive sensor noise, JPEG recompression, low-resolution downscale, broken
- * strokes).  Every variant of one source page shares its {@code doc} id so the
- * train/val split stays document-aware.  Label 1 is reserved for the
- * unambiguously degraded pages MRC must not touch (heavy blur, heavy
- * downscale, broken strokes).  Heavy background corruptions that leave text
- * crisp (noise, JPEG blocking) stay label 0 as hard negatives, and the mild
- * version of every corruption is label 0.
+ * <p>Each document renders its own page (deterministic per seed) with a
+ * realistic layout (title, headings, indented paragraphs).  A clean row plus
+ * {@code degradedPerDoc} degraded rows are derived per document: every degraded
+ * page draws a {@link ScannerProfile} from one {@link ScannerTier} archetype,
+ * runs it through {@link ScannerSimulator}, and carries a synthetic quality
+ * score in [0,1] computed from the degradation parameters plus a binary label
+ * (score below {@link SeverityScore#LABEL_CUTOFF} ⇒ 1, MRC must not touch).
+ * Every variant of one source page shares its {@code doc} id so the train/val
+ * split stays document-aware.
+ *
+ * <p>All pages of a document use the same RNG seed stream, so the corpus is
+ * byte-reproducible for a given {@code seed}.  The synthetic score is used for
+ * labeling; the final gate labels still come from human reading of the MRC
+ * output via the annotation workflow in docs/synthetic-labels.md.
  */
 public final class SyntheticCorpus {
 
@@ -65,6 +61,22 @@ public final class SyntheticCorpus {
 
     /** JPEG quality of the embedded "scan" like TestPdfGenerator.reads. */
     static final float SOURCE_JPEG_QUALITY = 0.95f;
+
+    /**
+     * Per-page scan compression.  Clean pages are scanned near-lossless while
+     * degraded photocopies carry heavy JPEG blockiness; the median3 residual
+     * (noiseSigma feature) only reads as "sensor noise" on degraded pages when
+     * the compressed stream is actually noisy there, otherwise the clean
+     * pages' anti-aliased text halos dominate the residual and flip the
+     * noise budget backwards.  The quality therefore tracks the synthetic
+     * quality score: 1.0 -> ~0.95, 0.0 -> ~0.45.
+     */
+    static float jpegQualityForScore(double score) {
+        return (float) Math.min(0.95, 0.45 + 0.50 * score);
+    }
+
+    /** Degraded pages per document when the caller doesn't specify a count. */
+    public static final int DEFAULT_DEGRADED_PER_DOC = 19;
 
     /** Source raster page size in points (72 DPI units). */
     private static final int SRC_W = 612;
@@ -75,37 +87,32 @@ public final class SyntheticCorpus {
     /** Typical printed body text is 10-12pt. */
     private static final int FONT_SIZE = 11;
 
-    // Severities of the unambiguously degraded (label=1, skip MRC) corruptions,
-    // calibrated so a human reads them as clearly hard to read.  The heavy
-    // background corruptions below are calibrated to stay label=0 hard
-    // negatives: crisp text on a corrupted background is acceptable.
-    private static final double SEVERE_BLUR_SIGMA = 4.5;
-    private static final double SEVERE_SCALE = 0.30;
-    private static final int SEVERE_STROKE_PERCENT = 50;
-    private static final int HEAVY_NOISE_SIGMA = 40;
-    private static final float HEAVY_JPEG_QUALITY = 0.10f;
-    private static final int HEAVY_STROKE_PERCENT = 25;
-
     private SyntheticCorpus() {
     }
 
     /**
-     * Writes the labeled corpus CSV for the given variant.  Rows:
-     * doc,label,followed by the {@link FeatureExtractor} features for that
-     * variant.
+     * Writes the labeled corpus CSV for the given variant with the default
+     * number of degraded pages per document.  Rows: doc,label,followed by the
+     * {@link FeatureExtractor} features for that variant.
      */
     public static void generate(Path out, String variant, int docCount, long seed) throws IOException {
-        generate(out, variant, docCount, seed, null, null);
+        generate(out, variant, docCount, DEFAULT_DEGRADED_PER_DOC, seed, null, null);
     }
 
     /**
      * As the four-arg form, but additionally emits a viewable preview PDF (one
-     * labeled sheet per doc showing every clean/mild/degraded variant) when
-     * {@code previewPdf} is non-null, streaming progress to {@code progress}
-     * if provided.  The corpus CSV is byte-identical with or without a preview.
+     * labeled sheet per doc showing every clean/degraded variant) when
+     * {@code previewPdf} is non-null, streaming progress to {@code progress}.
+     * The corpus CSV is byte-identical with or without a preview.
      */
     public static void generate(Path out, String variant, int docCount, long seed,
                                 Path previewPdf, PrintStream progress) throws IOException {
+        generate(out, variant, docCount, DEFAULT_DEGRADED_PER_DOC, seed, previewPdf, progress);
+    }
+
+    /** Full form: pinned degraded-page count plus optional preview PDF. */
+    public static void generate(Path out, String variant, int docCount, int degradedPerDoc,
+                                long seed, Path previewPdf, PrintStream progress) throws IOException {
         List<String> featureNames = new ArrayList<>(List.of(FeatureExtractor.IMAGE_FEATURE_NAMES));
         if (QualityModel.VARIANT_TEXT_LAYER.equals(variant)) {
             featureNames.addAll(List.of(FeatureExtractor.TEXT_FEATURE_NAMES));
@@ -122,16 +129,16 @@ public final class SyntheticCorpus {
                 int[] gray = ImageOps.toGrayscale(page.image);
                 rows.add(featureRow(gray, w, h, page.blocks, variant, "doc" + d, 0, dpi));
 
-                List<Variant> variants = buildVariants(page, rngSeed);
-                for (Variant v : variants) {
-                    int[] g = grayOf(v.image());
+                List<Variant> scans = buildScannedPages(page, rngSeed, degradedPerDoc);
+                for (Variant v : scans) {
+                    int[] g = ImageOps.toGrayscale(v.image());
                     rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, v.label(), dpi));
                 }
 
                 if (preview != null) {
                     List<Variant> sheets = new ArrayList<>();
-                    sheets.add(new Variant("clean", page.image, 0));
-                    sheets.addAll(variants);
+                    sheets.add(new Variant("clean", "clean", page.image, 1.0, 0));
+                    sheets.addAll(scans);
                     int before = preview.getNumberOfPages();
                     addPreviewPages(preview, sheets, d);
                     if (progress != null) {
@@ -149,32 +156,94 @@ public final class SyntheticCorpus {
         }
     }
 
-    record Variant(String name, BufferedImage image, int label) {
-    }
-
-    static List<Variant> buildVariants(Page page, long rngSeed) {
-        BufferedImage base = page.image();
-        List<Variant> out = new ArrayList<>();
-        out.add(new Variant("blur-1.0", gaussianBlur(base, 1), 0));
-        out.add(new Variant("blur-" + SEVERE_BLUR_SIGMA, gaussianBlur(base, SEVERE_BLUR_SIGMA), 1));
-        out.add(new Variant("noise-6", addNoise(base, 6, new java.util.Random(rngSeed ^ 0x51a)), 0));
-        out.add(new Variant("noise-" + HEAVY_NOISE_SIGMA, addNoise(base, HEAVY_NOISE_SIGMA, new java.util.Random(rngSeed ^ 0x51a)), 0));
-        out.add(new Variant("jpeg-0.75", recompressJpeg(base, 0.75f), 0));
-        out.add(new Variant("jpeg-" + HEAVY_JPEG_QUALITY, recompressJpeg(base, HEAVY_JPEG_QUALITY), 0));
-        out.add(new Variant("scale-0.75", downscale(base, 0.75), 0));
-        out.add(new Variant("scale-" + SEVERE_SCALE, downscale(base, SEVERE_SCALE), 1));
-        out.add(new Variant("strokes-4", breakStrokes(base, page.blocks(), 4, new java.util.Random(rngSeed ^ 0xb10b)), 0));
-        out.add(new Variant("strokes-" + HEAVY_STROKE_PERCENT,
-                breakStrokes(base, page.blocks(), HEAVY_STROKE_PERCENT, new java.util.Random(rngSeed ^ 0xb10b)), 0));
-        out.add(new Variant("strokes-" + SEVERE_STROKE_PERCENT,
-                breakStrokes(base, page.blocks(), SEVERE_STROKE_PERCENT, new java.util.Random(rngSeed ^ 0xb10b)), 1));
-        return out;
+    record Variant(String name, String tier, BufferedImage image, double score, int label) {
     }
 
     /**
-     * Emits the preview pages for one doc: one legible full page per variant.
-     * Variant pages are rasterized at 2x density so body text reads at roughly
-     * its true point size when the sheet displays at 612x792 pt.
+     * Baseline-scan of a pristine page: the "clean" corpus sheet is not the
+     * mathematically perfect raster but a fresh, light scan of it (small
+     * optics blur + a whisper of sensor grain, near-lossless capture).  This
+     * matters for feature realism: a pixel-perfect source reads the
+     * anti-aliased text halos as "background noise" (noiseSigma), making the
+     * cleanest sheets measure *noisier* than degraded photocopies.  Running
+     * them through the same mild scan chain keeps every sheet on the same
+     * feature scale.  Deterministic per document.
+     */
+    static BufferedImage cleanScan(Page page, long docSeed) {
+        long seed = docSeed ^ 0x5A3C1E4B57C0DE57L;
+        java.util.Random rng = new java.util.Random(seed ^ 0x51a7);
+        ScannerProfile base = new ScannerProfile(
+                0, 0, 1, 0.5, 0, 0, 0, 0, 0.4, 0, 0, 0, 0, 0, 0, 1, 0, 0.98f);
+        return ScannerSimulator.apply(page.image(), base, rng);
+    }
+
+    /**
+     * Builds {@code count} degraded variants of one page, each a deterministic
+     * random draw of a {@link ScannerTier} parameter range run through the
+     * {@link ScannerSimulator}.  Score and binary label come from the profile.
+     */
+    static List<Variant> buildScannedPages(Page page, long docSeed, int count) {
+        BufferedImage base = page.image();
+        List<Variant> out = new ArrayList<>();
+        for (int v = 0; v < count; v++) {
+            long pageSeed = docSeed ^ (v * 0xBF58476D1CE4E5B9L);
+            java.util.Random rng = new java.util.Random(pageSeed ^ 0x51a7);
+            ScannerTier tier = drawTier(rng);
+            ScannerProfile profile = tier.draw(rng);
+            double score = SeverityScore.score(profile);
+            int label = SeverityScore.label(score);
+            BufferedImage scanned = ScannerSimulator.apply(base, profile, rng);
+            out.add(new Variant(variantName(tier, profile), tier.slug(), scanned, score, label));
+        }
+        return out;
+    }
+
+    /** Weighted tier draw so the corpus spans all readability levels. */
+    private static ScannerTier drawTier(java.util.Random rng) {
+        double[] w = ScannerTier.DRAW_WEIGHTS;
+        double total = 0;
+        for (double v : w) total += v;
+        double r = rng.nextDouble() * total;
+        for (int i = 0; i < ScannerTier.values().length; i++) {
+            r -= w[i];
+            if (r < 0) return ScannerTier.values()[i];
+        }
+        return ScannerTier.values()[ScannerTier.values().length - 1];
+    }
+
+    /** Human-readable variant name: tier slug + dominant effects, e.g. {@code fx40+blur1.9+jpeg57}. */
+    static String variantName(ScannerTier tier, ScannerProfile p) {
+        SeverityScore.Severities s = SeverityScore.severities(p);
+        StringBuilder name = new StringBuilder(tier.slug());
+        if (s.blur() > 0.3) name.append("+blur").append(fmt(p.blurSigma(), 1));
+        if (s.motion() > 0.3) name.append("+motion").append(fmt(p.motionBlurLen(), 0));
+        if (s.scale() > 0.2) name.append("+scale").append(fmt(p.downscale(), 2));
+        if (s.ink() > 0.25) name.append(p.inkSpread() > 0 ? "+bold" : "+faint");
+        if (s.contrast() > 0.3) name.append("+ctr");
+        if (s.noise() > 0.3) name.append("+noise").append(fmt(p.noiseSigma(), 1));
+        if (s.jpeg() > 0.3) name.append("+jpeg").append(fmt(p.jpegQuality() * 100, 0));
+        if (s.illum() > 0.3) name.append("+shade");
+        if (s.paper() > 0.3) name.append("+paper");
+        if (s.bleed() > 0.3) name.append("+bleed");
+        if (s.streaks() > 0.3) name.append("+streak");
+        if (s.skew() > 0.3) name.append("+skew").append(fmt(p.skewDeg(), 1));
+        if (s.curl() > 0.3) name.append("+curl");
+        return name.toString();
+    }
+
+    private static String fmt(double v, int digits) {
+        return String.format(java.util.Locale.ROOT, "%." + digits + "f", v);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Preview
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * Emits the preview pages for one doc: one legible full page per variant
+     * (clean + every degraded draw).  Variant pages are rasterized at 2x
+     * density so body text reads at roughly its true point size when the sheet
+     * displays at 612x792 pt.
      */
     private static void addPreviewPages(PDDocument preview, List<Variant> variants, int docIdx)
             throws IOException {
@@ -208,14 +277,13 @@ public final class SyntheticCorpus {
 
             int bandH = 40;
             int bandY = dy + dh - bandH;
-            boolean overlay = bandY < ch;
-            if (overlay) {
+            if (bandY < ch) {
                 g2.setColor(var.label() == 0 ? new Color(0, 120, 0) : new Color(180, 20, 20));
                 g2.fillRect(dx, bandY, dw, bandH);
                 g2.setColor(Color.WHITE);
                 g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 22));
-                g2.drawString("doc" + docIdx + "  p" + pageNo + "  " + var.name() + "  (label "
-                        + var.label() + ")", dx + 12, bandY + 28);
+                g2.drawString("doc" + docIdx + "  p" + pageNo + "  " + var.name()
+                        + "  (score " + fmt(var.score(), 3) + "  label " + var.label() + ")", dx + 12, bandY + 28);
             }
         } finally {
             g2.dispose();
@@ -227,13 +295,8 @@ public final class SyntheticCorpus {
         PDPage pdPage = new PDPage(new PDRectangle(612, 792));
         preview.addPage(pdPage);
         try (PDPageContentStream cs = new PDPageContentStream(preview, pdPage)) {
-            PDImageXObject img = JPEGFactory.createFromImage(preview, sheet, 0.85f);
-            cs.drawImage(img, 0, 0, 612, 792);
+            JpegCodec.embed(preview, cs, sheet, 0.85f, 0, 0, 612, 792);
         }
-    }
-
-    private static int[] grayOf(BufferedImage image) {
-        return ImageOps.toGrayscale(image);
     }
 
     private static Dataset.Row featureRow(int[] gray, int w, int h, List<TextBlock> blocks,
@@ -264,6 +327,24 @@ public final class SyntheticCorpus {
     private record WordBox(String word, Rectangle box) {
     }
 
+    // Richer than filler text: title + subtitle, rule, body paragraphs with
+    // first-line indents and occasional bold section headings.
+    private static final String[] TITLES = {
+            "Annual Report", "Quality Assurance", "Field Notes",
+            "Technical Memo", "Operations Manual", "Student Handbook",
+            "Inspection Summary", "Procedures Draft", "Quarterly Digest",
+            "Project Proposal", "Regulatory Notice", "Resource Guide"
+    };
+
+    private static final String[] SECTIONS = {
+            "Introduction", "Methodology", "Findings", "Discussion",
+            "Recommendations", "Appendix", "References", "Summary"
+    };
+
+    private static String pick(String[] bank, long seed) {
+        return bank[(int) Math.floorMod(seed, bank.length)];
+    }
+
     static Page renderPage(long seed) throws IOException {
         // 1. Source "scan": AWT text on a 612x792 grayscale raster, JPEG'd.
         BufferedImage src = new BufferedImage(SRC_W, SRC_H, BufferedImage.TYPE_BYTE_GRAY);
@@ -277,22 +358,50 @@ public final class SyntheticCorpus {
             g.setColor(Color.WHITE);
             g.fillRect(0, 0, SRC_W, SRC_H);
             g.setColor(Color.BLACK);
-            Font font = new Font(Font.SANS_SERIF, Font.PLAIN, FONT_SIZE);
-            g.setFont(font);
+
+            // Title (bold 18, centered)
+            Font titleFont = new Font(Font.SANS_SERIF, Font.BOLD, 18);
+            g.setFont(titleFont);
+            FontMetrics tmf = g.getFontMetrics();
+            String title = pick(TITLES, seed ^ 0xcea1);
+            int ty = MARGIN + tmf.getAscent();
+            g.drawString(title, (SRC_W - tmf.stringWidth(title)) / 2, ty);
+            wordBoxes.addAll(fillBoxes(title, tmf, (SRC_W - tmf.stringWidth(title)) / 2, ty));
+
+            // Subtitle (11, plain)
+            Font bodyFont = new Font(Font.SANS_SERIF, Font.PLAIN, FONT_SIZE);
+            g.setFont(bodyFont);
             FontMetrics fm = g.getFontMetrics();
-            int y = MARGIN;
+            String subtitle = wordLine(fm, SRC_W - 2 * MARGIN, SUBTITLE_BANK, rng);
+            int sy = ty + 26;
+            g.drawString(subtitle, (SRC_W - fm.stringWidth(subtitle)) / 2, sy);
+            wordBoxes.addAll(fillBoxes(subtitle, fm, (SRC_W - fm.stringWidth(subtitle)) / 2, sy));
+
+            // Rule under the subtitle
+            int ry = sy + 10;
+            g.drawLine(MARGIN, ry, SRC_W - MARGIN, ry);
+
+            // Body: paragraphs with first-line indents, occasional headings.
+            int y = ry + 26;
             while (y < SRC_H - MARGIN) {
-                int x = MARGIN;
-                while (x < SRC_W - MARGIN) {
-                    String word = WORD_BANK[rng.nextInt(WORD_BANK.length)];
-                    int wordWidth = fm.stringWidth(word);
-                    if (x + wordWidth > SRC_W - MARGIN) break;
-                    g.drawString(word, x, y);
-                    wordBoxes.add(new WordBox(word,
-                            new Rectangle(x, y - fm.getAscent(), wordWidth, fm.getAscent() + fm.getDescent())));
-                    x += wordWidth + fm.stringWidth(" ");
+                if (y + LINE_HEIGHT < SRC_H - MARGIN && rng.nextInt(9) == 0) {
+                    Font headFont = new Font(Font.SANS_SERIF, Font.BOLD, 12);
+                    g.setFont(headFont);
+                    FontMetrics hfm = g.getFontMetrics();
+                    String head = pick(SECTIONS, seed ^ rng.nextLong());
+                    g.drawString(head, MARGIN, y + hfm.getAscent());
+                    wordBoxes.addAll(fillBoxes(head, hfm, MARGIN, y + hfm.getAscent()));
+                    y += 24;
+                    continue;
                 }
-                y += LINE_HEIGHT;
+                g.setFont(bodyFont);
+                FontMetrics bfm = g.getFontMetrics();
+                int indent = rng.nextInt(7) == 0 ? 24 : 0;
+                int lines = 2 + rng.nextInt(4);
+                for (int ln = 0; ln < lines && y < SRC_H - MARGIN; ln++) {
+                    y = drawTextLine(g, bfm, rng, wordBoxes, y, ln == 0 ? indent : 0);
+                }
+                y += LINE_HEIGHT; // paragraph gap
             }
         } finally {
             g.dispose();
@@ -305,8 +414,7 @@ public final class SyntheticCorpus {
             PDPage pdPage = new PDPage(new PDRectangle(SRC_W, SRC_H));
             doc.addPage(pdPage);
             try (PDPageContentStream cs = new PDPageContentStream(doc, pdPage)) {
-                PDImageXObject img = JPEGFactory.createFromImage(doc, src, SOURCE_JPEG_QUALITY);
-                cs.drawImage(img, 0, 0, SRC_W, SRC_H);
+                JpegCodec.embed(doc, cs, src, SOURCE_JPEG_QUALITY, 0, 0, SRC_W, SRC_H);
             }
             doc.save(pdf);
         }
@@ -336,115 +444,56 @@ public final class SyntheticCorpus {
         }
     }
 
-    // ──────────────────────────────────────────────────────────────────────
-    // Degradations (applied to the rendered page image)
-    // ──────────────────────────────────────────────────────────────────────
-
-    private static BufferedImage gaussianBlur(BufferedImage src, double sigma) {
-        int radius = Math.max(1, (int) Math.ceil(sigma * 3));
-        int size = 2 * radius + 1;
-        float[] kernel = new float[size * size];
-        double sum = 0;
-        for (int j = -radius; j <= radius; j++) {
-            for (int i = -radius; i <= radius; i++) {
-                double v = Math.exp(-(i * i + j * j) / (2 * sigma * sigma));
-                kernel[(j + radius) * size + (i + radius)] = (float) v;
-                sum += v;
-            }
+    /** Draws one wrapped line of body words and records its word boxes. */
+    private static int drawTextLine(Graphics2D g, FontMetrics fm, java.util.Random rng,
+                                    List<WordBox> wordBoxes, int baselineY, int indent) {
+        int x = MARGIN + indent;
+        int y = baselineY + fm.getAscent();
+        while (x < SRC_W - MARGIN) {
+            String word = WORD_BANK[rng.nextInt(WORD_BANK.length)];
+            int wordWidth = fm.stringWidth(word);
+            if (x + wordWidth > SRC_W - MARGIN) break;
+            g.drawString(word, x, y);
+            wordBoxes.add(new WordBox(word,
+                    new Rectangle(x, y - fm.getAscent(), wordWidth, fm.getAscent() + fm.getDescent())));
+            x += wordWidth + fm.stringWidth(" ");
         }
-        for (int i = 0; i < kernel.length; i++) kernel[i] /= sum;
-        BufferedImage out = new BufferedImage(src.getWidth(), src.getHeight(), src.getType());
-        new ConvolveOp(new Kernel(size, size, kernel), ConvolveOp.EDGE_NO_OP, null).filter(src, out);
-        return out;
+        return baselineY + LINE_HEIGHT;
     }
 
-    private static BufferedImage addNoise(BufferedImage src, double sigma, java.util.Random rng) {
-        int w = src.getWidth();
-        int h = src.getHeight();
-        BufferedImage out = new BufferedImage(w, h, src.getType());
-        int[] gray = ImageOps.toGrayscale(src);
-        for (int i = 0; i < gray.length; i++) {
-            gray[i] = clamp255(gray[i] + (int) Math.round(rng.nextGaussian() * sigma));
+    /** Builds word boxes for a fully drawn string (title/heading). */
+    private static List<WordBox> fillBoxes(String s, FontMetrics fm, int x, int baselineY) {
+        List<WordBox> boxes = new ArrayList<>();
+        String[] words = s.split(" ");
+        int xx = x;
+        int spaceW = fm.stringWidth(" ");
+        for (String w : words) {
+            int ww = fm.stringWidth(w);
+            boxes.add(new WordBox(w, new Rectangle(xx, baselineY - fm.getAscent(), ww,
+                    fm.getAscent() + fm.getDescent())));
+            xx += ww + spaceW;
         }
-        out.setRGB(0, 0, w, h, intsToRgb(gray), 0, w);
-        return out;
+        return boxes;
     }
 
-    private static int[] intsToRgb(int[] gray) {
-        int[] rgb = new int[gray.length];
-        for (int i = 0; i < gray.length; i++) {
-            int v = gray[i];
-            rgb[i] = (v << 16) | (v << 8) | v;
+    /** A subtitle-ish line of filler words up to {@code maxWidth} px. */
+    private static String wordLine(FontMetrics fm, int maxWidth, String[] bank, java.util.Random rng) {
+        StringBuilder sb = new StringBuilder();
+        while (fm.stringWidth(sb.toString()) < maxWidth) {
+            String w = bank[rng.nextInt(bank.length)];
+            String candidate = sb.length() == 0 ? w : sb + " " + w;
+            if (fm.stringWidth(candidate) > maxWidth) break;
+            sb = new StringBuilder(candidate);
         }
-        return rgb;
+        return sb.toString();
     }
 
-    private static BufferedImage recompressJpeg(BufferedImage src, float quality) {
-        try {
-            ImageWriter writer = ImageIO.getImageWritersByFormatName("jpg").next();
-            ImageWriteParam param = writer.getDefaultWriteParam();
-            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
-            param.setCompressionQuality(quality);
-            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-            try (ImageOutputStream ios = new MemoryCacheImageOutputStream(bos)) {
-                writer.setOutput(ios);
-                writer.write(null, new IIOImage(src, null, null), param);
-            }
-            writer.dispose();
-            return ImageIO.read(new java.io.ByteArrayInputStream(bos.toByteArray()));
-        } catch (IOException e) {
-            throw new IllegalStateException("JPEG degradation failed", e);
-        }
-    }
-
-    private static BufferedImage downscale(BufferedImage src, double scale) {
-        int w = src.getWidth();
-        int h = src.getHeight();
-        int sw = Math.max(1, (int) (w * scale));
-        int sh = Math.max(1, (int) (h * scale));
-        BufferedImage small = new BufferedImage(sw, sh, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = small.createGraphics();
-        try {
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.drawImage(src, 0, 0, sw, sh, null);
-        } finally {
-            g.dispose();
-        }
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g2 = out.createGraphics();
-        try {
-            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-            g2.drawImage(small, 0, 0, w, h, null);
-        } finally {
-            g2.dispose();
-        }
-        return out;
-    }
-
-    private static BufferedImage breakStrokes(BufferedImage src, List<TextBlock> blocks,
-                                              int percent, java.util.Random rng) {
-        BufferedImage out = new BufferedImage(src.getWidth(), src.getHeight(), src.getType());
-        Graphics2D g = out.createGraphics();
-        try {
-            g.drawImage(src, 0, 0, null);
-            g.setColor(Color.WHITE);
-            int target = Math.max(1, (blocks.size() * percent) / 100);
-            for (int k = 0; k < target; k++) {
-                Rectangle b = blocks.get(rng.nextInt(blocks.size())).getBbox();
-                int breakW = Math.max(2, b.width / 3);
-                int bx = b.x + rng.nextInt(Math.max(1, b.width - breakW));
-                int by = b.y + b.height / 2 + rng.nextInt(Math.max(1, b.height / 2));
-                g.fillRect(bx, by, breakW, 1);
-            }
-        } finally {
-            g.dispose();
-        }
-        return out;
-    }
-
-    private static int clamp255(int v) {
-        return Math.max(0, Math.min(255, v));
-    }
+    private static final String[] SUBTITLE_BANK = {
+            "prepared by", "field office", "revision", "confidential",
+            "draft for review", "internal use", "distribution unlimited",
+            "quarter", "edition", "version", "approved", "final copy",
+            "working document", "attachment", "enclosure", "notice"
+    };
 
     private static final String[] WORD_BANK = {
             "quality", "model", "gate", "degradation", "threshold", "fidelity",
@@ -452,6 +501,7 @@ public final class SyntheticCorpus {
             "broken", "stroke", "page", "render", "background", "foreground",
             "contrast", "uniformity", "separation", "energy", "laplacian",
             "coverage", "sharpness", "informed", "sampling", "undersampling",
-            "registration", "halo", "edge", "width", "fragment", "glyph"
+            "registration", "halo", "edge", "width", "fragment", "glyph",
+            "scanner", "illumination", "paper", "toner", "focus", "exposure"
     };
 }

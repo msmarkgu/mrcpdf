@@ -122,15 +122,19 @@ public final class FeatureExtractor {
             double[] widths = Arrays.copyOf(edgeWidths, edgeCount);
             Arrays.sort(widths);
             double median = widths[widths.length / 2];
-            double mean = 0;
-            for (double v : widths) mean += v;
-            mean /= widths.length;
-            double var = 0;
-            for (double v : widths) var += (v - mean) * (v - mean);
-            var = Math.max(0, var / widths.length);
+            // Robust width-spread index.  The classic std/mean CV is numerically
+            // swamped by mag/(eps) outliers and by the 2-4x larger edge population
+            // of blurred pages, so it cannot distinguish a sharp+smudged spread
+            // from a uniform soft one.  An inter-decile ratio measures the same
+            // physical quantity (width variation across the page) while staying
+            // immune to tail/lap-epsilon artifacts; it rises monotonically as a
+            // page mixes sharp and heavily blurred edges.
+            double p10 = quantile(widths, 0.10);
+            double p90 = quantile(widths, 0.90);
+            double edgeWidthSpread = (p90 - p10) / (p90 + p10 + EPS);
             // 2.0 maps a sharp step toward ~0.3-1.0 px and heavy blur toward 3px+.
             blurSigmaPx = Math.min(20.0, median * 2.0) * dpiScale;
-            edgeWidthCV = mean > 0 ? Math.sqrt(var) / mean : 0;
+            edgeWidthCV = edgeWidthSpread;
             hiFreqEnergy = Math.log1p(magSqSum / widths.length);
         }
         double lapMean = lapSum / n;
@@ -527,6 +531,17 @@ public final class FeatureExtractor {
         for (int i = 0; i < arr.length; i++) arr[i] = values.get(i);
         Arrays.sort(arr);
         return arr[arr.length / 2];
+    }
+
+    /** Linear-interpolated quantile of a sorted array. */
+    private static double quantile(double[] sorted, double q) {
+        if (sorted.length == 0) return 0;
+        if (sorted.length == 1) return sorted[0];
+        double pos = q * (sorted.length - 1);
+        int lo = (int) Math.floor(pos);
+        int hi = Math.min(sorted.length - 1, lo + 1);
+        double frac = pos - lo;
+        return sorted[lo] * (1 - frac) + sorted[hi] * frac;
     }
 
     private static double cvOfList(List<Double> values) {

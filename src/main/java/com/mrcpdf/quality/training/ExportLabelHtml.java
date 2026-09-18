@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Emits the static HTML labeling tool for the synthetic corpus.
@@ -61,16 +62,27 @@ public final class ExportLabelHtml {
         System.out.println("Open with: open " + out.toAbsolutePath());
     }
 
-    private record Row(int page, String doc, String variant, int inputLabel) {
+    private record Row(int page, String doc, String variant, int inputLabel,
+                       double score, String tier, int pageInDoc) {
     }
 
     private static List<Row> readMap(Path map, Path base) throws IOException {
         List<Row> rows = new ArrayList<>();
+        String currentDoc = null;
+        int pageInDoc = 0;
         for (String line : Files.readAllLines(map, StandardCharsets.US_ASCII)) {
             if (line.isBlank() || line.startsWith("page,")) continue;
-            String[] c = line.split(",", 5);
+            String[] c = line.split(",", 6);
             if (c.length < 4) throw new IllegalArgumentException("Bad map row: " + line);
-            rows.add(new Row(Integer.parseInt(c[0]), c[1], c[2], Integer.parseInt(c[3])));
+            if (!c[1].equals(currentDoc)) {
+                currentDoc = c[1];
+                pageInDoc = 0;
+            }
+            double score = c.length >= 6 ? Double.parseDouble(c[5]) : -1;
+            String tier = c.length >= 5 ? c[4] : "";
+            pageInDoc++;
+            rows.add(new Row(Integer.parseInt(c[0]), c[1], c[2], Integer.parseInt(c[3]),
+                    score, tier, pageInDoc));
         }
         Path dir = base.getParent();
         if (dir != null) Files.createDirectories(dir);
@@ -86,6 +98,9 @@ public final class ExportLabelHtml {
                     .append(",\"d\":\"").append(jsonEsc(r.doc))
                     .append("\",\"v\":\"").append(jsonEsc(r.variant))
                     .append("\",\"l\":").append(r.inputLabel)
+                    .append(",\"t\":\"").append(jsonEsc(r.tier))
+                    .append("\",\"s\":").append(String.format(Locale.ROOT, "%.3f", r.score))
+                    .append(",\"pi\":").append(r.pageInDoc)
                     .append('}');
         }
         return sb.append(']').toString();
@@ -212,7 +227,8 @@ ROWS.forEach((r, idx) => {
   const tr = document.createElement("tr");
   tr.dataset.page = r.p;
   tr.innerHTML =
-    '<td class="meta">p' + r.p + '<br><span class="tag">' + r.d + '<br>' + r.v + '</span></td>' +
+    '<td class="meta">p' + r.p + '<br><span class="tag">' + r.d + '<br>' + r.v +
+      (r.t ? '<br>' + r.t + (r.s >= 0 ? ' (score ' + r.s.toFixed(3) + ')' : '') : '') + '</span></td>' +
     '<td class="cell orig"><canvas data-pdf="src" data-page="' + r.p + '"></canvas></td>' +
     '<td class="cell mrc"><canvas data-pdf="mrc" data-page="' + r.p + '"></canvas></td>' +
     '<td class="checks">' +
@@ -269,7 +285,7 @@ const jump = document.getElementById("jump");
 ROWS.forEach((r, idx) => {
   const o = document.createElement("option");
   o.value = idx;
-  o.textContent = r.d + " p" + (idx % 12 + 1) + " " + r.v;
+  o.textContent = r.d + " p" + r.pi + " " + r.v;
   jump.appendChild(o);
 });
 jump.addEventListener("change", () => {

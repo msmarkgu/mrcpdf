@@ -98,7 +98,7 @@ public final class BuildSyntheticPairs {
         List<String[]> out = new ArrayList<>();
         for (String line : Files.readAllLines(map, StandardCharsets.US_ASCII)) {
             if (line.isBlank() || line.startsWith("page,")) continue;
-            String[] c = line.split(",", 5);
+            String[] c = line.split(",", 6);
             if (c.length < 4) throw new IllegalArgumentException("Bad map row: " + line);
             out.add(c);
         }
@@ -149,8 +149,10 @@ public final class BuildSyntheticPairs {
         g2.fillRect(dx, bandY, dw, bandH);
         g2.setColor(Color.BLACK);
         g2.setFont(new Font(Font.SANS_SERIF, Font.BOLD, 22));
+        String extra = row.length >= 6 ? "  score " + row[5] : "";
         String label = "p" + pageNo + "  " + row[1] + "  " + row[2]
-                + "  (input " + row[3] + ")  " + side + "     -> unreadable after MRC? 0/1";
+                + "  (input " + row[3] + ")" + extra + "  " + side
+                + "     -> unreadable after MRC? 0/1";
         g2.drawString(label, dx + 8, bandY + 31);
     }
 

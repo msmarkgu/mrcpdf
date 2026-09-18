@@ -67,7 +67,7 @@ tasks.register<JavaExec>("trainQualityModel") {
     mainClass.set("com.mrcpdf.tools.TrainModel")
     args("--generate", "build/quality-corpus.csv",
          "--out", "src/main/resources/quality-model.json",
-         "--variant", "image-only", "--docs", "20", "--seed", "42")
+         "--variant", "image-only", "--docs", "25", "--seed", "42")
 }
 
 // Emits build/synthetic-pages.pdf: one labeled preview sheet per synthetic doc
@@ -75,7 +75,7 @@ tasks.register<JavaExec>("trainQualityModel") {
 tasks.register<JavaExec>("dumpSyntheticPages") {
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass.set("com.mrcpdf.quality.training.SynthPageDump")
-    args("--docs", "20", "--seed", "42", "--out", "build/synthetic-pages.pdf")
+    args("--docs", "25", "--seed", "42", "--out", "build/synthetic-pages.pdf")
 }
 
 // Merges the synthetic corpus with the real clean-page rows into
@@ -91,14 +91,31 @@ tasks.register<JavaExec>("buildMergedCorpus") {
 }
 
 // Dumps the raw 300-DPI corpus variant pages into a plain PDF (one page per
-// variant, same order as synthetic-pages.pdf) plus a page->variant map CSV,
-// so a gate-off MRC pass can be labeled and joined back to corpus rows.
+// variant, same order as synthetic-pages.pdf) plus a page->variant map CSV
+// (page,doc,variant,label,tier,score), so a gate-off MRC pass can be labeled
+// and joined back to corpus rows.
 tasks.register<JavaExec>("dumpSyntheticSrc") {
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass.set("com.mrcpdf.quality.training.SynthSrcDump")
-    args("--docs", "20", "--seed", "42",
+    args("--docs", "25", "--pages", "20", "--seed", "42",
          "--out", "build/synthetic-src.pdf",
          "--map", "build/synthetic-variant-map.csv")
+    outputs.files(
+        layout.buildDirectory.file("synthetic-src.pdf"),
+        layout.buildDirectory.file("synthetic-variant-map.csv"))
+}
+
+// Verifies the generated corpus before labeling: checks the 10-20
+// events-per-feature rule for the minority class, ordering of the mean
+// synthetic score by tier, and Spearman sign of each image feature vs score.
+tasks.register<JavaExec>("checkSyntheticCorpus") {
+    dependsOn("dumpSyntheticSrc")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.ScoreCorrCheck")
+    jvmArgs("-Xmx3g")
+    args("--src", "build/synthetic-src.pdf",
+         "--map", "build/synthetic-variant-map.csv",
+         "--dpi", "300", "--min-events", "165")
 }
 
 // Runs the real MRC pipeline over build/synthetic-src.pdf with the quality
@@ -115,7 +132,7 @@ tasks.register<JavaExec>("mrcSyntheticSrc") {
 }
 
 // Renders the side-by-side original | MRC labeling doc from the src and MRC
-// PDFs (240 pages; page i corresponds to variant-map row i).
+// PDFs (500 pages; page i corresponds to variant-map row i).
 tasks.register<JavaExec>("buildSyntheticPairs") {
     dependsOn("mrcSyntheticSrc")
     classpath = sourceSets.main.get().runtimeClasspath
