@@ -104,6 +104,29 @@ public final class ScoreSampler {
     }
 
     /**
+     * What corpus QA needs to know about a steered row, and nothing more.
+     *
+     * <p>Deliberately not {@link Sample}: a sample holds its {@link Rendered}, and
+     * a rendered page is about a megabyte, so keeping the samples to build a
+     * histogram at the end of a run would retain half a gigabyte of rasters that
+     * were already written to disk. QA reads four numbers per row.
+     */
+    public interface SteeringRow {
+
+        /** The steering value measured on the page. */
+        double steer();
+
+        /** The value the sampler aimed at. */
+        double target();
+
+        /** Whether the page converged onto {@link #target()}. */
+        boolean onTarget();
+
+        /** Class index from the full {@code R_mrc}: 0 good, 1 middle, 2 bad. */
+        int cls();
+    }
+
+    /**
      * The dimension a page is steered by.
      *
      * <p>Kept in physical terms rather than as an enum of parameters, so the
@@ -155,11 +178,21 @@ public final class ScoreSampler {
      *                 the corpus QA counts them rather than hiding them
      */
     public record Sample(Rendered rendered, Dim aimed, Dim binding, double target,
-                         double steer, int attempts, boolean onTarget) {
+                         double steer, int attempts, boolean onTarget)
+            implements SteeringRow {
 
         /** Distance the page ended up from its target. */
         public double error() {
             return Math.abs(steer - target);
+        }
+
+        @Override
+        public int cls() {
+            return switch (rendered.mrc().tier()) {
+                case "good" -> 0;
+                case "middle" -> 1;
+                default -> 2;
+            };
         }
     }
 
@@ -354,5 +387,97 @@ public final class ScoreSampler {
     static double clamp01(double v) {
         if (Double.isNaN(v)) return 0.0;
         return Math.max(0.0, Math.min(1.0, v));
+    }
+
+    // ── Per-run steering configuration ────────────────────────────────────────
+
+    /**
+     * The steering settings for a corpus run, plus the calibration they imply.
+     *
+     * <p>Shared by reference across every page and every worker of a run.  The
+     * curves are cached rather than re-probed because a probe costs
+     * {@code 3 * steps} OCR passes: per shard it would dominate the build, and
+     * per page it would cost more than the sampling it is meant to accelerate.
+     * The first worker to need a curve probes it against its own page and the
+     * rest reuse it.
+     *
+     * <p>That makes the curves a property of the run rather than of the page, which
+     * is a real approximation: a dense legal page and a sparse one have different
+     * blur responses.  It is the right trade here because the curves only supply
+     * the <em>first guess</em> -- the re-aim loop measures the page in front of it
+     * and corrects -- so a slightly-off guess costs an extra render rather than a
+     * wrong page.
+     */
+    public static final class Steering {
+
+        private final boolean enabled;
+        private final double lo;
+        private final double hi;
+        private final ScoreSampler sampler;
+        private final Dim[] dims;
+        private volatile ScoreCalibration.Calibration calibration;
+
+        public Steering(boolean enabled, double lo, double hi, double tolerance,
+                        int maxAttempts, Dim[] dims) {
+            this.enabled = enabled;
+            this.lo = lo;
+            this.hi = hi;
+            this.sampler = new ScoreSampler(tolerance, maxAttempts);
+            this.dims = dims.clone();
+        }
+
+        /** Steering off: the corpus is built exactly as it was before this existed. */
+        public static Steering off() {
+            return new Steering(false, DEFAULT_LO, DEFAULT_HI, DEFAULT_TOLERANCE,
+                    DEFAULT_MAX_ATTEMPTS, Dim.values());
+        }
+
+        public boolean enabled() {
+            return enabled;
+        }
+
+        public double lo() {
+            return lo;
+        }
+
+        public double hi() {
+            return hi;
+        }
+
+        public ScoreSampler sampler() {
+            return sampler;
+        }
+
+        /** The calibration, or null if no page has needed one yet. */
+        public ScoreCalibration.Calibration calibration() {
+            return calibration;
+        }
+
+        /** Draws this page's target and the dimension to steer it by. */
+        public double drawTarget(Random rng) {
+            return ScoreSampler.drawTarget(rng, lo, hi);
+        }
+
+        public Dim drawDim(Random rng) {
+            return dims[rng.nextInt(dims.length)];
+        }
+
+        /**
+         * Probes the curves once per run, against whichever page asks first.
+         *
+         * <p>Synchronized because corpus runs are multi-worker and the probe is
+         * not idempotent in wall-clock terms -- a race here would pay for several
+         * calibrations concurrently, each competing for the same Tesseract
+         * processes the shards are using.
+         */
+        public synchronized ScoreCalibration.Calibration calibrate(ScoreSampler.Render render,
+                                                                    Random rng, int steps,
+                                                                    String reference)
+                throws IOException {
+            if (calibration == null) {
+                calibration = ScoreCalibration.probe(render, rng, steps, reference);
+            }
+            return calibration;
+        }
     }
 }

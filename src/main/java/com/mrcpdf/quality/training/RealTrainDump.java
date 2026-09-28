@@ -81,9 +81,10 @@ public final class RealTrainDump {
      * label.  {@code auditOk} is false where the page had too few reference words
      * for the audit to mean anything, and {@code auditScore} is NaN there.
      * {@code mrcBreakdown} keeps the sub-score summary so a label can always be
-     * explained after the fact.
+     * explained after the fact.  {@code steer} is null for the clean page and for
+     * every page of a {@code --no-steer} run.
      */
-    private static final class Row14 {
+    private static final class Row14 implements ScoreSampler.SteeringRow {
         final int basePage;
         final int variant;
         final String variantName;
@@ -95,11 +96,13 @@ public final class RealTrainDump {
         final double auditScore;
         final boolean auditOk;
         final String mrcBreakdown;
+        final SyntheticCorpus.Steer steer;
         boolean textOk;
 
         Row14(int basePage, int variant, String variantName, String tier, double score,
               int cls, int binaryLabel, double[] features, boolean textOk,
-              double auditScore, boolean auditOk, String mrcBreakdown) {
+              double auditScore, boolean auditOk, String mrcBreakdown,
+              SyntheticCorpus.Steer steer) {
             this.basePage = basePage;
             this.variant = variant;
             this.variantName = variantName;
@@ -112,6 +115,28 @@ public final class RealTrainDump {
             this.auditScore = auditScore;
             this.auditOk = auditOk;
             this.mrcBreakdown = mrcBreakdown;
+            this.steer = steer;
+        }
+
+        @Override
+        public double steer() {
+            return steer == null ? Double.NaN : steer.value();
+        }
+
+        @Override
+        public double target() {
+            return steer == null ? Double.NaN : steer.target();
+        }
+
+        @Override
+        public boolean onTarget() {
+            return steer != null && steer.onTarget();
+        }
+
+        /** Satisfies {@link ScoreSampler.SteeringRow}; the field is already indexed. */
+        @Override
+        public int cls() {
+            return cls;
         }
     }
 
@@ -160,6 +185,13 @@ public final class RealTrainDump {
         double badBelow = MrcReadiness.BAD_BELOW;
         boolean resume = true;
         boolean cleanShards = false;
+        boolean steer = true;
+        double steerLo = ScoreSampler.DEFAULT_LO;
+        double steerHi = ScoreSampler.DEFAULT_HI;
+        double steerTolerance = ScoreSampler.DEFAULT_TOLERANCE;
+        int steerMaxAttempts = ScoreSampler.DEFAULT_MAX_ATTEMPTS;
+        int steerCalibSteps = ScoreCalibration.DEFAULT_STEPS;
+        String steerDims = "visual,mask,bg";
 
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
@@ -178,6 +210,14 @@ public final class RealTrainDump {
                 case "--bad-below" -> badBelow = Double.parseDouble(args[++i]);
                 case "--no-resume" -> resume = false;
                 case "--clean-shards" -> cleanShards = true;
+                case "--steer" -> steer = true;
+                case "--no-steer" -> steer = false;
+                case "--steer-lo" -> steerLo = Double.parseDouble(args[++i]);
+                case "--steer-hi" -> steerHi = Double.parseDouble(args[++i]);
+                case "--steer-tolerance" -> steerTolerance = Double.parseDouble(args[++i]);
+                case "--steer-max-attempts" -> steerMaxAttempts = Integer.parseInt(args[++i]);
+                case "--steer-calib-steps" -> steerCalibSteps = Integer.parseInt(args[++i]);
+                case "--steer-dims" -> steerDims = args[++i];
                 default -> throw new IllegalArgumentException("Unknown flag: " + a);
             }
         }
@@ -185,6 +225,14 @@ public final class RealTrainDump {
         if (goodAbove <= badBelow) {
             throw new IllegalArgumentException("--good-above must exceed --bad-below");
         }
+        if (steerLo < 0 || steerHi > 1 || steerLo >= steerHi) {
+            throw new IllegalArgumentException(
+                    "--steer-lo/--steer-hi must be an increasing range inside [0,1], got "
+                            + steerLo + ".." + steerHi);
+        }
+        ScoreSampler.Dim[] steerDimList = parseDims(steerDims);
+        ScoreSampler.Steering steering = new ScoreSampler.Steering(steer, steerLo, steerHi,
+                steerTolerance, steerMaxAttempts, steerDimList);
 
         List<IndexRow> indexRows = readIndex(index);
         int nBase = indexRows.size();
@@ -196,6 +244,11 @@ public final class RealTrainDump {
         System.out.printf("RealTrainDump: %d base pages x %d variants = %d pages, workers=%d, "
                         + "thresholds good>=%.2f / bad<%.2f%n",
                 nBase, pages, nBase * pages, effWorkers, goodAbove, badBelow);
+        System.out.printf(steer
+                        ? "  steering ON: target uniform [%.2f,%.2f], dims %s, tolerance %.2f, "
+                                + "max %d attempts, %d calibration steps%n"
+                        : "  steering OFF: tier-centre draws, corpus is the pre-sampling baseline%n",
+                steerLo, steerHi, steerDims, steerTolerance, steerMaxAttempts, steerCalibSteps);
 
         Files.createDirectories(shardDir);
         Files.createDirectories(out.toAbsolutePath().getParent());
@@ -211,6 +264,13 @@ public final class RealTrainDump {
         final Path basesIn = bases;
         final Path shardIn = shardDir;
         final boolean resumeIn = resume;
+        // One Steering shared by reference across every shard, so the response
+        // curves are probed once per run instead of once per shard. A probe costs
+        // 3 * steps OCR passes, which is the same order as a shard's whole page
+        // budget; probing per shard would cost a third of the build for a
+        // slightly better first guess.
+        final ScoreSampler.Steering steeringIn = steering;
+        final int calibSteps = steerCalibSteps;
         ExecutorService pool = Executors.newFixedThreadPool(effWorkers);
         List<Future<List<Row14>>> futures = new ArrayList<>();
         for (int s = 0; s < effWorkers; s++) {
@@ -226,7 +286,7 @@ public final class RealTrainDump {
                     }
                 }
                 return processShard(shard, shardId, reviewIn, basesIn, shardIn,
-                        nPages, runSeed, goodCut, badCut);
+                        nPages, runSeed, goodCut, badCut, steeringIn, calibSteps);
             }));
         }
         pool.shutdown();
@@ -247,8 +307,43 @@ public final class RealTrainDump {
         writeMapCsv(mapCsv, all);
         mergeShards(shardDir, effWorkers, out, cleanShards);
 
+        if (steering.enabled()) {
+            // Filter rather than map to Sample: a Sample holds its rendered page,
+            // so keeping the list alive to the end of the run would pin every
+            // raster the build had already written to disk.
+            List<Row14> steeredRows = new ArrayList<>();
+            for (Row14 r : all) {
+                if (r.steer != null) steeredRows.add(r);
+            }
+            ScoreCalibration.Histogram hist =
+                    ScoreCalibration.histogram(steeredRows, 10, steerLo, steerHi);
+            hist.print();
+            if (!hist.ok()) {
+                System.out.println("  WARNING: steered corpus failed histogram QA; the map CSV "
+                        + "has the per-row detail.");
+            }
+        }
+
         printSummary(all, imputed, out, featuresCsv, mapCsv,
                 (System.nanoTime() - t0) / 1e9);
+    }
+
+    /** Parses {@code visual,mask,bg} into the dimensions a run may steer by. */
+    static ScoreSampler.Dim[] parseDims(String spec) {
+        List<ScoreSampler.Dim> dims = new ArrayList<>();
+        for (String part : spec.split(",")) {
+            String s = part.trim().toLowerCase(Locale.ROOT);
+            if (s.isEmpty()) continue;
+            switch (s) {
+                case "visual" -> dims.add(ScoreSampler.Dim.VISUAL);
+                case "mask" -> dims.add(ScoreSampler.Dim.MASK);
+                case "bg" -> dims.add(ScoreSampler.Dim.BG);
+                default -> throw new IllegalArgumentException(
+                        "Unknown --steer-dims entry: " + part + " (want visual, mask, bg)");
+            }
+        }
+        if (dims.isEmpty()) throw new IllegalArgumentException("--steer-dims named no dimensions");
+        return dims.toArray(new ScoreSampler.Dim[0]);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -257,7 +352,9 @@ public final class RealTrainDump {
 
     private static List<Row14> processShard(List<IndexRow> shard, int shardId, Path review,
                                             Path bases, Path shardDir, int pages, long seed,
-                                            double goodAbove, double badBelow) throws IOException {
+                                            double goodAbove, double badBelow,
+                                            ScoreSampler.Steering steering, int calibSteps)
+            throws IOException {
         List<Row14> rows = new ArrayList<>();
         Path shardPdf = shardDir.resolve(String.format(Locale.ROOT, "shard-%02d.pdf", shardId));
         System.out.printf("  shard %02d: %d base pages -> %s%n", shardId, shard.size(), shardPdf);
@@ -302,7 +399,8 @@ public final class RealTrainDump {
                                 + "imputed in the text columns%n", ir.outPage());
                     }
 
-                    SyntheticCorpus.Page page = new SyntheticCorpus.Page(img, blocks);
+                    SyntheticCorpus.Page page = new SyntheticCorpus.Page(img, blocks,
+                            "review page " + ir.outPage());
                     long pageSeed = SyntheticCorpus.basePageSeed(seed, ir.outPage());
 
                     List<SyntheticCorpus.Variant> sheets = new ArrayList<>();
@@ -310,7 +408,8 @@ public final class RealTrainDump {
                     // asserting 1.0 -- an unmeasured score would not be a label.
                     sheets.add(new SyntheticCorpus.Variant("clean", "clean",
                             SyntheticCorpus.cleanScan(page, pageSeed), -1.0, 0));
-                    sheets.addAll(SyntheticCorpus.buildScannedPages(page, pageSeed, pages - 1));
+                    sheets.addAll(SyntheticCorpus.buildScannedPages(page, pageSeed, pages - 1,
+                            steering));
                     if (sheets.size() != pages) {
                         throw new IOException("expected " + pages + " variants for base page "
                                 + ir.outPage() + ", got " + sheets.size());
@@ -323,34 +422,50 @@ public final class RealTrainDump {
                         // its decoded form means the label, the features and the
                         // embedded image are the same bytes -- round-tripping here
                         // and re-encoding in embedPage() would apply JPEG twice.
-                        JpegCodec.FinalImage jpeg = JpegCodec.prepare(
-                                var.image(), SyntheticCorpus.LABEL_JPEG_QUALITY);
-                        BufferedImage finalImg = jpeg.decoded();
-
-                        ReadabilityOcr.Result ocr = ReadabilityOcr.measureWithWords(
-                                finalImg, blocks);
-                        double auditScore = ocr.getAuditScore();
-                        boolean auditOk = ReferenceAnchor.isUsable(blocks)
-                                && Double.isFinite(auditScore);
-
-                        // measure() then score() rather than compute(), so the
-                        // raw measurements survive for the map; the pair is
-                        // exactly what compute() does internally.
-                        int pw = finalImg.getWidth(), ph = finalImg.getHeight();
-                        int[] pg = ImageOps.toGrayscale(finalImg);
-                        List<TextBlock> usable = MrcReadiness.usable(ocr.getBlocks(), pw, ph);
-                        MrcReadiness.Raw mrcRaw = MrcReadiness.measure(pg, pw, ph, usable,
-                                com.mrcpdf.quality.model.SauvolaMask.compute(pg, pw, ph));
-                        MrcReadiness.Breakdown mrc =
-                                MrcReadiness.score(mrcRaw, usable, pw, ph);
+                        //
+                        // A steered variant arrives already measured, because the
+                        // sampler had to OCR it to steer on it; re-measuring here
+                        // would double the cost of the most expensive step in the
+                        // build, and could disagree with the steer value the corpus
+                        // was built around.
+                        JpegCodec.FinalImage jpeg;
+                        BufferedImage finalImg;
+                        ReadabilityOcr.Result ocr;
+                        MrcReadiness.Raw mrcRaw;
+                        MrcReadiness.Breakdown mrc;
+                        if (var.steered()) {
+                            ScoreSampler.Rendered r = var.rendered();
+                            jpeg = r.jpeg();
+                            finalImg = jpeg.decoded();
+                            ocr = r.ocr();
+                            mrcRaw = r.raw();
+                            mrc = r.mrc();
+                        } else {
+                            jpeg = JpegCodec.prepare(
+                                    var.image(), SyntheticCorpus.LABEL_JPEG_QUALITY);
+                            finalImg = jpeg.decoded();
+                            ocr = ReadabilityOcr.measureWithWords(finalImg, blocks);
+                            // measure() then score() rather than compute(), so the
+                            // raw measurements survive for the map; the pair is
+                            // exactly what compute() does internally.
+                            int pw = finalImg.getWidth(), ph = finalImg.getHeight();
+                            int[] pg = ImageOps.toGrayscale(finalImg);
+                            List<TextBlock> usable = MrcReadiness.usable(ocr.getBlocks(), pw, ph);
+                            mrcRaw = MrcReadiness.measure(pg, pw, ph, usable,
+                                    com.mrcpdf.quality.model.SauvolaMask.compute(pg, pw, ph));
+                            mrc = MrcReadiness.score(mrcRaw, usable, pw, ph);
+                        }
 
                         double score = mrc.score();
                         int cls = classOf(score, goodAbove, badBelow);
+                        double auditScore = ocr.getAuditScore();
+                        boolean auditOk = ReferenceAnchor.isUsable(blocks)
+                                && Double.isFinite(auditScore);
                         Feat14 f = features14(finalImg, ocr.getBlocks());
                         embedPage(shardDoc, jpeg.jpeg(), score, cls, ir.outPage(), var.tier());
                         rows.add(new Row14(ir.outPage(), v, var.name(), var.tier(), score, cls,
                                 SeverityScore.label(score), f.v(), f.textOk(),
-                                auditScore, auditOk, formatBreakdown(mrc, mrcRaw)));
+                                auditScore, auditOk, formatBreakdown(mrc, mrcRaw), var.steer()));
                     }
                     done++;
                     // Every base page, not every 10th: a shard holds only 8-9
@@ -551,7 +666,8 @@ public final class RealTrainDump {
     private static void writeMapCsv(Path path, List<Row14> rows) throws IOException {
         StringBuilder sb = new StringBuilder();
         sb.append("page,basePage,variant,variantName,tier,R_mrc,class,binaryLabel,textOk")
-                .append(",auditWordF1,auditOk,mrc_dims\n");
+                .append(",auditWordF1,auditOk,mrc_dims")
+                .append(",steerDim,steerTarget,steerValue,steerAttempts,onTarget\n");
         int page = 0;
         for (Row14 r : rows) {
             sb.append(++page).append(',').append(r.basePage).append(',').append(r.variant)
@@ -566,9 +682,31 @@ public final class RealTrainDump {
             // An empty field, not a 0: a page with too few reference words has no
             // readback at all, and 0.0 would read as "completely unreadable".
             sb.append(',').append(r.auditOk)
-                    .append(',').append(r.mrcBreakdown).append('\n');
+                    .append(',').append(r.mrcBreakdown);
+            appendSteer(sb, r.steer);
+            sb.append('\n');
         }
         Files.writeString(path, sb.toString());
+    }
+
+    /**
+     * The five steering columns.
+     *
+     * <p>Empty for the clean page and for every row of a {@code --no-steer} run,
+     * for the same reason the audit columns are: absent is not the same as zero,
+     * and a steer value of 0.0 is a real measurement (a page destroyed past
+     * recognition) that must not be confused with "not steered".
+     */
+    private static void appendSteer(StringBuilder sb, SyntheticCorpus.Steer s) {
+        if (s == null) {
+            sb.append(",,,,");
+            return;
+        }
+        sb.append(',').append(s.dim().slug())
+                .append(',').append(String.format(Locale.ROOT, "%.6f", s.target()))
+                .append(',').append(String.format(Locale.ROOT, "%.6f", s.value()))
+                .append(',').append(s.attempts())
+                .append(',').append(s.onTarget());
     }
 
     /**
@@ -579,16 +717,28 @@ public final class RealTrainDump {
      */
     private static final String SHARD_HEADER =
             "schema,variant-set,basePage,variant,variantName,tier,score,class,"
-                    + "binaryLabel,textOk,auditWordF1,auditOk,mrc_dims";
+                    + "binaryLabel,textOk,auditWordF1,auditOk,mrc_dims,"
+                    + "steerDim,steerTarget,steerValue,steerAttempts,onTarget";
 
-    /** Must match {@link #SHARD_HEADER} for a checkpoint to be reusable. */
-    private static final String SHARD_SCHEMA = "rmrc-1";
+    /**
+     * Must match {@link #SHARD_HEADER} for a checkpoint to be reusable.
+     *
+     * <p>Bumped to {@code rmrc-2} when the steering columns were added.  The rows
+     * are read positionally below, so an old checkpoint would be decoded with the
+     * new columns shifted one place left -- {@code steerDim} landing in the feature
+     * vector, and every label after it garbage.  Worse, it would not *look* wrong:
+     * the reader validates the row width, and the old rows have the old width, so
+     * a schema check that compared only the feature count would let them through.
+     * Hence an explicit tag that the reader compares before touching anything.
+     */
+    private static final String SHARD_SCHEMA = "rmrc-2";
 
     private static void writeShardRows(Path path, List<Row14> rows) throws IOException {
         StringBuilder sb = new StringBuilder();
-        // The audit columns and the sub-score breakdown are part of the
-        // checkpoint: a resumed run must not silently relabel pages using audit
-        // values it no longer has.
+        // The audit columns, the sub-score breakdown and the steering record are
+        // all part of the checkpoint: a resumed run must not silently relabel pages
+        // using audit values it no longer has, nor lose the evidence for whether a
+        // page met the target it was built to meet.
         sb.append(SHARD_HEADER);
         for (String n : featureNames()) sb.append(',').append(n);
         sb.append('\n');
@@ -605,6 +755,7 @@ public final class RealTrainDump {
                 sb.append(String.format(Locale.ROOT, "%.6f", r.auditScore));
             }
             sb.append(',').append(r.auditOk).append(',').append(r.mrcBreakdown);
+            appendSteer(sb, r.steer);
             for (double d : r.features) {
                 if (!Double.isFinite(d)) sb.append(",0.000000");
                 else sb.append(String.format(Locale.ROOT, ",%.6f", d));
@@ -640,9 +791,36 @@ public final class RealTrainDump {
                     Double.parseDouble(c[6]), classes.indexOf(c[7]), Integer.parseInt(c[8]),
                     v, Boolean.parseBoolean(c[9]),
                     audit.isEmpty() ? Double.NaN : Double.parseDouble(audit),
-                    Boolean.parseBoolean(c[11]), c[12]));
+                    Boolean.parseBoolean(c[11]), c[12], readSteer(c)));
         }
         return rows;
+    }
+
+    /**
+     * Rebuilds the steering record from the checkpoint's trailing columns.
+     *
+     * <p>All five are empty for a clean page and for a {@code --no-steer} run, and
+     * the whole group has to be present together: a half-populated record would
+     * mean a corrupted checkpoint, and reading the target as 0.0 would put the
+     * page in the histogram as a page that missed a target of zero.
+     */
+    private static SyntheticCorpus.Steer readSteer(String[] c) {
+        String dim = c[13];
+        boolean empty = c[13].isEmpty() && c[14].isEmpty() && c[15].isEmpty()
+                && c[16].isEmpty() && c[17].isEmpty();
+        if (empty) return null;
+        if (dim.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "checkpoint has steering values but no steerDim: " + String.join(",", c[13], c[14], c[15]));
+        }
+        ScoreSampler.Dim d = switch (dim) {
+            case "visual" -> ScoreSampler.Dim.VISUAL;
+            case "mask" -> ScoreSampler.Dim.MASK;
+            case "bg" -> ScoreSampler.Dim.BG;
+            default -> throw new IllegalArgumentException("Unknown steerDim in checkpoint: " + dim);
+        };
+        return new SyntheticCorpus.Steer(d, Double.parseDouble(c[14]), Double.parseDouble(c[15]),
+                Integer.parseInt(c[16]), Boolean.parseBoolean(c[17]));
     }
 
     /**

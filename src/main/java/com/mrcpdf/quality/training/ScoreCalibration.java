@@ -316,7 +316,7 @@ public final class ScoreCalibration {
      * histogram from the steer value, and neither is asked to stand in for the
      * other.
      */
-    public static Histogram histogram(List<ScoreSampler.Sample> samples, int bins,
+    public static Histogram histogram(List<? extends ScoreSampler.SteeringRow> rows, int bins,
                                       double lo, double hi) {
         int n = Math.max(1, bins);
         int[] steerCounts = new int[n];
@@ -324,23 +324,21 @@ public final class ScoreCalibration {
         int misses = 0;
         double worst = 0.0;
 
-        for (ScoreSampler.Sample s : samples) {
+        for (ScoreSampler.SteeringRow s : rows) {
             int b = bin(s.steer(), lo, hi, n);
             if (b >= 0) steerCounts[b]++;
-            switch (s.rendered().mrc().tier()) {
-                case "good" -> classCounts[0]++;
-                case "middle" -> classCounts[1]++;
-                default -> classCounts[2]++;
-            }
+            int c = s.cls();
+            classCounts[c >= 0 && c < 3 ? c : 2]++;
             if (!s.onTarget()) misses++;
-            worst = Math.max(worst, s.error());
+            worst = Math.max(worst, Math.abs(s.steer() - s.target()));
         }
+        int samples = rows.size();
 
         List<String> problems = new ArrayList<>();
-        if (samples.isEmpty()) {
+        if (samples == 0) {
             problems.add("no steered samples at all");
         } else {
-            int maxEmpty = (int) Math.floor(MAX_EMPTY_FRACTION * samples.size());
+            int maxEmpty = (int) Math.floor(MAX_EMPTY_FRACTION * samples);
             for (int i = 0; i < n; i++) {
                 // Strictly below the threshold, and zero always: a bin holding
                 // exactly MAX_EMPTY_FRACTION of the rows is a populated bin, and
@@ -360,11 +358,11 @@ public final class ScoreCalibration {
                         worst, MAX_TARGET_ERROR));
             }
             int total = classCounts[0] + classCounts[1] + classCounts[2];
-            if (total != samples.size()) {
+            if (total != samples) {
                 problems.add("class mix does not account for every row");
             }
         }
-        return new Histogram(samples.size(), n, lo, hi, steerCounts, classCounts,
+        return new Histogram(samples, n, lo, hi, steerCounts, classCounts,
                 misses, worst, problems);
     }
 

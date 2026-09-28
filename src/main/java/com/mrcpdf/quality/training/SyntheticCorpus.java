@@ -25,6 +25,7 @@ import org.apache.pdfbox.rendering.PDFRenderer;
 
 import com.mrcpdf.model.TextBlock;
 import com.mrcpdf.quality.model.FeatureExtractor;
+import com.mrcpdf.quality.model.MrcReadiness;
 import com.mrcpdf.quality.model.QualityModel;
 import com.mrcpdf.util.ImageOps;
 
@@ -133,6 +134,23 @@ public final class SyntheticCorpus {
     /** Full form: pinned degraded-page count plus optional preview PDF. */
     public static void generate(Path out, String variant, int docCount, int degradedPerDoc,
                                 long seed, Path previewPdf, PrintStream progress) throws IOException {
+        generate(out, variant, docCount, degradedPerDoc, seed, previewPdf, progress, null);
+    }
+
+    /**
+     * Full form, plus steering.
+     *
+     * <p>The default is unsteered ({@code steer == null}), and that is deliberate
+     * rather than an oversight: this method is what {@code TrainModel} calls to
+     * build the corpus behind the runtime {@code quality-model.json}, whose labels
+     * are measured 1-WER rather than {@code R_mrc}.  Steering those draws would
+     * change the runtime gate's training data as a side effect of a change aimed
+     * at the R_mrc research corpus, and the mid-band problem being fixed here is a
+     * property of the R_mrc label, not of the 1-WER one.
+     */
+    public static void generate(Path out, String variant, int docCount, int degradedPerDoc,
+                                long seed, Path previewPdf, PrintStream progress,
+                                ScoreSampler.Steering steer) throws IOException {
         List<String> featureNames = new ArrayList<>(List.of(FeatureExtractor.IMAGE_FEATURE_NAMES));
         if (QualityModel.VARIANT_TEXT_LAYER.equals(variant)) {
             featureNames.addAll(List.of(FeatureExtractor.TEXT_FEATURE_NAMES));
@@ -149,7 +167,7 @@ public final class SyntheticCorpus {
                 int[] gray = ImageOps.toGrayscale(page.image);
                 rows.add(featureRow(gray, w, h, page.blocks, variant, "doc" + d, 0, dpi));
 
-                List<Variant> scans = buildScannedPages(page, rngSeed, degradedPerDoc);
+                List<Variant> scans = buildScannedPages(page, rngSeed, degradedPerDoc, steer);
                 for (Variant v : scans) {
                     int[] g = ImageOps.toGrayscale(v.image());
                     rows.add(featureRow(g, w, h, page.blocks, variant, "doc" + d, v.label(), dpi));
@@ -176,8 +194,48 @@ public final class SyntheticCorpus {
         }
     }
 
-    record Variant(String name, String tier, BufferedImage image, double score, int label) {
+    /**
+     * What the sampler was asked for and what it got, carried alongside the page
+     * so a corpus row can always be traced back to the intent that produced it.
+     *
+     * @param value     the steering value actually measured, which is not the
+     *                  target: the loop reports a miss rather than pretending
+     * @param onTarget  whether the page converged; false rows are the evidence
+     *                  for "this dimension cannot reach that far", which is
+     *                  otherwise invisible in the score distribution
+     */
+    record Steer(ScoreSampler.Dim dim, double target, double value, int attempts,
+                 boolean onTarget) {
     }
+
+    /**
+     * @param rendered the full measurement, non-null exactly when {@code steer} is.
+     *                The builder reuses it instead of measuring again, so the
+     *                corpus pays one OCR pass per page rather than one per page
+     *                plus one for the label
+     */
+    record Variant(String name, String tier, BufferedImage image, double score, int label,
+                   Steer steer, ScoreSampler.Rendered rendered) {
+
+        Variant(String name, String tier, BufferedImage image, double score, int label) {
+            this(name, tier, image, score, label, null, null);
+        }
+
+        boolean steered() {
+            return rendered != null;
+        }
+    }
+
+    /**
+     * Distinct from the sampler's: this is the per-variant draw seed, so a
+     * steered page's target and dimension are fixed by the page's position in the
+     * corpus and do not depend on how many workers ran or in what order pages
+     * were probed.
+     */
+    private static final long STEER_SALT = 0x7E3D5C9A1B2F4069L;
+
+    /** Separate from {@link #STEER_SALT} so a probe cannot perturb a page's draw. */
+    private static final long CALIB_SALT = 0x0C41B2E5F7A9318DL;
 
     /**
      * Seed for one base page, shared by every variant drawn from that page.
@@ -219,19 +277,101 @@ public final class SyntheticCorpus {
      * readability measurement of the rendered page against the known text.
      */
     static List<Variant> buildScannedPages(Page page, long docSeed, int count) throws IOException {
-        BufferedImage base = page.image();
+        return buildScannedPages(page, docSeed, count, null);
+    }
+
+    /**
+     * Builds {@code count} variants, steered onto a target {@code R_mrc} when
+     * {@code steer} is enabled.
+     *
+     * <p>With steering off this is the pre-sampling behaviour, byte for byte,
+     * which is the only way the A/B comparison means anything: the unsteered 500-row
+     * corpus is the sole labeled baseline, and a baseline that drifts under a
+     * refactor measures the refactor.
+     *
+     * <p>The steered path labels from the sampler's own OCR result rather than
+     * re-measuring, so a page costs one OCR pass per attempt instead of one per
+     * attempt plus one for the label.  It also measures on the JPEG-decoded
+     * pixels, which is where the delivered page's score comes from but is not
+     * where the pre-sampling path measured it.  That difference is real and is
+     * noted in the docs; it is the price of having the steering value, the label
+     * and the features all describe the same bytes.
+     */
+    static List<Variant> buildScannedPages(Page page, long docSeed, int count,
+                                           ScoreSampler.Steering steer) throws IOException {
         List<Variant> out = new ArrayList<>();
         for (int v = 0; v < count; v++) {
             long pageSeed = docSeed ^ (v * 0xBF58476D1CE4E5B9L);
             java.util.Random rng = new java.util.Random(pageSeed ^ 0x51a7);
-            ScannerTier tier = drawTier(rng);
-            ScannerProfile profile = tier.draw(rng);
-            BufferedImage scanned = ScannerSimulator.apply(base, profile, rng);
-            double score = ReadabilityOcr.measure(scanned, page.blocks());
-            int label = SeverityScore.label(score);
-            out.add(new Variant(variantName(tier, profile), tier.slug(), scanned, score, label));
+            // The sampler's own stream, deliberately not `rng`: the unsteered
+            // branch below draws from `rng` exactly as it always has, so a run
+            // with --no-steer stays bit-reproducible no matter what the steered
+            // path does with its own draws.
+            java.util.Random steerRng = new java.util.Random(pageSeed ^ STEER_SALT);
+
+            if (steer == null || !steer.enabled()) {
+                ScannerTier tier = drawTier(rng);
+                ScannerProfile profile = tier.draw(rng);
+                BufferedImage scanned = ScannerSimulator.apply(page.image(), profile, rng);
+                double score = ReadabilityOcr.measure(scanned, page.blocks());
+                out.add(new Variant(variantName(tier, profile), tier.slug(), scanned, score,
+                        SeverityScore.label(score)));
+                continue;
+            }
+
+            ScoreSampler.Render render = (profile, r) ->
+                    renderSteered(page, profile, r);
+            ScoreCalibration.Calibration cal = steer.calibration();
+            if (cal == null) {
+                cal = steer.calibrate(render, new java.util.Random(pageSeed ^ CALIB_SALT),
+                        ScoreCalibration.DEFAULT_STEPS, page.label());
+            }
+            double target = steer.drawTarget(steerRng);
+            ScoreSampler.Dim dim = steer.drawDim(steerRng);
+            ScoreSampler.Sample s = steer.sampler().sample(render, steerRng, target, dim, cal);
+
+            ScoreSampler.Rendered r = s.rendered();
+            double score = r.ocr().getAuditScore();
+            Steer info = new Steer(s.aimed(), s.target(), s.steer(), s.attempts(), s.onTarget());
+            out.add(new Variant(steeredName(s), s.aimed().slug(), r.image(), score,
+                    SeverityScore.label(score), info, r));
         }
         return out;
+    }
+
+    /**
+     * One steering attempt: degrade, encode, OCR, measure.
+     *
+     * <p>Measurement happens on {@link JpegCodec.FinalImage#decoded()} rather than
+     * on the raster, so the steering value describes the pixels the page will
+     * actually present after delivery compression.
+     */
+    private static ScoreSampler.Rendered renderSteered(SyntheticCorpus.Page page,
+                                                        ScannerProfile profile,
+                                                        java.util.Random rng) throws IOException {
+        BufferedImage scanned = ScannerSimulator.apply(page.image(), profile, rng);
+        JpegCodec.FinalImage jpeg = JpegCodec.prepare(scanned, LABEL_JPEG_QUALITY);
+        BufferedImage finalImg = jpeg.decoded();
+        int w = finalImg.getWidth(), h = finalImg.getHeight();
+        int[] gray = ImageOps.toGrayscale(finalImg);
+        ReadabilityOcr.Result ocr = ReadabilityOcr.measureWithWords(finalImg, page.blocks());
+        List<TextBlock> usable = MrcReadiness.usable(ocr.getBlocks(), w, h);
+        MrcReadiness.Raw raw = MrcReadiness.measure(gray, w, h, usable,
+                com.mrcpdf.quality.model.SauvolaMask.compute(gray, w, h));
+        return new ScoreSampler.Rendered(scanned, jpeg, ocr, raw, MrcReadiness.score(raw, usable, w, h));
+    }
+
+    /**
+     * Variant name for a steered page: what was aimed, where it landed, and
+     * whether it got there.
+     *
+     * <p>The measured value is in the name rather than the target because the
+     * target is only the intent -- two pages with identical targets can differ by
+     * half a point, and a name that asserts the intent would make that invisible.
+     */
+    private static String steeredName(ScoreSampler.Sample s) {
+        return String.format(java.util.Locale.ROOT, "%s->%.2f@%dx%s",
+                s.aimed().slug(), s.steer(), s.attempts(), s.onTarget() ? "" : "miss");
     }
 
     /** Weighted tier draw so the corpus spans all readability levels. */
@@ -357,7 +497,18 @@ public final class SyntheticCorpus {
     // chain so feature distributions match pipeline inputs.
     // ──────────────────────────────────────────────────────────────────────
 
-    record Page(BufferedImage image, List<TextBlock> blocks) {
+    /**
+     * One base page to draw variants from.
+     *
+     * @param label a human-readable identifier, used only to name the calibration
+     *              reference in reports.  Steering probes the response curves
+     *              against whichever page reaches it first, and a report that says
+     *              "unknown" cannot be reproduced or sanity-checked.
+     */
+    record Page(BufferedImage image, List<TextBlock> blocks, String label) {
+        Page(BufferedImage image, List<TextBlock> blocks) {
+            this(image, blocks, "base page");
+        }
     }
 
     private record WordBox(String word, Rectangle box) {
