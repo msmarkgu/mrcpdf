@@ -54,15 +54,15 @@ public final class TierCheckDump {
                     long ps = seed ^ (i * 0xBF58476D1CE4E5B9L + ti * 0x51A7ED0000000007L);
                     Random rng = new Random(ps ^ 0x51a7);
                     ScannerProfile p = t.draw(rng);
-                    double score = SeverityScore.score(p);
-                    int label = SeverityScore.label(score);
                     java.awt.image.BufferedImage img = ScannerSimulator.apply(base.image(), p, rng);
+                    double score = ReadabilityOcr.measure(img, base.blocks());
+                    int label = SeverityScore.label(score);
                     page++;
                     // copy of SynthSrcDump.embedPage
                     PDPage pdPage = new PDPage(new PDRectangle(PAGE_W, PAGE_H));
                     preview.addPage(pdPage);
                     try (PDPageContentStream cs = new PDPageContentStream(preview, pdPage)) {
-                        JpegCodec.embed(preview, cs, img, SyntheticCorpus.jpegQualityForScore(score), 0, 0, PAGE_W, PAGE_H);
+                        JpegCodec.embed(preview, cs, img, SyntheticCorpus.LABEL_JPEG_QUALITY, 0, 0, PAGE_W, PAGE_H);
                     }
                     csv.append(page).append(",tiercheck,var").append(page)
                             .append(',').append(label).append(',')

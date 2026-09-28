@@ -73,21 +73,20 @@ class QualityModelTest {
     void coefficientSignsMatchPhysicalMechanism() {
         QualityModel model = QualityModel.loadDefault();
         Assumptions.assumeTrue(model != null, "committed artifact absent — run gradle trainQualityModel");
-        // Degraded pages have wider / softer edges (downscale, blur, JPEG).
-        assertTrue(model.featureWeight("edgeWidthCV") > 0,
-                "edgeWidthCV weight should be positive, got " + model.featureWeight("edgeWidthCV"));
-        // Degraded pages lose high-frequency energy.
+        // Degraded (OCR-failing) pages lose high-frequency energy.
         assertTrue(model.featureWeight("hiFreqEnergy") < 0,
                 "hiFreqEnergy weight should be negative, got " + model.featureWeight("hiFreqEnergy"));
         // A strong bimodal (clean) split → lower degraded probability.
         assertTrue(model.featureWeight("otsuSeparability") < 0,
                 "otsuSeparability weight should be negative, got " + model.featureWeight("otsuSeparability"));
-        // High signal-to-noise → lower degraded probability.
-        assertTrue(model.featureWeight("snr") < 0,
-                "snr weight should be negative, got " + model.featureWeight("snr"));
-        // blurSigmaPx's coefficient is collinear with the above and can flip
-        // sign between retrains while its mild/severe ordering still gates
-        // correctly, so it is not asserted here.
+        // Ink spread (blur/bold/streaks) is a hallmark of OCR-failing pages.
+        assertTrue(model.featureWeight("inkCoverage") > 0,
+                "inkCoverage weight should be positive, got " + model.featureWeight("inkCoverage"));
+        // edgeWidthCV and snr are NOT asserted by sign: their univariate rank
+        // correlations with the OCR-measured score are correct (see
+        // checkSyntheticCorpus), but in the multivariate logistic fit they act
+        // as collinear suppressors and flip, exactly like blurSigmaPx. Their
+        // per-tier ordering still gates correctly.
     }
 
     @Test
@@ -102,7 +101,7 @@ class QualityModelTest {
         // update these constants from the printed values.
         System.out.println("GOLDEN_CLEAN prediction: " + pClean);
         System.out.println("GOLDEN_DEGRADED prediction: " + pDegraded);
-        assertEquals(0.002775149376186915, pClean, 1e-12, "clean-row prediction changed");
-        assertEquals(0.9999542984745883, pDegraded, 1e-12, "degraded-row prediction changed");
+        assertEquals(5.271871468898777E-6, pClean, 1e-12, "clean-row prediction changed");
+        assertEquals(0.9992585432742552, pDegraded, 1e-12, "degraded-row prediction changed");
     }
 }

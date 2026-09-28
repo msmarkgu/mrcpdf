@@ -5,14 +5,15 @@ package com.mrcpdf.quality.training;
  * parameter range in the synthetic quality space.  A degraded corpus page
  * draws a {@link ScannerProfile} from one tier: the tier's archetype center
  * pins the target degradation severity, individual effects get jitter and a
- * "drop" chance so same-tier pages spread realistically (and the label
- * boundary — score around {@link SeverityScore#LABEL_CUTOFF} — is crossed by
- * some pages of the middle tiers rather than a single hard step).
+ * "drop" chance so same-tier pages spread realistically.
  *
- * <p>The inverse mappings here round-trip through {@link SeverityScore}, so
- * {@code SeverityScore.score(draw(rng))} lands near the tier's {@code center}
- * on average.  Scoring is validated empirically by the corpus verification
- * tool; tweak the draw weights / jitter if a tier drifts.
+ * <p>The draw maps tier severities back to profile parameters (the inverse of
+ * {@link SeverityScore#severity}), so the *intended* degradation lands near
+ * the tier's {@code center}.  Actual labels are the measured readability
+ * ({@link ReadabilityOcr}, 1 - word error rate) and the label boundary around
+ * {@link SeverityScore#LABEL_CUTOFF} is crossed by the middle tiers.  Scoring
+ * is validated empirically by the corpus verification tool; tweak the draw
+ * weights / jitter if a tier drifts.
  */
 public enum ScannerTier {
 

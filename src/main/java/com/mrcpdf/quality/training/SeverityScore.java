@@ -1,28 +1,28 @@
 package com.mrcpdf.quality.training;
 
 /**
- * Maps a {@link ScannerProfile} to the "synthetic quality" score described in
- * {@code notes/simulate-realworld-scans.md}.  Each effect's severity is
- * normalized to [0,1] against its realistic maximum and combined by perceptual
- * weights: foreground-impacting effects (blur, resolution loss, ink spread,
- * contrast) dominate over background-only corruption (noise, JPEG, shading,
- * paper, bleed, streaks, geometry), so crisp text on a dirty background keeps a
- * high score — the corpus's automatic hard negative.
+ * Normalizes a {@link ScannerProfile} into per-effect severities in [0,1] —
+ * the generator-side degradation "intent" used by {@link ScannerTier#draw} to
+ * aim a tier at its archetype center and by {@link SyntheticCorpus#variantName}
+ * for human-readable variant names.
  *
- * <p>Score = {@code 1 - Σ w·sev}; label = {@code score < LABEL_CUTOFF}.  The
- * score is a normalized quality in [0,1] (1 = pristine, 0 = unreadable).  The
- * {@link ScannerTier} draw uses the inverse of these formulas so the score
- * distribution of each tier lands near its archetype center.
+ * <p>The corpus's actual quality label is NOT derived from these severities
+ * anymore: each page is <em>measured</em> by OCR against its known text
+ * ({@link ReadabilityOcr}, score = 1 - word error rate), and
+ * {@code label = score < LABEL_CUTOFF}.  The composite {@code severity()} sum
+ * was retired because hand-weighted parameters do not track what a reader
+ * actually sees (see notes/ocr-readable-score.md).
  */
 public final class SeverityScore {
 
     /**
-     * Readability cutoff: pages below this synthetic quality skip MRC.  Tuned
-     * against the tier draw distribution so the label boundary falls inside the
-     * OLD_PHOTOCOPY tier and ≈45% of the degraded corpus lands label-1 (the
-     * 10-20 events/feature target for the 11-feature gate model).
+     * Readability cutoff: pages whose OCR-measured readability score falls
+     * below this skip MRC.  The threshold has a plain reading — label-1 means
+     * OCR recovers under 60% of the printed words — and is chosen so the
+     * minority class stays well above the 10-20 events/feature floor for the
+     * 11-feature gate model (see notes/ocr-readable-score.md).
      */
-    public static final double LABEL_CUTOFF = 0.58;
+    public static final double LABEL_CUTOFF = 0.60;
 
     // Per-effect realistic maxima (amounts that make a page clearly unreadable).
     static final double MAX_BLUR = 2.8;
@@ -91,7 +91,7 @@ public final class SeverityScore {
                 illum, paper, bleed, streaks, skew, curl);
     }
 
-    /** Weighted degradation severity in [0,1]. */
+    /** Weighted degradation severity in [0,1]; retired as a quality label (see class doc). */
     public static double severity(ScannerProfile p) {
         Severities s = severities(p);
         return W_BLUR * s.blur() + W_MOTION * s.motion() + W_SCALE * s.scale()
@@ -101,19 +101,9 @@ public final class SeverityScore {
                 + W_CURL * s.curl();
     }
 
-    /** Synthetic quality score in [0,1]; 1.0 = pristine, 0.0 = unreadable. */
-    public static double score(ScannerProfile p) {
-        double s = severity(p);
-        return clamp(1 - s);
-    }
-
-    /** Binary gate prior: 1 (skip MRC) when the synthetic quality falls below the cutoff. */
+    /** Binary gate prior: 1 (skip MRC) when the measured readability falls below the cutoff. */
     public static int label(double score) {
         return score < LABEL_CUTOFF ? 1 : 0;
-    }
-
-    public static int label(ScannerProfile p) {
-        return label(score(p));
     }
 
     private static double clamp(double v) {

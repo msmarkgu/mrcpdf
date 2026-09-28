@@ -42,17 +42,22 @@ import com.mrcpdf.util.ImageOps;
  * <p>Each document renders its own page (deterministic per seed) with a
  * realistic layout (title, headings, indented paragraphs).  A clean row plus
  * {@code degradedPerDoc} degraded rows are derived per document: every degraded
- * page draws a {@link ScannerProfile} from one {@link ScannerTier} archetype,
- * runs it through {@link ScannerSimulator}, and carries a synthetic quality
- * score in [0,1] computed from the degradation parameters plus a binary label
- * (score below {@link SeverityScore#LABEL_CUTOFF} ⇒ 1, MRC must not touch).
+ * page draws a {@link ScannerProfile} from one {@link ScannerTier} archetype
+ * and runs it through {@link ScannerSimulator}, then its quality score is
+ * <em>measured</em> by OCR against the known printed text
+ * ({@link ReadabilityOcr}: score = 1 - word error rate, 1 = pristine, 0 =
+ * unreadable) with a binary label (score below {@link SeverityScore#LABEL_CUTOFF}
+ * ⇒ 1, MRC must not touch).  Effect severities from {@link SeverityScore} only
+ * drive the tier draw and variant naming — not the label.
  * Every variant of one source page shares its {@code doc} id so the train/val
  * split stays document-aware.
  *
- * <p>All pages of a document use the same RNG seed stream, so the corpus is
- * byte-reproducible for a given {@code seed}.  The synthetic score is used for
- * labeling; the final gate labels still come from human reading of the MRC
- * output via the annotation workflow in docs/synthetic-labels.md.
+ * <p>All pages of a document use the same RNG seed stream.  Rendering and
+ * degradation are byte-reproducible for a given {@code seed}; the measured
+ * OCR score and label are deterministic for a given Tesseract build + {@code eng}
+ * language data (pinned, see notes/ocr-readable-score.md).  The scored CVS /
+ * JSON are the replay artifacts.  The final gate labels still come from human
+ * reading of the MRC output via the annotation workflow in docs/synthetic-labels.md.
  */
 public final class SyntheticCorpus {
 
@@ -63,17 +68,32 @@ public final class SyntheticCorpus {
     static final float SOURCE_JPEG_QUALITY = 0.95f;
 
     /**
-     * Per-page scan compression.  Clean pages are scanned near-lossless while
-     * degraded photocopies carry heavy JPEG blockiness; the median3 residual
-     * (noiseSigma feature) only reads as "sensor noise" on degraded pages when
-     * the compressed stream is actually noisy there, otherwise the clean
-     * pages' anti-aliased text halos dominate the residual and flip the
-     * noise budget backwards.  The quality therefore tracks the synthetic
-     * quality score: 1.0 -> ~0.95, 0.0 -> ~0.45.
+     * Per-page scan compression quality, held constant across every variant.
+     *
+     * <p>This used to track the measured readability score
+     * ({@code min(0.95, 0.45 + 0.50*score)}), which conflated the artifact with
+     * the label.  Two consequences made that untenable:
+     * <ul>
+     *   <li>The label was measured on the <em>pre-embedding</em> raster while the
+     *       features were read from the <em>post-JPEG</em> one, so no page's
+     *       features described the pixels its label was computed from.  A label
+     *       of 0.5 came from a page embedded at q=0.70 and a label of 0.8 from a
+     *       page embedded at q=0.85, so the two tiers differed in blockiness as
+     *       well as in legibility.</li>
+     *   <li>It handed the corpus an artifact-based shortcut: a model could
+     *       separate the tiers by JPEG block strength alone without reading a
+     *       single glyph, and the scores were not comparable across pages.</li>
+     * </ul>
+     *
+     * <p>Degradation must instead come from the degradation pipeline alone.
+     * {@code 0.92} is near-lossless for text at 300 DPI: it costs a little
+     * sharpness, which is a realistic scanner property common to all pages, and
+     * keeps blockiness small enough that it cannot stand in for legibility.
+     * Labels are now computed on the decoded JPEG stream
+     * ({@link JpegCodec.FinalImage}), so features and label describe the same
+     * bytes the page ships.
      */
-    static float jpegQualityForScore(double score) {
-        return (float) Math.min(0.95, 0.45 + 0.50 * score);
-    }
+    static final float LABEL_JPEG_QUALITY = 0.92f;
 
     /** Degraded pages per document when the caller doesn't specify a count. */
     public static final int DEFAULT_DEGRADED_PER_DOC = 19;
@@ -160,6 +180,21 @@ public final class SyntheticCorpus {
     }
 
     /**
+     * Seed for one base page, shared by every variant drawn from that page.
+     *
+     * <p>Defined here so the corpus builder and {@link MrcCalibration} cannot
+     * drift apart: if the two pick different seeds, calibration measures a
+     * different set of clean images than the one it is calibrating for, and the
+     * measured percentiles describe a corpus that is never labelled.
+     *
+     * @param corpusSeed the corpus-wide seed
+     * @param basePage   index of the base page within the review PDF
+     */
+    static long basePageSeed(long corpusSeed, int basePage) {
+        return corpusSeed + basePage * 1000L;
+    }
+
+    /**
      * Baseline-scan of a pristine page: the "clean" corpus sheet is not the
      * mathematically perfect raster but a fresh, light scan of it (small
      * optics blur + a whisper of sensor grain, near-lossless capture).  This
@@ -180,9 +215,10 @@ public final class SyntheticCorpus {
     /**
      * Builds {@code count} degraded variants of one page, each a deterministic
      * random draw of a {@link ScannerTier} parameter range run through the
-     * {@link ScannerSimulator}.  Score and binary label come from the profile.
+     * {@link ScannerSimulator}.  Score and binary label come from the OCR
+     * readability measurement of the rendered page against the known text.
      */
-    static List<Variant> buildScannedPages(Page page, long docSeed, int count) {
+    static List<Variant> buildScannedPages(Page page, long docSeed, int count) throws IOException {
         BufferedImage base = page.image();
         List<Variant> out = new ArrayList<>();
         for (int v = 0; v < count; v++) {
@@ -190,9 +226,9 @@ public final class SyntheticCorpus {
             java.util.Random rng = new java.util.Random(pageSeed ^ 0x51a7);
             ScannerTier tier = drawTier(rng);
             ScannerProfile profile = tier.draw(rng);
-            double score = SeverityScore.score(profile);
-            int label = SeverityScore.label(score);
             BufferedImage scanned = ScannerSimulator.apply(base, profile, rng);
+            double score = ReadabilityOcr.measure(scanned, page.blocks());
+            int label = SeverityScore.label(score);
             out.add(new Variant(variantName(tier, profile), tier.slug(), scanned, score, label));
         }
         return out;

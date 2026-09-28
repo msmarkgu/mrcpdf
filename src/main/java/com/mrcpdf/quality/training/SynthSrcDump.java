@@ -110,7 +110,7 @@ private static final float PAGE_W = 612;
         PDPage pdPage = new PDPage(new PDRectangle(PAGE_W, PAGE_H));
         doc.addPage(pdPage);
         try (PDPageContentStream cs = new PDPageContentStream(doc, pdPage)) {
-            JpegCodec.embed(doc, cs, image, SyntheticCorpus.jpegQualityForScore(score), 0, 0, PAGE_W, PAGE_H);
+            JpegCodec.embed(doc, cs, image, SyntheticCorpus.LABEL_JPEG_QUALITY, 0, 0, PAGE_W, PAGE_H);
             drawScoreOverlay(cs, score);
         }
     }

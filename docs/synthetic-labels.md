@@ -47,19 +47,24 @@ that tier's parameter range, and runs it through a
 contrast loss, sensor noise (Gaussian + salt/pepper + fixed pattern), JPEG,
 uneven illumination, paper texture, bleed-through, streaks/dust, skew and curl.
 
-`SeverityScore` maps the profile to a normalized "synthetic quality" score in
-`[0,1]` (1.0 = pristine, 0.0 = unreadable) and a binary label
-(`score < SeverityScore.LABEL_CUTOFF`, currently 0.58) where label 1
-means unambiguously degraded — MRC must not touch it. Foreground-damaging
-effects (blur, resolution loss, ink spread, contrast) dominate the score, so
-crisp text on a dirty background stays label 0 as a hard negative. The clean
-sheet is itself run through a light scan chain (`cleanScan`) so its features
-live on the same scale as the degraded sheets.
+Each degraded sheet's **readability score is measured, not assumed**: the
+degraded raster is OCR'd and compared word-by-word to the exact text the page
+generator printed (`ReadabilityOcr`, `notes/ocr-readable-score.md`). The score
+is `1 - word error rate` in `[0,1]` (1.0 = every word readable, 0.0 =
+unreadable) and the binary label is `score < SeverityScore.LABEL_CUTOFF`
+(currently 0.60): label 1 means unambiguously degraded — MRC must not touch it.
+The clean sheet is itself run through a light scan chain (`cleanScan`) so its
+features live on the same scale as the degraded sheets; clean sheets hold the
+score constant at 1.0.
 
-This synthetic score is a **readability prior**, not the final label. The
-workflow re-derives the final label from a human reading of the MRC output
-(steps 4-6), because what matters is "readable after MRC", not the input
-classification.
+This measured score captures what actually renders — a downscaled, skewed or
+shadowed page fails OCR and scores low, while crisp text on a dirty background
+keeps score 0 as a hard negative. The per-effect severities (`SeverityScore`)
+only *drive* the tier draw and variant naming; they no longer label.
+
+It is still a **readability prior**, not the final label. The workflow
+re-derives the final label from a human reading of the MRC output (steps 4-6),
+because what matters is "readable after MRC", not the input classification.
 
 | Tier                | Slug   | Archetype                      |
 |---------------------|--------|--------------------------------|
@@ -82,12 +87,17 @@ Outputs:
 
 - `build/synthetic-src.pdf` — 500 pages (25 docs × [clean + 19 degraded]).
   Every page carries a vector banner in its blank top margin reading
-  `score = X.XXX` (the normalized synthetic quality).
+  `score = X.XXX` (the measured OCR readability).
 - `build/synthetic-variant-map.csv` — `page,doc,variant,label,tier,score`, one
   row per page, where `variant` is a readable descriptor such as
   `fx40+blur1.9+jpeg57` and `score` is `0.000`-`1.000`
 
 Page *i* of the PDF is row *i* of the map, for every downstream step.
+
+> Requires `tesseract` with the `eng` language pack (the score is measured by
+> OCR against the known page text). The corpus is reproducible for a pinned
+> Tesseract version; `dumpSyntheticSrc` fails fast with a hint if it is
+> missing.
 
 ## Step 2 — Verify the corpus (before labeling)
 
@@ -99,10 +109,9 @@ Runs `ScoreCorrCheck` over the generated PDF and reports:
 
 - the label mix and the 10-20 events-per-feature rule for the minority class
   (an 11-feature logistic model needs enough degraded rows to fit stably);
-- mean synthetic score per tier (tiers should be ordered and near their
-  archetype centers);
-- the Spearman correlation of the synthetic score with each image feature and
-  its expected sign;
+- mean measured readability score per tier (tiers should be ordered);
+- the Spearman correlation of the measured readability score with each image
+  feature and its expected sign;
 - per-tier feature means and overall label ordering.
 
 Fix the tier draw/scoring before labeling if any sign is flagged.
@@ -235,10 +244,10 @@ Commit the regenerated `src/main/resources/quality-model.json` (and the corpus
 CSVs/scripts if you made them reproducible) together with the code changes.
 
 > `./gradlew trainQualityModel` is the shortcut for the synthetic-prior path
-> only: it generates the corpus (`--generate`) and trains from
-> `SeverityScore`-derived labels, **not** human labels. Because those labels
-> come straight from the simulator, that path separates cleanly (AUC ~1) and is
-> a sanity/CI artifact, not a substitute for the human-labeled steps above.
+> only: it generates the corpus (`--generate`) and trains from OCR-measured
+> readability labels, **not** human labels. Because those labels still come
+> straight from the simulator, that path separates cleanly (AUC ~1) and is a
+> sanity/CI artifact, not a substitute for the human-labeled steps above.
 
 ## Current state of the pipeline
 
