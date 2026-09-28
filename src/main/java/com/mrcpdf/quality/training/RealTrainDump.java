@@ -1,0 +1,818 @@
+package com.mrcpdf.quality.training;
+
+import com.mrcpdf.model.TextBlock;
+import com.mrcpdf.quality.model.FeatureExtractor;
+import com.mrcpdf.quality.model.MrcReadiness;
+import com.mrcpdf.util.ImageOps;
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.apache.pdfbox.rendering.PDFRenderer;
+
+import java.awt.Color;
+import java.awt.Rectangle;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+/**
+ * Turns the 125-page clean review corpus into a 1250-page labeled training set:
+ * 1 clean + N-1 stochastic scan variants per base page.
+ *
+ * <p>The label is {@code R_mrc} ({@link MrcReadiness#compute}), a reference-free
+ * measurement of the page's own pixels, bucketed into good/middle/bad at
+ * {@link MrcReadiness#GOOD_ABOVE} and {@link MrcReadiness#BAD_BELOW}.  It is
+ * deliberately <em>not</em> {@link TextQualityScorer} (which reads the same
+ * features the model sees) and <em>not</em> an analytic severity (which reads the
+ * generator's own parameters) — either would be circular.  The clean page is
+ * measured too, so no score in the output is fabricated.
+ *
+ * <p>Word-multiset F1 against the source page ({@link ReadabilityOcr#measureWithWords})
+ * is recorded alongside as {@code auditWordF1} for correlation analysis, but it
+ * does <em>not</em> define the label: it needs the reference text, so it cannot
+ * score a page at runtime.
+ *
+ * <p>Ground truth comes from re-reading the <em>source</em> PDF page named in the
+ * review index via {@link RealSrcDump#extractBlocks}, so reference words are
+ * exact rather than OCR'd.  Word boxes live in source-raster pixels; they are
+ * mapped through the fit-scale affine that {@code embedVariant} applied, so the
+ * 3 conditional text features see the same coordinate frame as the raster.
+ *
+ * <p>Note the caveat carried into the evaluation: {@link ScannerSimulator}
+ * geometrically warps a page when {@code curl > 0 || skewDeg > 0}, which
+ * invalidates pristine-anchored glyph boxes on those variants.  That is why the
+ * 11-feature image-only baseline is reported alongside the 14-feature model.
+ */
+public final class RealTrainDump {
+
+    private static final double PAGE_W = 612;
+    private static final double PAGE_H = 792;
+    private static final int DPI = SyntheticCorpus.RENDER_DPI;
+
+    /** good / middle / bad, index-ordered. */
+    static final String[] CLASS_NAMES = {"good", "middle", "bad"};
+
+
+    private RealTrainDump() {
+    }
+
+    /** One row of the review index. */
+    private record IndexRow(int outPage, String baseFile, int basePage) {
+    }
+
+    /**
+     * One emitted corpus page.
+     *
+     * <p>{@code score} is the {@code R_MRC} label; {@code auditScore} is the
+     * independent ground-truth word F1, carried alongside rather than used as the
+     * label.  {@code auditOk} is false where the page had too few reference words
+     * for the audit to mean anything, and {@code auditScore} is NaN there.
+     * {@code mrcBreakdown} keeps the sub-score summary so a label can always be
+     * explained after the fact.
+     */
+    private static final class Row14 {
+        final int basePage;
+        final int variant;
+        final String variantName;
+        final String tier;
+        final double score;
+        final int cls;
+        final int binaryLabel;
+        final double[] features;
+        final double auditScore;
+        final boolean auditOk;
+        final String mrcBreakdown;
+        boolean textOk;
+
+        Row14(int basePage, int variant, String variantName, String tier, double score,
+              int cls, int binaryLabel, double[] features, boolean textOk,
+              double auditScore, boolean auditOk, String mrcBreakdown) {
+            this.basePage = basePage;
+            this.variant = variant;
+            this.variantName = variantName;
+            this.tier = tier;
+            this.score = score;
+            this.cls = cls;
+            this.binaryLabel = binaryLabel;
+            this.features = features;
+            this.textOk = textOk;
+            this.auditScore = auditScore;
+            this.auditOk = auditOk;
+            this.mrcBreakdown = mrcBreakdown;
+        }
+    }
+
+    /**
+     * One-line sub-score summary, for the map CSV's {@code mrc_dims} column.
+     *
+     * <p>Logs the raw measurements as well as the mapped sub-scores.  The
+     * sub-scores are a lossy function of the raw values through
+     * {@code MrcRefs}' bands, so a map holding only the sub-scores cannot be
+     * re-scored when a band changes -- and a band did change, which is how the
+     * corrected sBg endpoints had to be cross-checked against the calibration
+     * cache rather than against the 500 pilot pages.  With the raw values
+     * present, any future re-reference is exact arithmetic over the map.
+     */
+    private static String formatBreakdown(MrcReadiness.Breakdown b, MrcReadiness.Raw raw) {
+        return String.format(Locale.ROOT,
+                "vis=%.3f mask=%.3f ocr=%.3f bg=%.3f kappa=%.3f words=%d "
+                        + "blur=%.4f contrast=%.5f swcv=%.5f margin=%.5f "
+                        + "comps=%.4f speckle=%.3f noise=%.5f tile=%.5f",
+                b.sVisual(), b.sMask(), b.sOcr(), b.sBg(), b.kappa(), b.glyphBoxes(),
+                raw.blurResidual(), raw.contrast(), raw.strokeWidthCv(),
+                raw.ambiguousFraction(), raw.compsPerChar(), raw.specklePerMpx(),
+                raw.noiseSigma(), raw.tileSigma());
+    }
+
+    /** 14 features, flagging whether the conditional 3 were actually extractable. */
+    private record Feat14(double[] v, boolean textOk) {
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path review = Path.of("build/real-base-pages.pdf");
+        Path index = Path.of("build/real-base-pages.csv");
+        Path bases = Path.of("build/real-bases");
+        Path out = Path.of("build/real-train-src.pdf");
+        Path featuresCsv = Path.of("build/real-train-features.csv");
+        Path mapCsv = Path.of("build/real-train-map.csv");
+        Path shardDir = Path.of("build/real-train-shards");
+        int pages = 10;
+        // Kept in step with MrcCalibration.CORPUS_SEED so the calibration's clean
+        // population is the same image this builder labels tier=clean.
+        long seed = 42;
+        int workers = 3;
+        // Defaults come from the scorer so the label cuts cannot silently drift
+        // apart from MrcReadiness.tier().
+        double goodAbove = MrcReadiness.GOOD_ABOVE;
+        double badBelow = MrcReadiness.BAD_BELOW;
+        boolean resume = true;
+        boolean cleanShards = false;
+
+        for (int i = 0; i < args.length; i++) {
+            String a = args[i];
+            switch (a) {
+                case "--review" -> review = Path.of(args[++i]);
+                case "--index" -> index = Path.of(args[++i]);
+                case "--bases" -> bases = Path.of(args[++i]);
+                case "--out" -> out = Path.of(args[++i]);
+                case "--features" -> featuresCsv = Path.of(args[++i]);
+                case "--map" -> mapCsv = Path.of(args[++i]);
+                case "--shard-dir" -> shardDir = Path.of(args[++i]);
+                case "--pages" -> pages = Integer.parseInt(args[++i]);
+                case "--seed" -> seed = Long.parseLong(args[++i]);
+                case "--workers" -> workers = Integer.parseInt(args[++i]);
+                case "--good-above" -> goodAbove = Double.parseDouble(args[++i]);
+                case "--bad-below" -> badBelow = Double.parseDouble(args[++i]);
+                case "--no-resume" -> resume = false;
+                case "--clean-shards" -> cleanShards = true;
+                default -> throw new IllegalArgumentException("Unknown flag: " + a);
+            }
+        }
+        if (pages < 2) throw new IllegalArgumentException("--pages must be >= 2 (1 clean + degraded)");
+        if (goodAbove <= badBelow) {
+            throw new IllegalArgumentException("--good-above must exceed --bad-below");
+        }
+
+        List<IndexRow> indexRows = readIndex(index);
+        int nBase = indexRows.size();
+        if (nBase == 0) throw new IllegalArgumentException("Empty index: " + index);
+        requireFile(review);
+        if (!Files.isDirectory(bases)) throw new IOException("Missing base dir: " + bases);
+
+        int effWorkers = Math.max(1, Math.min(workers, nBase));
+        System.out.printf("RealTrainDump: %d base pages x %d variants = %d pages, workers=%d, "
+                        + "thresholds good>=%.2f / bad<%.2f%n",
+                nBase, pages, nBase * pages, effWorkers, goodAbove, badBelow);
+
+        Files.createDirectories(shardDir);
+        Files.createDirectories(out.toAbsolutePath().getParent());
+        Files.createDirectories(featuresCsv.toAbsolutePath().getParent());
+
+        List<List<IndexRow>> shards = partition(indexRows, effWorkers);
+        long t0 = System.nanoTime();
+        final int nPages = pages;
+        final long runSeed = seed;
+        final double goodCut = goodAbove;
+        final double badCut = badBelow;
+        final Path reviewIn = review;
+        final Path basesIn = bases;
+        final Path shardIn = shardDir;
+        final boolean resumeIn = resume;
+        ExecutorService pool = Executors.newFixedThreadPool(effWorkers);
+        List<Future<List<Row14>>> futures = new ArrayList<>();
+        for (int s = 0; s < effWorkers; s++) {
+            List<IndexRow> shard = shards.get(s);
+            final int shardId = s;
+            futures.add(pool.submit(() -> {
+                if (resumeIn) {
+                    List<Row14> cached = loadCompletedShard(shardIn, shardId, shard, nPages);
+                    if (cached != null) {
+                        System.out.printf("  shard %02d: reusing %d checkpointed rows%n",
+                                shardId, cached.size());
+                        return cached;
+                    }
+                }
+                return processShard(shard, shardId, reviewIn, basesIn, shardIn,
+                        nPages, runSeed, goodCut, badCut);
+            }));
+        }
+        pool.shutdown();
+
+        List<Row14> all = new ArrayList<>();
+        for (Future<List<Row14>> f : futures) {
+            try {
+                all.addAll(f.get());
+            } catch (Exception e) {
+                pool.shutdownNow();
+                throw (e instanceof RuntimeException re) ? re : new RuntimeException(e);
+            }
+        }
+        all.sort(Comparator.comparingInt((Row14 r) -> r.basePage).thenComparingInt(r -> r.variant));
+
+        int imputed = imputeMissingText(all);
+        writeFeatureCsv(featuresCsv, all);
+        writeMapCsv(mapCsv, all);
+        mergeShards(shardDir, effWorkers, out, cleanShards);
+
+        printSummary(all, imputed, out, featuresCsv, mapCsv,
+                (System.nanoTime() - t0) / 1e9);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Shard worker
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private static List<Row14> processShard(List<IndexRow> shard, int shardId, Path review,
+                                            Path bases, Path shardDir, int pages, long seed,
+                                            double goodAbove, double badBelow) throws IOException {
+        List<Row14> rows = new ArrayList<>();
+        Path shardPdf = shardDir.resolve(String.format(Locale.ROOT, "shard-%02d.pdf", shardId));
+        System.out.printf("  shard %02d: %d base pages -> %s%n", shardId, shard.size(), shardPdf);
+
+        try (PDDocument reviewDoc = Loader.loadPDF(review.toFile());
+             PDDocument shardDoc = new PDDocument()) {
+            PDFRenderer renderer = new PDFRenderer(reviewDoc);
+            PDDocument src = null;
+            String openFile = null;
+            int done = 0;
+            long t0 = System.nanoTime();
+            try {
+                for (IndexRow ir : shard) {
+                    if (!ir.baseFile().equals(openFile)) {
+                        if (src != null) {
+                            src.close();
+                            src = null;
+                        }
+                        Path sp = bases.resolve(ir.baseFile());
+                        if (!Files.isRegularFile(sp)) {
+                            throw new IOException("Missing source PDF for " + ir.baseFile() + ": " + sp);
+                        }
+                        src = Loader.loadPDF(sp.toFile());
+                        openFile = ir.baseFile();
+                    }
+                    int spIndex = ir.basePage() - 1;
+                    if (spIndex < 0 || spIndex >= src.getNumberOfPages()) {
+                        throw new IOException("basePage " + ir.basePage() + " out of range for "
+                                + ir.baseFile() + " (" + src.getNumberOfPages() + " pages)");
+                    }
+
+                    PDRectangle mb = src.getPage(spIndex).getMediaBox();
+                    List<TextBlock> truth = RealSrcDump.extractBlocks(
+                            src, spIndex, mb.getWidth(), mb.getHeight(), seed);
+
+                    BufferedImage img = renderer.renderImageWithDPI(ir.outPage() - 1, DPI);
+                    int w = img.getWidth();
+                    int h = img.getHeight();
+                    List<TextBlock> blocks = mapBlocksToReview(truth, mb, w, h);
+                    if (blocks.isEmpty()) {
+                        System.out.printf("  !! p%d: no usable ground-truth words; page will be "
+                                + "imputed in the text columns%n", ir.outPage());
+                    }
+
+                    SyntheticCorpus.Page page = new SyntheticCorpus.Page(img, blocks);
+                    long pageSeed = SyntheticCorpus.basePageSeed(seed, ir.outPage());
+
+                    List<SyntheticCorpus.Variant> sheets = new ArrayList<>();
+                    // Measure the clean page like every other variant instead of
+                    // asserting 1.0 -- an unmeasured score would not be a label.
+                    sheets.add(new SyntheticCorpus.Variant("clean", "clean",
+                            SyntheticCorpus.cleanScan(page, pageSeed), -1.0, 0));
+                    sheets.addAll(SyntheticCorpus.buildScannedPages(page, pageSeed, pages - 1));
+                    if (sheets.size() != pages) {
+                        throw new IOException("expected " + pages + " variants for base page "
+                                + ir.outPage() + ", got " + sheets.size());
+                    }
+
+                    for (int v = 0; v < sheets.size(); v++) {
+                        SyntheticCorpus.Variant var = sheets.get(v);
+                        // Measure and extract on the pixels the page will actually
+                        // present.  Encoding once and keeping the stream alongside
+                        // its decoded form means the label, the features and the
+                        // embedded image are the same bytes -- round-tripping here
+                        // and re-encoding in embedPage() would apply JPEG twice.
+                        JpegCodec.FinalImage jpeg = JpegCodec.prepare(
+                                var.image(), SyntheticCorpus.LABEL_JPEG_QUALITY);
+                        BufferedImage finalImg = jpeg.decoded();
+
+                        ReadabilityOcr.Result ocr = ReadabilityOcr.measureWithWords(
+                                finalImg, blocks);
+                        double auditScore = ocr.getAuditScore();
+                        boolean auditOk = ReferenceAnchor.isUsable(blocks)
+                                && Double.isFinite(auditScore);
+
+                        // measure() then score() rather than compute(), so the
+                        // raw measurements survive for the map; the pair is
+                        // exactly what compute() does internally.
+                        int pw = finalImg.getWidth(), ph = finalImg.getHeight();
+                        int[] pg = ImageOps.toGrayscale(finalImg);
+                        List<TextBlock> usable = MrcReadiness.usable(ocr.getBlocks(), pw, ph);
+                        MrcReadiness.Raw mrcRaw = MrcReadiness.measure(pg, pw, ph, usable,
+                                com.mrcpdf.quality.model.SauvolaMask.compute(pg, pw, ph));
+                        MrcReadiness.Breakdown mrc =
+                                MrcReadiness.score(mrcRaw, usable, pw, ph);
+
+                        double score = mrc.score();
+                        int cls = classOf(score, goodAbove, badBelow);
+                        Feat14 f = features14(finalImg, ocr.getBlocks());
+                        embedPage(shardDoc, jpeg.jpeg(), score, cls, ir.outPage(), var.tier());
+                        rows.add(new Row14(ir.outPage(), v, var.name(), var.tier(), score, cls,
+                                SeverityScore.label(score), f.v(), f.textOk(),
+                                auditScore, auditOk, formatBreakdown(mrc, mrcRaw)));
+                    }
+                    done++;
+                    // Every base page, not every 10th: a shard holds only 8-9
+                    // base pages, so a "done % 10" gate never fired and a
+                    // 500-page build sat silent for its whole duration.
+                    System.out.printf("  shard %02d: %d/%d base pages (%.1f min)%n",
+                            shardId, done, shard.size(), (System.nanoTime() - t0) / 6e10);
+                }
+                shardDoc.save(shardPdf.toFile());
+                // Checkpoint the rows next to the shard PDF.  A corpus build takes
+                // hours, so a later shard must not be able to discard completed work.
+                writeShardRows(shardDir.resolve(
+                        String.format(Locale.ROOT, "shard-%02d.csv", shardId)), rows);
+            } finally {
+                if (src != null) src.close();
+            }
+        }
+        return rows;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Geometry
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Maps word boxes from source-raster pixels into review-raster pixels.
+     *
+     * <p>{@code embedVariant} fit-scales the 300-DPI source raster into a
+     * 612x792 container at {@code scale}, centred at {@code (dx, dy)}.  The
+     * container is then re-rendered at {@link #DPI}, so the net mapping is a
+     * uniform scale plus a translate:
+     * {@code x_r = x_s*scale + dx*k} and
+     * {@code y_r = y_s*scale + (792 - dy - drawH)*k}, with {@code k = DPI/72}.
+     */
+    private static List<TextBlock> mapBlocksToReview(List<TextBlock> truth, PDRectangle mb,
+                                                     int dstW, int dstH) {
+        double srcWpt = mb.getWidth();
+        double srcHpt = mb.getHeight();
+        double scale = Math.min(PAGE_W / srcWpt, PAGE_H / srcHpt);
+        double drawW = srcWpt * scale;
+        double drawH = srcHpt * scale;
+        double dx = (PAGE_W - drawW) / 2.0;
+        double dy = (PAGE_H - drawH) / 2.0;
+        double k = DPI / 72.0;
+        double ox = dx * k;
+        double oy = (PAGE_H - dy - drawH) * k;
+
+        List<TextBlock> out = new ArrayList<>(truth.size());
+        for (TextBlock b : truth) {
+            Rectangle r = b.getBbox();
+            if (r == null) {
+                out.add(b);
+                continue;
+            }
+            int nx = (int) Math.round(r.x * scale + ox);
+            int ny = (int) Math.round(r.y * scale + oy);
+            int nw = Math.max(1, (int) Math.round(r.width * scale));
+            int nh = Math.max(1, (int) Math.round(r.height * scale));
+            nx = Math.max(0, Math.min(nx, dstW - 1));
+            ny = Math.max(0, Math.min(ny, dstH - 1));
+            nw = Math.max(1, Math.min(nw, dstW - nx));
+            nh = Math.max(1, Math.min(nh, dstH - ny));
+            out.add(new TextBlock(b.getWord(), new Rectangle(nx, ny, nw, nh),
+                    b.getConfidence(), b.getCharPositions()));
+        }
+        return out;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Features
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private static Feat14 features14(BufferedImage img, List<TextBlock> blocks) {
+        int[] gray = ImageOps.toGrayscale(img);
+        int w = img.getWidth();
+        int h = img.getHeight();
+        double[] image = FeatureExtractor.extractImage(gray, w, h, DPI);
+        double[] text = null;
+        if (!blocks.isEmpty()) {
+            float[] mag = FeatureExtractor.gradientMagnitudes(gray, w, h);
+            text = FeatureExtractor.extractText(gray, mag, w, h, blocks);
+        }
+        if (text == null) {
+            double[] v = new double[image.length + FeatureExtractor.TEXT_FEATURE_NAMES.length];
+            System.arraycopy(image, 0, v, 0, image.length);
+            return new Feat14(v, false);
+        }
+        double[] v = new double[image.length + text.length];
+        System.arraycopy(image, 0, v, 0, image.length);
+        System.arraycopy(text, 0, v, image.length, text.length);
+        return new Feat14(v, true);
+    }
+
+    /**
+     * Fills the 3 conditional text columns of any row where extraction failed,
+     * using the per-column median of the rows that succeeded, so the 14-feature
+     * matrix stays rectangular.  Returns the number of rows touched.
+     */
+    private static int imputeMissingText(List<Row14> rows) {
+        int width = rows.get(0).features.length;
+        for (int c = 0; c < width; c++) {
+            List<Double> vals = new ArrayList<>();
+            for (Row14 r : rows) {
+                if (r.textOk && Double.isFinite(r.features[c])) vals.add(r.features[c]);
+            }
+            if (vals.isEmpty()) continue;
+            vals.sort(Comparator.naturalOrder());
+            double med = vals.get(vals.size() / 2);
+            for (Row14 r : rows) {
+                if (!r.textOk || !Double.isFinite(r.features[c])) r.features[c] = med;
+            }
+        }
+        int n = 0;
+        for (Row14 r : rows) {
+            if (!r.textOk) n++;
+        }
+        return n;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Output
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Emits one labeled page. {@code jpeg} is the exact stream the label and
+     * features were measured on, so the rendered page and the labeled raster
+     * agree bit for bit.
+     */
+    private static void embedPage(PDDocument doc, byte[] jpeg, double score, int cls,
+                                  int basePage, String tier) throws IOException {
+        PDPage pd = new PDPage(new PDRectangle((float) PAGE_W, (float) PAGE_H));
+        doc.addPage(pd);
+        try (PDPageContentStream cs = new PDPageContentStream(doc, pd)) {
+            JpegCodec.embedBytes(doc, cs, jpeg, 0, 0, PAGE_W, PAGE_H);
+            drawLabelBanner(cs, score, cls, basePage, tier);
+        }
+    }
+
+    /** Top band: the measured score and its good/middle/bad class, plus provenance. */
+    private static void drawLabelBanner(PDPageContentStream cs, double score, int cls,
+                                        int basePage, String tier) throws IOException {
+        String text = String.format(Locale.ROOT, "R_MRC=%.3f  class=%s", score, CLASS_NAMES[cls]);
+        PDType1Font font = new PDType1Font(Standard14Fonts.FontName.HELVETICA_BOLD);
+        float fontSize = 8;
+        float tw = font.getStringWidth(text) / 1000f * fontSize;
+        float x = (float) ((PAGE_W - tw) / 2.0);
+        float baseline = (float) (PAGE_H - 9);
+        cs.setNonStrokingColor(Color.WHITE);
+        cs.addRect(x - 4, baseline - 3, tw + 8, 11.5f);
+        cs.fill();
+        cs.setNonStrokingColor(Color.BLACK);
+        cs.beginText();
+        cs.setFont(font, fontSize);
+        cs.newLineAtOffset(x, baseline);
+        cs.showText(text);
+        cs.endText();
+
+        String meta = "p" + basePage + "  " + tier;
+        PDType1Font mf = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+        float ms = 6.5f;
+        float mw = mf.getStringWidth(meta) / 1000f * ms;
+        float mx = (float) (PAGE_W - mw - 4);
+        float mb = (float) (PAGE_H - 20);
+        cs.setNonStrokingColor(Color.WHITE);
+        cs.addRect(mx - 2, mb - 2.5f, mw + 4, 9);
+        cs.fill();
+        cs.setNonStrokingColor(new Color(70, 70, 70));
+        cs.beginText();
+        cs.setFont(mf, ms);
+        cs.newLineAtOffset(mx, mb);
+        cs.showText(meta);
+        cs.endText();
+    }
+
+    private static void writeFeatureCsv(Path path, List<Row14> rows) throws IOException {
+        List<String> names = featureNames();
+        StringBuilder sb = new StringBuilder();
+        sb.append("doc,label");
+        for (String n : names) sb.append(',').append(n);
+        sb.append('\n');
+        for (Row14 r : rows) {
+            sb.append("p").append(r.basePage).append(',').append(r.cls);
+            for (double v : r.features) {
+                if (!Double.isFinite(v)) sb.append(",0.000000");
+                else sb.append(String.format(Locale.ROOT, ",%.6f", v));
+            }
+            sb.append('\n');
+        }
+        Files.writeString(path, sb.toString());
+    }
+
+    /**
+     * {@code R_mrc} is the reference-free label; {@code auditWordF1} is the
+     * independent OCR readback used to police it — a word-level F1 against the
+     * assembled text, not a raw error rate, and 1.0 means Tesseract read every
+     * reference word and invented nothing.
+     */
+    private static void writeMapCsv(Path path, List<Row14> rows) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append("page,basePage,variant,variantName,tier,R_mrc,class,binaryLabel,textOk")
+                .append(",auditWordF1,auditOk,mrc_dims\n");
+        int page = 0;
+        for (Row14 r : rows) {
+            sb.append(++page).append(',').append(r.basePage).append(',').append(r.variant)
+                    .append(',').append(r.variantName).append(',').append(r.tier)
+                    .append(',').append(String.format(Locale.ROOT, "%.6f", r.score))
+                    .append(',').append(CLASS_NAMES[r.cls])
+                    .append(',').append(r.binaryLabel)
+                    .append(',').append(r.textOk).append(',');
+            if (Double.isFinite(r.auditScore)) {
+                sb.append(String.format(Locale.ROOT, "%.6f", r.auditScore));
+            }
+            // An empty field, not a 0: a page with too few reference words has no
+            // readback at all, and 0.0 would read as "completely unreadable".
+            sb.append(',').append(r.auditOk)
+                    .append(',').append(r.mrcBreakdown).append('\n');
+        }
+        Files.writeString(path, sb.toString());
+    }
+
+    /**
+     * Checkpoint header, including a schema tag.  Labels changed from OCR
+     * {@code 1-WER} to reference-free {@code R_mrc}, so a checkpoint written by
+     * an older build is not resumable: its scores are a different measurement and
+     * would be silently mixed with new ones.  The tag is checked on load.
+     */
+    private static final String SHARD_HEADER =
+            "schema,variant-set,basePage,variant,variantName,tier,score,class,"
+                    + "binaryLabel,textOk,auditWordF1,auditOk,mrc_dims";
+
+    /** Must match {@link #SHARD_HEADER} for a checkpoint to be reusable. */
+    private static final String SHARD_SCHEMA = "rmrc-1";
+
+    private static void writeShardRows(Path path, List<Row14> rows) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        // The audit columns and the sub-score breakdown are part of the
+        // checkpoint: a resumed run must not silently relabel pages using audit
+        // values it no longer has.
+        sb.append(SHARD_HEADER);
+        for (String n : featureNames()) sb.append(',').append(n);
+        sb.append('\n');
+        for (Row14 r : rows) {
+            sb.append(SHARD_SCHEMA).append(',').append(r.variantName.indexOf('+') < 0
+                    ? r.variantName : r.variantName.substring(0, r.variantName.indexOf('+')))
+                    .append(',').append(r.basePage).append(',').append(r.variant).append(',')
+                    .append(r.variantName)
+                    .append(',').append(r.tier).append(',')
+                    .append(String.format(Locale.ROOT, "%.6f", r.score)).append(',')
+                    .append(CLASS_NAMES[r.cls]).append(',').append(r.binaryLabel).append(',')
+                    .append(r.textOk).append(',');
+            if (Double.isFinite(r.auditScore)) {
+                sb.append(String.format(Locale.ROOT, "%.6f", r.auditScore));
+            }
+            sb.append(',').append(r.auditOk).append(',').append(r.mrcBreakdown);
+            for (double d : r.features) {
+                if (!Double.isFinite(d)) sb.append(",0.000000");
+                else sb.append(String.format(Locale.ROOT, ",%.6f", d));
+            }
+            sb.append('\n');
+        }
+        Files.writeString(path, sb.toString());
+    }
+
+    private static List<Row14> readShardRows(Path csv) throws IOException {
+        List<String> lines = Files.readAllLines(csv);
+        if (lines.isEmpty()) throw new IOException("Empty checkpoint " + csv);
+        if (!SHARD_SCHEMA.equals(lines.get(0).split(",", -1)[0])) {
+            throw new IOException("Checkpoint " + csv + " has schema "
+                    + lines.get(0).split(",", -1)[0] + ", expected " + SHARD_SCHEMA
+                    + ". Its scores came from a different label definition and cannot be"
+                    + " resumed; delete the shard directory or pass --no-resume.");
+        }
+        int nFeat = featureNames().size();
+        int meta = SHARD_HEADER.split(",", -1).length;
+        List<String> classes = Arrays.asList(CLASS_NAMES);
+        List<Row14> rows = new ArrayList<>();
+        for (int i = 1; i < lines.size(); i++) {
+            if (lines.get(i).isBlank()) continue;
+            String[] c = lines.get(i).split(",", -1);
+            if (c.length < meta + nFeat) {
+                throw new IOException("Malformed checkpoint row in " + csv + ": " + lines.get(i));
+            }
+            double[] v = new double[nFeat];
+            for (int k = 0; k < nFeat; k++) v[k] = Double.parseDouble(c[meta + k]);
+            String audit = c[10].isEmpty() ? "" : c[10];
+            rows.add(new Row14(Integer.parseInt(c[2]), Integer.parseInt(c[3]), c[4], c[5],
+                    Double.parseDouble(c[6]), classes.indexOf(c[7]), Integer.parseInt(c[8]),
+                    v, Boolean.parseBoolean(c[9]),
+                    audit.isEmpty() ? Double.NaN : Double.parseDouble(audit),
+                    Boolean.parseBoolean(c[11]), c[12]));
+        }
+        return rows;
+    }
+
+    /**
+     * Returns the checkpointed rows for a shard, or {@code null} when the shard
+     * has to be rebuilt.  A shard counts as done only when both its PDF and its
+     * row CSV exist, the row count matches, and every base page is present.
+     */
+    private static List<Row14> loadCompletedShard(Path shardDir, int shardId,
+                                                  List<IndexRow> shard, int pages) {
+        Path pdf = shardDir.resolve(String.format(Locale.ROOT, "shard-%02d.pdf", shardId));
+        Path csv = shardDir.resolve(String.format(Locale.ROOT, "shard-%02d.csv", shardId));
+        if (!Files.isRegularFile(pdf) || !Files.isRegularFile(csv)) return null;
+        List<Row14> rows;
+        try {
+            rows = readShardRows(csv);
+        } catch (IOException | RuntimeException e) {
+            System.out.printf("  shard %02d: unreadable checkpoint (%s); rebuilding%n",
+                    shardId, e.getMessage());
+            return null;
+        }
+        if (rows.size() != shard.size() * pages) {
+            System.out.printf("  shard %02d: checkpoint has %d rows, expected %d; rebuilding%n",
+                    shardId, rows.size(), shard.size() * pages);
+            return null;
+        }
+        for (IndexRow ir : shard) {
+            boolean found = false;
+            for (Row14 r : rows) if (r.basePage == ir.outPage()) { found = true; break; }
+            if (!found) {
+                System.out.printf("  shard %02d: checkpoint missing base page p%d; rebuilding%n",
+                        shardId, ir.outPage());
+                return null;
+            }
+        }
+        return rows;
+    }
+
+    private static void mergeShards(Path shardDir, int workers, Path out, boolean clean)
+            throws IOException {
+        List<Path> present = new ArrayList<>();
+        for (int s = 0; s < workers; s++) {
+            Path p = shardDir.resolve(String.format(Locale.ROOT, "shard-%02d.pdf", s));
+            if (Files.isRegularFile(p)) present.add(p);
+        }
+        if (present.size() != workers) {
+            // Never emit a silently short corpus: a missing shard means the merged
+            // PDF would have fewer pages than the feature CSV claims.
+            throw new IOException("Expected " + workers + " shard PDFs in " + shardDir
+                    + " but found " + present.size() + " " + present);
+        }
+        List<PDDocument> open = new ArrayList<>();
+        try (PDDocument dest = new PDDocument()) {
+            try {
+                for (Path p : present) {
+                    PDDocument shardDoc = Loader.loadPDF(p.toFile());
+                    open.add(shardDoc);
+                    // PDFBox 3 exposes only importPage, a *shallow* copy that shares
+                    // the source's image COS objects.  So the shard documents must
+                    // stay open until dest.save() has walked and written them.
+                    for (PDPage page : shardDoc.getPages()) {
+                        dest.importPage(page);
+                    }
+                }
+                dest.save(out.toFile());
+            } finally {
+                for (PDDocument d : open) d.close();
+            }
+        }
+        if (clean) {
+            for (Path p : present) Files.deleteIfExists(p);
+        }
+    }
+
+    private static void printSummary(List<Row14> rows, int imputed, Path out, Path featuresCsv,
+                                     Path mapCsv, double secs) {
+        int[] counts = new int[3];
+        for (Row14 r : rows) counts[r.cls]++;
+        MapStats.byTier(rows);
+        System.out.println();
+        System.out.printf("pages            %d%n", rows.size());
+        System.out.printf("class good       %d (%.1f%%)%n", counts[0], pct(counts[0], rows.size()));
+        System.out.printf("class middle     %d (%.1f%%)%n", counts[1], pct(counts[1], rows.size()));
+        System.out.printf("class bad        %d (%.1f%%)%n", counts[2], pct(counts[2], rows.size()));
+        System.out.printf("text imputed     %d rows (%.1f%%)%n", imputed, pct(imputed, rows.size()));
+        System.out.printf("out              %s (%.1f MB)%n", out, sizeMb(out));
+        System.out.printf("features         %s%n", featuresCsv);
+        System.out.printf("map              %s%n", mapCsv);
+        System.out.printf("elapsed          %.1f min%n", secs / 60.0);
+    }
+
+    private static double pct(int n, int total) {
+        return total == 0 ? 0.0 : 100.0 * n / total;
+    }
+
+    private static double sizeMb(Path p) {
+        try {
+            return Files.size(p) / 1e6;
+        } catch (IOException e) {
+            return 0.0;
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ──────────────────────────────────────────────────────────────────────────
+
+    static List<String> featureNames() {
+        List<String> names = new ArrayList<>();
+        for (String n : FeatureExtractor.IMAGE_FEATURE_NAMES) names.add(n);
+        for (String n : FeatureExtractor.TEXT_FEATURE_NAMES) names.add(n);
+        return names;
+    }
+
+    static int classOf(double score, double goodAbove, double badBelow) {
+        if (score >= goodAbove) return 0;
+        if (score >= badBelow) return 1;
+        return 2;
+    }
+
+    private static void requireFile(Path p) throws IOException {
+        if (!Files.isRegularFile(p)) throw new IOException("Missing input: " + p);
+    }
+
+    private static List<List<IndexRow>> partition(List<IndexRow> rows, int parts) {
+        List<List<IndexRow>> out = new ArrayList<>();
+        for (int i = 0; i < parts; i++) out.add(new ArrayList<>());
+        for (int i = 0; i < rows.size(); i++) out.get(i % parts).add(rows.get(i));
+        return out;
+    }
+
+    private static List<IndexRow> readIndex(Path path) throws IOException {
+        List<String> lines = Files.readAllLines(path);
+        if (lines.size() < 2) throw new IOException("Index has no data rows: " + path);
+        String[] head = lines.get(0).split(",");
+        int outIdx = col(head, "outPage");
+        int fileIdx = col(head, "baseFile");
+        int pageIdx = col(head, "basePage");
+        List<IndexRow> out = new ArrayList<>();
+        for (int i = 1; i < lines.size(); i++) {
+            String line = lines.get(i).trim();
+            if (line.isEmpty()) continue;
+            String[] c = line.split(",");
+            out.add(new IndexRow(Integer.parseInt(c[outIdx].trim()),
+                    c[fileIdx].trim(),
+                    Integer.parseInt(c[pageIdx].trim())));
+        }
+        return out;
+    }
+
+    private static int col(String[] head, String name) {
+        for (int i = 0; i < head.length; i++) {
+            if (head[i].trim().equals(name)) return i;
+        }
+        throw new IllegalArgumentException("Index is missing column '" + name + "'");
+    }
+
+    /** Per-tier mean readability, printed for eyeballing coverage. */
+    static final class MapStats {
+        static void byTier(List<Row14> rows) {
+            java.util.Map<String, double[]> acc = new java.util.TreeMap<>();
+            for (Row14 r : rows) {
+                double[] a = acc.computeIfAbsent(r.tier, k -> new double[2]);
+                a[0] += r.score;
+                a[1]++;
+            }
+            System.out.println("tier means");
+            for (var e : acc.entrySet()) {
+                System.out.printf("  %-6s n=%-5d readability=%.3f%n",
+                        e.getKey(), (int) e.getValue()[1], e.getValue()[0] / e.getValue()[1]);
+            }
+        }
+    }
+}

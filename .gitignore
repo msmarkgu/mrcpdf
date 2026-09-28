@@ -27,6 +27,7 @@ notes/
 
 # Per-run temp files (page images, etc.)
 temp/
+tmp/
 
 .opencode/
 
