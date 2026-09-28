@@ -47,7 +47,39 @@ final class JpegCodec {
 
     static void embed(PDDocument doc, PDPageContentStream cs, BufferedImage image,
                       float quality, double x, double y, double w, double h) throws IOException {
-        PDImageXObject img = PDImageXObject.createFromByteArray(doc, encode(image, quality), "synthetic");
+        embedBytes(doc, cs, encode(image, quality), x, y, w, h);
+    }
+
+    /**
+     * Encodes once and exposes both the exact bytes to embed and the pixels a
+     * renderer will draw from them.
+     *
+     * <p>Encoding is lossy, so the delivered page is the <em>decoded</em> stream,
+     * not the raster handed to the encoder. Anything describing the delivered page
+     * (label, audit, features) must therefore read {@link #decoded()}, while
+     * {@link #jpeg()} is what goes into the PDF. Round-tripping first and encoding
+     * again would score a different image from the one shipped, applying JPEG
+     * twice; keeping the two in one record makes that mismatch unrepresentable.
+     */
+    static FinalImage prepare(BufferedImage image, float quality) throws IOException {
+        byte[] jpeg = encode(image, quality);
+        try (java.io.ByteArrayInputStream in = new java.io.ByteArrayInputStream(jpeg)) {
+            BufferedImage decoded = javax.imageio.ImageIO.read(in);
+            if (decoded == null) {
+                throw new IOException("JPEG round-trip produced no image ("
+                        + jpeg.length + " bytes)");
+            }
+            return new FinalImage(jpeg, decoded);
+        }
+    }
+
+    /** The JPEG stream to embed together with the pixels it decodes to. */
+    record FinalImage(byte[] jpeg, BufferedImage decoded) {
+    }
+
+    static void embedBytes(PDDocument doc, PDPageContentStream cs, byte[] jpeg,
+                           double x, double y, double w, double h) throws IOException {
+        PDImageXObject img = PDImageXObject.createFromByteArray(doc, jpeg, "page");
         cs.drawImage(img, (float) x, (float) y, (float) w, (float) h);
     }
 }

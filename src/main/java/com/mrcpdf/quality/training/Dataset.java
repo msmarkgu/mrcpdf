@@ -71,6 +71,21 @@ public final class Dataset {
     // IO
     // ──────────────────────────────────────────────────────────────────────
 
+    /**
+     * In-memory factory, so callers can build train/test subsets (optionally over
+     * a feature subset) without round-tripping through a temporary CSV.
+     */
+    public static Dataset of(List<String> featureNames, List<Row> rows) {
+        if (featureNames.isEmpty()) throw new IllegalArgumentException("No feature names");
+        for (Row r : rows) {
+            if (r.features().length != featureNames.size()) {
+                throw new IllegalArgumentException("Row " + r.doc() + " has "
+                        + r.features().length + " features, expected " + featureNames.size());
+            }
+        }
+        return new Dataset(featureNames, rows);
+    }
+
     public static Dataset fromCsv(Path path, List<String> expectedFeatures) throws IOException {
         List<String> lines = Files.readAllLines(path);
         if (lines.isEmpty()) throw new IllegalArgumentException("Empty CSV: " + path);
