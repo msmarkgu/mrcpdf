@@ -392,6 +392,21 @@ public final class SyntheticCorpus {
      */
     private static final int MAX_STEER_FALLBACKS = 5;
 
+    /**
+     * Probes a reference page's steering curves without installing them.
+     *
+     * <p>Exposed so a caller holding several pages can build a corpus-level
+     * calibration from a spread of them, rather than letting whichever page
+     * reaches the sampler first define the curves for all the others. Deliberately
+     * does not go through {@code Steering.calibrate}, which installs on first use
+     * and would make the second and third pages no-ops.
+     */
+    static ScoreCalibration.Calibration probeCalibration(Page page, long seed, int steps)
+            throws IOException {
+        return ScoreCalibration.probe((profile, r) -> renderSteered(page, profile, r),
+                new java.util.Random(seed ^ CALIB_SALT), steps, page.label());
+    }
+
     /** The unsteered tier draw, shared by the normal and fallback paths. */
     private static Variant unsteered(Page page, java.util.Random rng) throws IOException {
         ScannerTier tier = drawTier(rng);

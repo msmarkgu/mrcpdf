@@ -191,6 +191,7 @@ public final class RealTrainDump {
         double steerTolerance = ScoreSampler.DEFAULT_TOLERANCE;
         int steerMaxAttempts = ScoreSampler.DEFAULT_MAX_ATTEMPTS;
         int steerCalibSteps = ScoreCalibration.DEFAULT_STEPS;
+        int steerCalibPages = DEFAULT_CALIB_PAGES;
         String steerDims = "visual,mask,bg";
 
         for (int i = 0; i < args.length; i++) {
@@ -217,6 +218,7 @@ public final class RealTrainDump {
                 case "--steer-tolerance" -> steerTolerance = Double.parseDouble(args[++i]);
                 case "--steer-max-attempts" -> steerMaxAttempts = Integer.parseInt(args[++i]);
                 case "--steer-calib-steps" -> steerCalibSteps = Integer.parseInt(args[++i]);
+                case "--steer-calib-pages" -> steerCalibPages = Integer.parseInt(args[++i]);
                 case "--steer-dims" -> steerDims = args[++i];
                 default -> throw new IllegalArgumentException("Unknown flag: " + a);
             }
@@ -246,9 +248,10 @@ public final class RealTrainDump {
                 nBase, pages, nBase * pages, effWorkers, goodAbove, badBelow);
         System.out.printf(steer
                         ? "  steering ON: target uniform [%.2f,%.2f], dims %s, tolerance %.2f, "
-                                + "max %d attempts, %d calibration steps%n"
+                                + "max %d attempts, %d calibration steps on %d reference pages%n"
                         : "  steering OFF: tier-centre draws, corpus is the pre-sampling baseline%n",
-                steerLo, steerHi, steerDims, steerTolerance, steerMaxAttempts, steerCalibSteps);
+                steerLo, steerHi, steerDims, steerTolerance, steerMaxAttempts, steerCalibSteps,
+                steerCalibPages);
 
         Files.createDirectories(shardDir);
         Files.createDirectories(out.toAbsolutePath().getParent());
@@ -271,6 +274,12 @@ public final class RealTrainDump {
         // slightly better first guess.
         final ScoreSampler.Steering steeringIn = steering;
         final int calibSteps = steerCalibSteps;
+        // Before the workers start: every worker shares one calibration, and it is
+        // cheaper to spend 3 * probes * steps renders once here than to let each
+        // worker discover a different reference page.
+        primeCalibration(allIndexRows(shards), reviewIn, basesIn, seed, steering, calibSteps,
+                steerCalibPages);
+
         ExecutorService pool = Executors.newFixedThreadPool(effWorkers);
         List<Future<List<Row14>>> futures = new ArrayList<>();
         for (int s = 0; s < effWorkers; s++) {
@@ -372,6 +381,84 @@ public final class RealTrainDump {
         return dims.toArray(new ScoreSampler.Dim[0]);
     }
 
+    /**
+    /** Every indexed row, shard order, for sampling references across the corpus. */
+    private static List<IndexRow> allIndexRows(List<List<IndexRow>> shards) {
+        List<IndexRow> all = new ArrayList<>();
+        for (List<IndexRow> shard : shards) all.addAll(shard);
+        return all;
+    }
+
+    /**
+     * Renders one indexed page and pairs it with its ground-truth words.
+     *
+     * <p>Shared by the shard worker and the calibration priming pass so both agree
+     * on what a page is; a second copy of this would be a second definition of the
+     * page the probes measured.
+     */
+    private static SyntheticCorpus.Page loadPage(IndexRow ir, PDDocument src, PDDocument reviewDoc,
+                                                  long seed) throws IOException {
+        int spIndex = ir.basePage() - 1;
+        if (spIndex < 0 || spIndex >= src.getNumberOfPages()) {
+            throw new IOException("basePage " + ir.basePage() + " out of range for "
+                    + ir.baseFile() + " (" + src.getNumberOfPages() + " pages)");
+        }
+
+        PDRectangle mb = src.getPage(spIndex).getMediaBox();
+        List<TextBlock> truth = RealSrcDump.extractBlocks(
+                src, spIndex, mb.getWidth(), mb.getHeight(), seed);
+
+        BufferedImage img = new PDFRenderer(reviewDoc).renderImageWithDPI(ir.outPage() - 1, DPI);
+        List<TextBlock> blocks = mapBlocksToReview(truth, mb, img.getWidth(), img.getHeight());
+        if (blocks.isEmpty()) {
+            System.out.printf("  !! p%d: no usable ground-truth words; page will be "
+                    + "imputed in the text columns%n", ir.outPage());
+        }
+        return new SyntheticCorpus.Page(img, blocks, "review page " + ir.outPage());
+    }
+
+    /**
+     * Builds the run's steering calibration from pages spread across the corpus.
+     *
+     * <p>Probing a single page makes the curves that page's response, and the rest
+     * of the corpus is then steered by a curve measured on a page that is not like
+     * it -- which costs attempts and, where a target sits near that page's own
+     * ceiling, leaves the marginal unreachable. A handful of references merged is
+     * the same cost order as the one probe it replaces.
+     */
+    private static void primeCalibration(List<IndexRow> all, Path review, Path bases, long seed,
+                                         ScoreSampler.Steering steering, int steps, int probes)
+            throws IOException {
+        if (!steering.enabled() || probes <= 0) return;
+        if (all.size() <= probes) probes = all.size();
+
+        List<ScoreCalibration.Calibration> parts = new ArrayList<>();
+        try (PDDocument reviewDoc = Loader.loadPDF(review.toFile())) {
+            PDDocument src = null;
+            String openFile = null;
+            try {
+                for (int k = 0; k < probes; k++) {
+                    // Evenly spaced, so the sample spans the corpus rather than
+                    // clustering in whichever files sort first.
+                    IndexRow ir = all.get((int) Math.round((double) k * (all.size() - 1) / (probes - 1)));
+                    if (!ir.baseFile().equals(openFile)) {
+                        if (src != null) src.close();
+                        src = Loader.loadPDF(bases.resolve(ir.baseFile()).toFile());
+                        openFile = ir.baseFile();
+                    }
+                    SyntheticCorpus.Page page = loadPage(ir, src, reviewDoc, seed);
+                    long pageSeed = SyntheticCorpus.basePageSeed(seed, ir.outPage());
+                    parts.add(SyntheticCorpus.probeCalibration(page, pageSeed, steps));
+                    System.out.printf("  calibration probe %d/%d: review page %d%n",
+                            k + 1, probes, ir.outPage());
+                }
+            } finally {
+                if (src != null) src.close();
+            }
+        }
+        steering.calibrateFrom(parts);
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // Shard worker
     // ──────────────────────────────────────────────────────────────────────────
@@ -406,27 +493,7 @@ public final class RealTrainDump {
                         src = Loader.loadPDF(sp.toFile());
                         openFile = ir.baseFile();
                     }
-                    int spIndex = ir.basePage() - 1;
-                    if (spIndex < 0 || spIndex >= src.getNumberOfPages()) {
-                        throw new IOException("basePage " + ir.basePage() + " out of range for "
-                                + ir.baseFile() + " (" + src.getNumberOfPages() + " pages)");
-                    }
-
-                    PDRectangle mb = src.getPage(spIndex).getMediaBox();
-                    List<TextBlock> truth = RealSrcDump.extractBlocks(
-                            src, spIndex, mb.getWidth(), mb.getHeight(), seed);
-
-                    BufferedImage img = renderer.renderImageWithDPI(ir.outPage() - 1, DPI);
-                    int w = img.getWidth();
-                    int h = img.getHeight();
-                    List<TextBlock> blocks = mapBlocksToReview(truth, mb, w, h);
-                    if (blocks.isEmpty()) {
-                        System.out.printf("  !! p%d: no usable ground-truth words; page will be "
-                                + "imputed in the text columns%n", ir.outPage());
-                    }
-
-                    SyntheticCorpus.Page page = new SyntheticCorpus.Page(img, blocks,
-                            "review page " + ir.outPage());
+                    SyntheticCorpus.Page page = loadPage(ir, src, reviewDoc, seed);
                     long pageSeed = SyntheticCorpus.basePageSeed(seed, ir.outPage());
 
                     List<SyntheticCorpus.Variant> sheets = new ArrayList<>();
@@ -470,7 +537,7 @@ public final class RealTrainDump {
                             jpeg = JpegCodec.prepare(
                                     var.image(), SyntheticCorpus.LABEL_JPEG_QUALITY);
                             finalImg = jpeg.decoded();
-                            ocr = ReadabilityOcr.measureWithWords(finalImg, blocks);
+                            ocr = ReadabilityOcr.measureWithWords(finalImg, page.blocks());
                             // measure() then score() rather than compute(), so the
                             // raw measurements survive for the map; the pair is
                             // exactly what compute() does internally.
@@ -485,7 +552,7 @@ public final class RealTrainDump {
                         double score = mrc.score();
                         int cls = classOf(score, goodAbove, badBelow);
                         double auditScore = ocr.getAuditScore();
-                        boolean auditOk = ReferenceAnchor.isUsable(blocks)
+                        boolean auditOk = ReferenceAnchor.isUsable(page.blocks())
                                 && Double.isFinite(auditScore);
                         Feat14 f = features14(finalImg, ocr.getBlocks());
                         embedPage(shardDoc, jpeg.jpeg(), score, cls, ir.outPage(), var.tier());
@@ -763,6 +830,14 @@ public final class RealTrainDump {
      * Hence an explicit tag that the reader compares before touching anything.
      */
     private static final String SHARD_SCHEMA = "rmrc-3";
+
+    /**
+     * Reference pages probed to build the run's steering calibration.
+     *
+     * <p>Three is enough to stop one page defining the curves for the corpus and
+     * costs 3x a single probe on a run that renders hundreds of pages.
+     */
+    private static final int DEFAULT_CALIB_PAGES = 3;
 
     private static void writeShardRows(Path path, List<Row14> rows) throws IOException {
         StringBuilder sb = new StringBuilder();

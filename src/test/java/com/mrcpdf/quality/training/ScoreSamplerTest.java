@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 
@@ -385,6 +386,120 @@ class ScoreSamplerTest {
         assertEquals(expectedMisses, h.misses());
         assertEquals(133, h.misses(), "fixture sanity: the 0.20-0.30 band is 13.3% of the range");
         assertEquals(133 / 1000.0, h.missRate(), 1e-9);
+    }
+
+    @Test
+    void aGenuinelyUniformCorpusPassesEvenThoughHalfItsBinsSitBelowTheMean() {
+        // The previous rule required every bin to hold at least 10% of the rows.
+        // With 10 bins that is the mean, and half of a uniform sample is below the
+        // mean by definition, so the check rejected well-behaved corpora.
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            double t = 0.20 + 0.75 * (i + 0.5) / 1000;
+            xs.add(fake(t, t, true));
+        }
+        ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, 0.20, 0.95);
+        assertTrue(h.ok(), "a uniform corpus must pass: " + h.problems());
+        int spread = Arrays.stream(h.steerCounts()).max().getAsInt()
+                - Arrays.stream(h.steerCounts()).min().getAsInt();
+        assertEquals(0, spread, "fixture is not actually uniform, counts=" +
+                Arrays.toString(h.steerCounts()));
+    }
+
+    @Test
+    void aGenuinelyLopsidedCorpusStillFails() {
+        // The other half of the previous rule: a corpus crammed into one bin must
+        // not pass just because the threshold was loosened.
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < 900; i++) xs.add(fake(0.50, 0.50, true));
+        for (int i = 0; i < 100; i++) xs.add(fake(0.30 + 0.001 * i, 0.30, true));
+        ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, 0.20, 0.95);
+        assertFalse(h.ok(), "a corpus with 900 of 1000 rows in one bin must fail");
+    }
+
+    @Test
+    void tooFewRowsToJudgeIsReportedRatherThanEnforced() {
+        // A 30-row slice empties a quarter of its bins by chance. Reporting that
+        // as a failure trains the reader to ignore the check; reporting it as a
+        // pass hides a real problem. Say the sample is too small and stop there.
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < 30; i++) xs.add(fake(0.90, 0.90, true));
+
+        ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, 0.20, 0.95);
+        assertTrue(h.notes().stream().anyMatch(n -> n.contains("no power")),
+                "expected an underpowered note, got " + h.notes());
+        assertTrue(h.notes().stream().anyMatch(n -> n.contains("100")),
+                "the note should name the rows it needs, got " + h.notes());
+    }
+
+    @Test
+    void aFullSizedCorpusIsJudgedEvenWhenOneBinIsEmpty() {
+        // Under the same 30 rows this is excused; at 300 rows an empty bin is a
+        // real gap in the marginal and must be reported.
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < 300; i++) {
+            double t = 0.20 + 0.75 * (i + 0.5) / 300;
+            if (t > 0.60 && t < 0.68) continue;   // leave one hole
+            xs.add(fake(t, t, true));
+        }
+        ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, 0.20, 0.95);
+        assertTrue(h.notes().isEmpty(), "300 rows is enough to judge: " + h.notes());
+        assertTrue(h.problems().stream().anyMatch(p -> p.contains("0.58-0.65")),
+                "the hole should be reported, got " + h.problems());
+    }
+
+    @Test
+    void mergingKeepsTheUnionRangeButSeedsFromTheMedianPage() {
+        // Two pages that respond differently: one holds up better under severity.
+        // The merged curve is only a bisection seed, so it should sit near the
+        // middle page rather than be dragged by either, but the range QA is checked
+        // against has to stay the full span the corpus can actually produce.
+        double[] sev = {0, 0.5, 1.0};
+        ScoreCalibration.Calibration weak = new ScoreCalibration.Calibration(
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.VISUAL, sev, new double[] {0.55, 0.30, 0.10}),
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.MASK, sev, new double[] {0.60, 0.35, 0.10}),
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.BG, sev, new double[] {0.70, 0.45, 0.10}),
+                "weak page");
+        ScoreCalibration.Calibration strong = new ScoreCalibration.Calibration(
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.VISUAL, sev, new double[] {0.95, 0.70, 0.40}),
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.MASK, sev, new double[] {0.96, 0.72, 0.42}),
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.BG, sev, new double[] {0.97, 0.80, 0.50}),
+                "strong page");
+
+        ScoreCalibration.Calibration merged =
+                ScoreCalibration.Calibration.merge(List.of(weak, strong));
+
+        assertEquals(0.10, merged.fillableRange()[0], 1e-6, "dirtiest across the union");
+        assertEquals(0.97, merged.fillableRange()[1], 1e-6, "cleanest across the union");
+        assertTrue(merged.reference().contains("weak page")
+                        && merged.reference().contains("strong page"),
+                "the report should name what it merged, got " + merged.reference());
+
+        // The seed for a mid target should be between the two pages' own seeds,
+        // not equal to either: a seed tuned to one page is the thing being fixed.
+        double weakSeed = weak.severityFor(ScoreSampler.Dim.VISUAL, 0.50);
+        double strongSeed = strong.severityFor(ScoreSampler.Dim.VISUAL, 0.50);
+        double mergedSeed = merged.severityFor(ScoreSampler.Dim.VISUAL, 0.50);
+        assertTrue(mergedSeed > weakSeed && mergedSeed < strongSeed,
+                "expected the median seed between the two pages, got " + mergedSeed
+                        + " not in (" + weakSeed + ", " + strongSeed + ")");
+    }
+
+    @Test
+    void mergingTakesTheMedianSoOneOddPageCannotSwampTheSeed() {
+        // Three pages, one of which barely responds at all. A mean would be pulled
+        // most of the way to the odd page and produce a seed nothing benefits from.
+        double[] sev = {0, 1.0};
+        ScoreCalibration.Curve normal =
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.VISUAL, sev, new double[] {0.90, 0.50});
+        ScoreCalibration.Curve alsoNormal =
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.VISUAL, sev, new double[] {0.90, 0.50});
+        ScoreCalibration.Curve odd =
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.VISUAL, sev, new double[] {0.90, 0.10});
+
+        double merged = ScoreCalibration.Curve.merge(normal, alsoNormal, odd)
+                .responseAt(1.0);
+        assertEquals(0.50, merged, 1e-6, "the median of two normal pages and one odd one");
     }
 
     @Test

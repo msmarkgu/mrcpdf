@@ -512,5 +512,19 @@ public final class ScoreSampler {
             }
             return calibration;
         }
+
+        /**
+         * Installs a calibration built from several reference pages.
+         *
+         * <p>Preferred to {@link #calibrate} when the caller can see more than one
+         * page, because a curve measured on one page is a single draw from how the
+         * corpus responds, and the sampler then has to spend attempts correcting
+         * for pages that are not that page.
+         */
+        public synchronized void calibrateFrom(java.util.List<ScoreCalibration.Calibration> parts) {
+            if (calibration == null && !parts.isEmpty()) {
+                calibration = ScoreCalibration.Calibration.merge(parts);
+            }
+        }
     }
 }
