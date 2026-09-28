@@ -124,6 +124,22 @@ public final class MrcReadiness {
      * directly, without synthesizing a page that happens to hit given values.
      */
     public static Breakdown aggregate(double sVisual, double sMask, double sOcr, double sBg) {
+        return aggregate(sVisual, sMask, sOcr, sBg, 0);
+    }
+
+    /**
+     * As {@link #aggregate(double, double, double, double)}, but with an explicit
+     * glyph-box count.
+     *
+     * <p>The four-sub-score form has no page behind it, so it reports zero boxes.
+     * That is fine for testing the aggregation algebra, but it makes the box count
+     * untestable in isolation, and the count gates {@code steerKappa} in
+     * {@code ScoreSampler} -- the safety that stops a page degraded past
+     * recognition from reporting a clean steering value.  So the count is
+     * overridable here rather than left to a synthetic raster.
+     */
+    public static Breakdown aggregate(double sVisual, double sMask, double sOcr, double sBg,
+                                      int glyphBoxes) {
         double v = clamp01(sVisual), k = clamp01(sMask);
         double o = clamp01(sOcr), b = clamp01(sBg);
 
@@ -134,7 +150,7 @@ public final class MrcReadiness {
         double kappa = Math.min(Math.min(v, k), Math.min(o, b));
         double bottleneck = bottleneck(kappa);
         return new Breakdown(v, v, v, v, k, k, k, k, o, o, o, o, o, b, b, b,
-                rGeom, kappa, bottleneck, clamp01(rGeom * bottleneck), 0);
+                rGeom, kappa, bottleneck, clamp01(rGeom * bottleneck), glyphBoxes);
     }
 
     /** The OCR sub-score implied by a set of word confidences. */
