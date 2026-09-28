@@ -381,12 +381,39 @@ public final class RealTrainDump {
         return dims.toArray(new ScoreSampler.Dim[0]);
     }
 
-    /**
     /** Every indexed row, shard order, for sampling references across the corpus. */
     private static List<IndexRow> allIndexRows(List<List<IndexRow>> shards) {
         List<IndexRow> all = new ArrayList<>();
         for (List<IndexRow> shard : shards) all.addAll(shard);
         return all;
+    }
+
+    /**
+     * Measures a variant, retrying a transient OCR failure.
+     *
+     * <p>This is the site the 500-row run actually died on, 90 minutes in, which
+     * discarded four workers' completed pages along with the one that failed.
+     * Measuring the same pixels again is idempotent, so unlike the steered path
+     * there is nothing to redraw -- a timeout here is Tesseract declining a
+     * particular raster, and it frequently accepts the identical one on a retry
+     * once the machine is less loaded. Bounded, and the cause propagates after.
+     */
+    private static ReadabilityOcr.Result measureWithRetry(BufferedImage img, List<TextBlock> blocks,
+                                                          String label, int variant)
+            throws IOException {
+        IOException last = null;
+        for (int attempt = 1; attempt <= OCR_ATTEMPTS; attempt++) {
+            try {
+                return ReadabilityOcr.measureWithWords(img, blocks);
+            } catch (IOException e) {
+                last = e;
+                System.err.printf(Locale.ROOT,
+                        "warning: OCR failed on %s variant %d, attempt %d/%d (%s: %s)%n",
+                        label, variant, attempt, OCR_ATTEMPTS,
+                        e.getClass().getSimpleName(), e.getMessage());
+            }
+        }
+        throw last;
     }
 
     /**
@@ -552,7 +579,7 @@ public final class RealTrainDump {
                             jpeg = JpegCodec.prepare(
                                     var.image(), SyntheticCorpus.LABEL_JPEG_QUALITY);
                             finalImg = jpeg.decoded();
-                            ocr = ReadabilityOcr.measureWithWords(finalImg, page.blocks());
+                            ocr = measureWithRetry(finalImg, page.blocks(), page.label(), v);
                             // measure() then score() rather than compute(), so the
                             // raw measurements survive for the map; the pair is
                             // exactly what compute() does internally.
@@ -853,6 +880,9 @@ public final class RealTrainDump {
      * costs 3x a single probe on a run that renders hundreds of pages.
      */
     private static final int DEFAULT_CALIB_PAGES = 3;
+
+    /** Retries for a transient OCR failure on a single variant. */
+    private static final int OCR_ATTEMPTS = 3;
 
     private static void writeShardRows(Path path, List<Row14> rows) throws IOException {
         StringBuilder sb = new StringBuilder();

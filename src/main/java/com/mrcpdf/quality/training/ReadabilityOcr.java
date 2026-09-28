@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 import javax.imageio.ImageIO;
 
@@ -38,6 +39,19 @@ public final class ReadabilityOcr {
      * the budget is generous and the call is retried once.
      */
     private static final long TIMEOUT_MS = Long.getLong("mrc.ocr.timeoutMs", 300_000L);
+
+    /**
+     * Tesseract is built on OpenMP and defaults to one thread per core.
+     *
+     * <p>Left alone, each worker spawns a full-width OpenMP pool, so five workers
+     * ask for forty threads on eight cores. The pages do not get slower by the
+     * amount the arithmetic suggests -- they get much slower, because the
+     * schedulers thrash, and a page that takes 35s alone was observed exceeding
+     * the 300s timeout under that load. Parallelism here comes from running
+     * several pages at once, which is what the worker pool already does, so
+     * Tesseract is pinned to one thread and the cores are shared predictably.
+     */
+    private static final Map<String, String> TESSERACT_ENV = Map.of("OMP_THREAD_LIMIT", "1");
     private static final int OCR_ATTEMPTS = 2;
     private static Boolean available;
 
@@ -190,7 +204,7 @@ public final class ReadabilityOcr {
                     SubprocessRunner.Result r = SubprocessRunner.run(new File(TESSERACT),
                             List.of(tmp.getAbsolutePath(), "stdout", config,
                                     "-l", "eng", "--psm", "6"),
-                            TIMEOUT_MS);
+                            TIMEOUT_MS, TESSERACT_ENV);
                     if (r.getExitCode() != 0) {
                         throw new IOException("tesseract failed (exit " + r.getExitCode()
                                 + "): " + r.getStderrString());

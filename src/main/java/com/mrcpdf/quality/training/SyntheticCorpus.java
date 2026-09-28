@@ -338,7 +338,7 @@ public final class SyntheticCorpus {
             java.util.Random steerRng = new java.util.Random(pageSeed ^ STEER_SALT);
 
             if (steer == null || !steer.enabled()) {
-                out.add(unsteered(page, rng));
+                out.add(unsteeredContained(page, rng, page.label(), out.size()));
                 continue;
             }
 
@@ -379,7 +379,7 @@ public final class SyntheticCorpus {
                         "warning: steering failed on page %d of %s (%s: %s); "
                                 + "falling back to an unsteered row%n",
                         out.size(), page.label(), e.getClass().getSimpleName(), e.getMessage());
-                out.add(unsteered(page, rng));
+                out.add(unsteeredContained(page, rng, page.label(), out.size()));
             }
         }
         return out;
@@ -391,6 +391,37 @@ public final class SyntheticCorpus {
      * that is not.
      */
     private static final int MAX_STEER_FALLBACKS = 5;
+
+    /**
+     * The unsteered draw, surviving an OCR failure by redrawing the degradation.
+     *
+     * <p>Needed as much as the steered path's containment: the first version of
+     * that guard wrapped only the steering branch, and the 500-row run then died
+     * 90 minutes in on a timeout from the <em>unsteered</em> branch, throwing away
+     * every page the other four workers had finished. A failure on a page with no
+     * steering to fall back to is still recoverable -- redrawing the tier gives a
+     * different raster, and a page that times out is far more often a raster
+     * Tesseract dislikes than a page that is unreadable.
+     *
+     * <p>Bounded, and the cause propagates once exhausted: past that point the
+     * problem is not this page.
+     */
+    private static Variant unsteeredContained(Page page, java.util.Random rng, String label,
+                                              int index) throws IOException {
+        IOException last = null;
+        for (int attempt = 1; attempt <= MAX_STEER_FALLBACKS; attempt++) {
+            try {
+                return unsteered(page, rng);
+            } catch (IOException e) {
+                last = e;
+                System.err.printf(java.util.Locale.ROOT,
+                        "warning: OCR failed on %s row %d, draw %d/%d (%s: %s)%n",
+                        label, index, attempt, MAX_STEER_FALLBACKS,
+                        e.getClass().getSimpleName(), e.getMessage());
+            }
+        }
+        throw last;
+    }
 
     /**
      * Probes a reference page's steering curves without installing them.
