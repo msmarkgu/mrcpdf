@@ -404,13 +404,25 @@ public final class FeatureExtractor {
     // scorer and extractor stay independent.
     // ──────────────────────────────────────────────────────────────────────
 
-    private static double strokeWidthEstimate(boolean[] fg, int bw, int bh, int[] local) {
+    /**
+     * Median stroke width of a binarized word patch, or 0 when the patch holds no
+     * ink.  Package-private so {@link MrcReadiness} can measure the same
+     * quantity the {@code strokeWidthCV} feature uses.
+     */
+    static double strokeWidthEstimate(boolean[] fg, int bw, int bh, int[] local) {
         int n = bw * bh;
         int INF = 1 << 29;
         int[] d = new int[n];
         Arrays.fill(d, INF);
+        // Seed on the BACKGROUND and read the result back at the FOREGROUND.
+        // Each ink pixel's distance to the nearest background pixel is that
+        // pixel's local half-stroke, so a high percentile over ink tracks stroke
+        // width.  Seeding and reading the same set instead (the previous code)
+        // makes every sampled distance identically 0, so this always returned 0,
+        // which in turn made extractText() always return null and silently
+        // dropped the 3 text features from every corpus built so far.
         for (int i = 0; i < n; i++) {
-            if (fg[i]) d[i] = 0;
+            if (!fg[i]) d[i] = 0;
         }
         for (int y = 0; y < bh; y++) {
             int row = y * bw;
@@ -441,7 +453,7 @@ public final class FeatureExtractor {
         double[] dists = new double[fg.length];
         int count = 0;
         for (int i = 0; i < fg.length; i++) {
-            if (fg[i] && d[i] < INF) dists[count++] = d[i];
+            if (fg[i] && d[i] < INF && d[i] > 0) dists[count++] = d[i];
         }
         if (count == 0) return 0;
         Arrays.sort(dists, 0, count);
@@ -544,7 +556,12 @@ public final class FeatureExtractor {
         return sorted[lo] * (1 - frac) + sorted[hi] * frac;
     }
 
-    private static double cvOfList(List<Double> values) {
+    /**
+     * Coefficient of variation of a sample.  Package-private so
+     * {@link MrcReadiness} scores stroke-width consistency the same way the
+     * {@code strokeWidthCV} feature does.
+     */
+    static double cvOfList(List<Double> values) {
         double mean = 0;
         for (double v : values) mean += v;
         mean /= values.size();

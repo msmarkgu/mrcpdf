@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.awt.Color;
 import java.awt.Font;
 import java.awt.Graphics2D;
+import java.awt.FontMetrics;
+import java.awt.Rectangle;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.awt.image.ConvolveOp;
@@ -12,6 +14,10 @@ import java.awt.image.Kernel;
 
 import org.junit.jupiter.api.Test;
 
+import com.mrcpdf.model.TextBlock;
+import com.mrcpdf.util.ImageOps;
+
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -107,5 +113,76 @@ class FeatureExtractorTest {
         assertTrue(f[9] >= 0, "snr is log1p so non-negative");
         assertTrue(f[10] >= 0 && f[10] <= 1, "inkCoverage is a fraction");
         assertTrue(f[7] >= 0, "bgUniformity non-negative");
+    }
+
+    /**
+     * Regression: {@code strokeWidthEstimate} used to seed its distance transform
+     * on the foreground and then read the result back at foreground pixels, so
+     * every sampled distance was 0, the stroke width was always 0, and
+     * {@code extractText} always returned null.  The 3 conditional text features
+     * were therefore dead in every corpus built before the fix, and the
+     * text-layer rows silently fell back to the 11 image features.
+     */
+    @Test
+    void extractTextReturnsThreeValuesForRealGlyphBoxes() {
+        BufferedImage img = cleanImage();
+        int[] gray = ImageOps.toGrayscale(img);
+        float[] mag = FeatureExtractor.gradientMagnitudes(gray, W, H);
+
+        List<TextBlock> blocks = new ArrayList<>();
+        FontMetrics fm = img.createGraphics().getFontMetrics(new Font("SansSerif", Font.PLAIN, 28));
+        for (int i = 0; i < WORDS.length; i++) {
+            int x = 40;
+            int y = BASELINE_Y[i] - fm.getAscent();
+            blocks.add(new TextBlock(WORDS[i],
+                    new Rectangle(x, y, fm.stringWidth(WORDS[i]), fm.getHeight()),
+                    90.0));
+        }
+
+        double[] text = FeatureExtractor.extractText(gray, mag, W, H, blocks);
+        assertNotNull(text, "extractText must not return null for real glyph boxes");
+        assertEquals(3, text.length);
+        for (int i = 0; i < text.length; i++) {
+            assertTrue(Double.isFinite(text[i]), "text feature must be finite: " + text[i]);
+            assertTrue(text[i] >= 0, "text feature must be non-negative: " + text[i]);
+        }
+        // strokeWidthCV is a coefficient of variation, so it is scale-invariant
+        // and legitimately 0 when every glyph is identical; what must not happen
+        // is extractText bailing out and handing back fewer than 3 features.
+        assertEquals(FeatureExtractor.TEXT_FEATURE_NAMES.length, text.length);
+    }
+
+    /**
+     * edgeAlign measures edge energy leaking outside the glyph boxes, so shifting
+     * the boxes off the ink must push it up.  This also proves the boxes are
+     * really being used.
+     */
+    @Test
+    void edgeAlignRisesWhenGlyphBoxesAreMisaligned() {
+        BufferedImage img = cleanImage();
+        int[] gray = ImageOps.toGrayscale(img);
+        float[] mag = FeatureExtractor.gradientMagnitudes(gray, W, H);
+        Font font = new Font("SansSerif", Font.PLAIN, 28);
+        FontMetrics fm = img.createGraphics().getFontMetrics(font);
+
+        List<TextBlock> aligned = new ArrayList<>();
+        List<TextBlock> shifted = new ArrayList<>();
+        for (int i = 0; i < WORDS.length; i++) {
+            int x = 40;
+            int y = BASELINE_Y[i] - fm.getAscent();
+            int wBox = fm.stringWidth(WORDS[i]);
+            int hBox = fm.getHeight();
+            aligned.add(new TextBlock(WORDS[i], new Rectangle(x, y, wBox, hBox), 90.0));
+            shifted.add(new TextBlock(WORDS[i], new Rectangle(x + 14, y + 7, wBox, hBox), 90.0));
+        }
+
+        double[] a = FeatureExtractor.extractText(gray, mag, W, H, aligned);
+        double[] s = FeatureExtractor.extractText(gray, mag, W, H, shifted);
+        assertNotNull(a);
+        assertNotNull(s);
+        int edgeAlignIdx = 2;
+        assertTrue(s[edgeAlignIdx] > a[edgeAlignIdx],
+                "edgeAlign should rise with misalignment: aligned=" + a[edgeAlignIdx]
+                        + " shifted=" + s[edgeAlignIdx]);
     }
 }
