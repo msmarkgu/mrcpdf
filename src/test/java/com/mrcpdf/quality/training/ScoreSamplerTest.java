@@ -384,8 +384,7 @@ class ScoreSamplerTest {
 
         assertTrue(h.ok(), "misses alone should not fail the histogram: " + h.problems());
         assertEquals(expectedMisses, h.misses());
-        assertEquals(133, h.misses(), "fixture sanity: the 0.20-0.30 band is 13.3% of the range");
-        assertEquals(133 / 1000.0, h.missRate(), 1e-9);
+        assertEquals(expectedMisses / (double) rows, h.missRate(), 1e-9);
     }
 
     @Test

@@ -40,8 +40,25 @@ public final class ScoreSampler {
 
     /** Bottom of the target marginal. Below this a page is destroyed, not merely bad. */
     public static final double DEFAULT_LO = 0.20;
-    /** Top of the target marginal. A clean page scores near 1.0, so 0.95 fills the bin. */
-    public static final double DEFAULT_HI = 0.95;
+    /**
+     * Top of the target marginal, set by what the generator can actually deliver.
+     *
+     * <p>This was 0.95, on the reasoning that a clean page scores near 1.0 so the
+     * top bin would be fillable. Measured on a 10-base-page slice, no degraded page
+     * exceeded 0.807: targets of 0.83, 0.83, 0.85 and 0.90 all landed between 0.72
+     * and 0.76 and were recorded as misses. The realism texture -- motion blur, JPEG
+     * quantization, skew, curl -- is applied to every degraded page on purpose, and
+     * it puts a ceiling under how clean one can measure. Asking for a 0.90 degraded
+     * page is not a hard target, it is a spec the simulator cannot meet, and it
+     * spent a fifth of the attempt budget proving it.
+     *
+     * <p>The pristine end of the range is not a gap: the clean variant of every base
+     * page measures around 0.90, which is what that end of the corpus is for.
+     *
+     * <p>Overridable with {@code --steer-hi} for anyone deliberately asking for
+     * out-of-range targets and willing to take the misses.
+     */
+    public static final double DEFAULT_HI = 0.80;
     /** Accept a page whose measured steering value lands this close to the target. */
     public static final double DEFAULT_TOLERANCE = 0.05;
     /**

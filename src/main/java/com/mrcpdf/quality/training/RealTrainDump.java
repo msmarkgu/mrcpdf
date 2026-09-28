@@ -425,6 +425,10 @@ public final class RealTrainDump {
      * it -- which costs attempts and, where a target sits near that page's own
      * ceiling, leaves the marginal unreachable. A handful of references merged is
      * the same cost order as the one probe it replaces.
+     *
+     * <p>The probes run concurrently. Each is a full OCR pass per severity step, so
+     * serially this is minutes of the run spent before any page is built, and the
+     * references are independent.
      */
     private static void primeCalibration(List<IndexRow> all, Path review, Path bases, long seed,
                                          ScoreSampler.Steering steering, int steps, int probes)
@@ -432,28 +436,39 @@ public final class RealTrainDump {
         if (!steering.enabled() || probes <= 0) return;
         if (all.size() <= probes) probes = all.size();
 
-        List<ScoreCalibration.Calibration> parts = new ArrayList<>();
-        try (PDDocument reviewDoc = Loader.loadPDF(review.toFile())) {
-            PDDocument src = null;
-            String openFile = null;
-            try {
-                for (int k = 0; k < probes; k++) {
-                    // Evenly spaced, so the sample spans the corpus rather than
-                    // clustering in whichever files sort first.
-                    IndexRow ir = all.get((int) Math.round((double) k * (all.size() - 1) / (probes - 1)));
-                    if (!ir.baseFile().equals(openFile)) {
-                        if (src != null) src.close();
-                        src = Loader.loadPDF(bases.resolve(ir.baseFile()).toFile());
-                        openFile = ir.baseFile();
-                    }
+        // Evenly spaced, so the sample spans the corpus rather than clustering in
+        // whichever files sort first.
+        List<IndexRow> refs = new ArrayList<>();
+        for (int k = 0; k < probes; k++) {
+            refs.add(all.get((int) Math.round((double) k * (all.size() - 1) / (probes - 1))));
+        }
+
+        ExecutorService pool = Executors.newFixedThreadPool(refs.size());
+        List<Future<ScoreCalibration.Calibration>> futures = new ArrayList<>();
+        for (IndexRow ir : refs) {
+            futures.add(pool.submit(() -> {
+                try (PDDocument reviewDoc = Loader.loadPDF(review.toFile());
+                     PDDocument src = Loader.loadPDF(bases.resolve(ir.baseFile()).toFile())) {
                     SyntheticCorpus.Page page = loadPage(ir, src, reviewDoc, seed);
-                    long pageSeed = SyntheticCorpus.basePageSeed(seed, ir.outPage());
-                    parts.add(SyntheticCorpus.probeCalibration(page, pageSeed, steps));
-                    System.out.printf("  calibration probe %d/%d: review page %d%n",
-                            k + 1, probes, ir.outPage());
+                    return SyntheticCorpus.probeCalibration(page,
+                            SyntheticCorpus.basePageSeed(seed, ir.outPage()), steps);
                 }
-            } finally {
-                if (src != null) src.close();
+            }));
+        }
+        pool.shutdown();
+
+        List<ScoreCalibration.Calibration> parts = new ArrayList<>();
+        for (int k = 0; k < futures.size(); k++) {
+            try {
+                parts.add(futures.get(k).get());
+                System.out.printf("  calibration probe %d/%d: review page %d%n",
+                        k + 1, futures.size(), refs.get(k).outPage());
+            } catch (Exception e) {
+                pool.shutdownNow();
+                // Better to refuse to start than to run 4 hours on curves from a
+                // partial sample that may be missing half the corpus's range.
+                throw new IOException("steering calibration probe failed for review page "
+                        + refs.get(k).outPage(), e);
             }
         }
         steering.calibrateFrom(parts);
