@@ -377,6 +377,18 @@ tasks.register<JavaExec>("calibrateMrc") {
 // of which would be circular.  Measured OCR word-multiset F1 is recorded
 // alongside as auditWordF1 for validation, but does not define the label.
 // Long: ~1.5-2 h with --workers 3.
+// Re-runs the steering histogram QA against a map that already exists, so a
+// change to the check itself can be validated without paying for a regeneration.
+tasks.register<JavaExec>("checkRealCorpus") {
+    dependsOn("classes")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.CorpusQa")
+    val defaults = listOf("--map", "build/real-train-map.csv",
+        "--steer-lo", "0.20", "--steer-hi", "0.80",
+        "--fill-lo", "0.11", "--fill-hi", "0.844")
+    setArgs((findProperty("corpusQaArgs") as String?)?.split(" ") ?: defaults)
+}
+
 tasks.register<JavaExec>("dumpRealTrain") {
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass.set("com.mrcpdf.quality.training.RealTrainDump")

@@ -365,26 +365,68 @@ class ScoreSamplerTest {
     }
 
     @Test
-    void histogramCountsMissesSeparatelyFromEmptyBins() {
-        // An unreachable target is not a distribution failure, and conflating the
-        // two would send a reader looking for a class-mix bug that isn't there. The
-        // miss band is the bottom of the marginal, which is the realistic case: a
-        // dimension whose measured floor sits above the low end of the range.
+    void missesAreExcludedFromTheBinsAndGatedByRateInstead() {
+        // A miss is a page the generator could not place, and the marginal asks
+        // for targets it cannot reach. Folding those rows into the distribution
+        // would demand a uniformity the design cannot deliver -- the same
+        // unsatisfiable demand as requiring a bin no dimension can fill. So they
+        // are counted, gated, and reported, and the bins describe the rows that
+        // did land.
         int rows = 1000;
-        double lo = ScoreSampler.DEFAULT_LO, hi = ScoreSampler.DEFAULT_HI;
-        int expectedMisses = 0;
+        double lo = 0.20, hi = 0.80;
         List<ScoreSampler.Sample> xs = new ArrayList<>();
+        int expectedMisses = 0;
         for (int i = 0; i < rows; i++) {
             double t = lo + (hi - lo) * (i + 0.5) / rows;
-            boolean reachable = t >= 0.30;
+            // 10% miss, spread evenly so no single bin is distorted.
+            boolean reachable = i % 10 != 0;
             if (!reachable) expectedMisses++;
             xs.add(fake(t, t, reachable));
         }
         ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, lo, hi);
 
-        assertTrue(h.ok(), "misses alone should not fail the histogram: " + h.problems());
+        assertTrue(h.ok(), "a 10% miss rate should pass: " + h.problems());
         assertEquals(expectedMisses, h.misses());
         assertEquals(expectedMisses / (double) rows, h.missRate(), 1e-9);
+        assertTrue(h.notes().stream().anyMatch(n -> n.contains("remaining 900")),
+                "the note should say what the uniformity check actually judged: " + h.notes());
+    }
+
+    @Test
+    void tooManyMissesFailsEvenWhenTheConvergedRowsLookPerfect() {
+        // The gate is what keeps excluding misses honest. Without it, dropping
+        // every miss would produce a flawless-looking distribution from a corpus
+        // the generator could not actually build.
+        int rows = 1000;
+        double lo = 0.20, hi = 0.80;
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < rows; i++) {
+            double t = lo + (hi - lo) * (i + 0.5) / rows;
+            xs.add(fake(t, t, i % 10 >= 5));   // 50% miss
+        }
+        ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, lo, hi);
+
+        assertFalse(h.ok());
+        assertTrue(h.problems().stream().anyMatch(p -> p.contains("miss rate")),
+                "expected a miss-rate problem, got " + h.problems());
+    }
+
+    @Test
+    void aLopsidedRunOfMissesStillFailsTheBinCheck() {
+        // Excluding misses must not become a way to empty a bin. Here the misses
+        // are all in the bottom band, so excluding them leaves that bin empty even
+        // though the overall rate is under the gate.
+        int rows = 1000;
+        double lo = 0.20, hi = 0.80;
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < rows; i++) {
+            double t = lo + (hi - lo) * (i + 0.5) / rows;
+            xs.add(fake(t, t, t >= 0.30));
+        }
+        ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, lo, hi);
+
+        assertTrue(h.problems().stream().anyMatch(p -> p.contains("0.20-0.26")),
+                "the emptied bin should still be reported, got " + h.problems());
     }
 
     @Test
@@ -442,7 +484,10 @@ class ScoreSamplerTest {
             xs.add(fake(t, t, true));
         }
         ScoreCalibration.Histogram h = ScoreCalibration.histogram(xs, 10, 0.20, 0.95);
-        assertTrue(h.notes().isEmpty(), "300 rows is enough to judge: " + h.notes());
+        // The note about what the check judged is always present now; what this
+        // test cares about is that the run is not excused for lack of power.
+        assertTrue(h.notes().stream().noneMatch(n -> n.contains("no power")),
+                "300 rows is enough to judge: " + h.notes());
         assertTrue(h.problems().stream().anyMatch(p -> p.contains("0.58-0.65")),
                 "the hole should be reported, got " + h.problems());
     }

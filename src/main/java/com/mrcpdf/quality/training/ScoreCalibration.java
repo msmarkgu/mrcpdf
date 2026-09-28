@@ -39,6 +39,19 @@ public final class ScoreCalibration {
      * makes any per-bin rule either fail a good corpus or pass a bad one.
      */
     public static final int MIN_QA_ROWS = 100;
+
+    /**
+     * Share of steered rows allowed to miss their target.
+     *
+     * <p>Misses are a recorded outcome, not a silent one: an unreachable target
+     * still yields a page, flagged, and the map carries it. What matters is that
+     * they stay rare enough that the corpus is still mostly where the marginal
+     * asked. Measured 22% on the 375-row corpus, rising with the target because
+     * the response flattens near its ceiling, so the ceiling is set well above
+     * the observed rate -- a regression that doubles it should fail, and a run
+     * that cannot hit two thirds of its targets should too.
+     */
+    public static final double MAX_MISS_RATE = 0.35;
     /** Largest mean |achieved - target| inside a bin that still passes QA. */
     public static final double MAX_TARGET_ERROR = 0.06;
 
@@ -490,16 +503,28 @@ public final class ScoreCalibration {
         int[] steerCounts = new int[n];
         int[] classCounts = new int[3];
         int misses = 0;
+        int converged = 0;
         double worst = 0.0;
         List<String> notes = new ArrayList<>();
 
         for (ScoreSampler.SteeringRow s : rows) {
-            int b = bin(s.steer(), lo, hi, n);
-            if (b >= 0) steerCounts[b]++;
             int c = s.cls();
             classCounts[c >= 0 && c < 3 ? c : 2]++;
-            if (!s.onTarget()) misses++;
             worst = Math.max(worst, Math.abs(s.steer() - s.target()));
+            if (!s.onTarget()) {
+                misses++;
+            } else {
+                // Uniformity is judged on the rows that landed where they were
+                // asked to. A miss is a page the generator could not place, and it
+                // is already counted, gated and reported in its own right; folding
+                // it into the distribution as though it were a placement would ask
+                // the marginal to be uniform over targets the generator cannot
+                // reach, which is the same unsatisfiable demand as requiring a bin
+                // no dimension can fill.
+                int b = bin(s.steer(), lo, hi, n);
+                if (b >= 0) steerCounts[b]++;
+                converged++;
+            }
         }
         int samples = rows.size();
 
@@ -512,15 +537,25 @@ public final class ScoreCalibration {
             // alone -- so report the sample as too small to judge rather than
             // failing a corpus that may well be fine, and rather than passing it
             // because the noise happened to land favourably.
-            boolean powered = samples >= MIN_QA_ROWS;
+            double missRate = (double) misses / samples;
+            if (missRate > MAX_MISS_RATE) {
+                problems.add(String.format(
+                        Locale.ROOT, "miss rate %.3f exceeds %.3f: the marginal asks for targets "
+                                + "the generator cannot reach", missRate, MAX_MISS_RATE));
+            }
+            notes.add(String.format(Locale.ROOT,
+                    "%d of %d rows missed their target (%.1f%%); uniformity judged on the "
+                            + "remaining %d", misses, samples, 100 * missRate, converged));
+
+            boolean powered = converged >= MIN_QA_ROWS;
             if (!powered) {
                 notes.add(String.format(
                         Locale.ROOT,
-                        "only %d steered rows: a %d-bin uniformity check has no power at this "
+                        "only %d converged rows: a %d-bin uniformity check has no power at this "
                                 + "size (needs %d); bin occupancy was not enforced",
-                        samples, n, MIN_QA_ROWS));
+                        converged, n, MIN_QA_ROWS));
             }
-            double expected = (double) samples / n;
+            double expected = (double) converged / n;
             // Three sigma below the expected count.  A floor of a fixed fraction of
             // the rows would be wrong: requiring every bin to hold at least the
             // mean is unsatisfiable, because half of a uniform sample's bins are
