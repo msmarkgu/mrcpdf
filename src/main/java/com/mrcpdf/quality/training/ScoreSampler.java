@@ -69,6 +69,9 @@ public final class ScoreSampler {
     public static final int DEFAULT_MAX_ATTEMPTS = 6;
     /** Proportional step floor, so a severity near 0 still moves and one near 1 still resolves. */
     static final double MIN_STEP = 0.08;
+    /** Ceiling on the score-space minimum step, so a near-flat response cannot ask
+     *  for a severity jump across the whole range. */
+    static final double MAX_STEP = 0.5;
     static final double STEP_GAIN = 0.5;
 
     private final double tolerance;
@@ -384,6 +387,19 @@ public final class ScoreSampler {
         Sample best = null;
         int made = 0;
 
+        // A bracket in severity, and the last two measurements for a secant step.
+        //
+        // The response is monotone -- more severity, lower score -- so the target
+        // is a root find and not a search. The rule this replaces took a step
+        // proportional to severity, which cannot see how far off the page is: off
+        // by 0.4 and off by 0.02 moved the same distance, and near a high-severity
+        // target the step stayed around 0.45, so the page oscillated across the
+        // target instead of settling on it. On the 375-row corpus that showed up
+        // as a flat tail of pages exhausting all six attempts, 25% of them, and as
+        // a top bin holding 16 rows where 20 were required.
+        double lo = -1.0, hi = 2.0;
+        double lastSev = Double.NaN, lastSteer = Double.NaN;
+
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             ScannerProfile profile = profileFor(aimed, severity, tex);
             Rendered r = render.render(profile, rng);
@@ -413,6 +429,13 @@ public final class ScoreSampler {
             if (binding != aimed) {
                 aimed = binding;
                 severity = cal == null ? severity : cal.severityFor(aimed, target01);
+                // The bracket was measured through a different dimension's drivers,
+                // so it says nothing about this one. Carrying it over would pin the
+                // search into a range the new dimension may not even reach.
+                lo = -1.0;
+                hi = 2.0;
+                lastSev = Double.NaN;
+                lastSteer = Double.NaN;
                 continue;
             }
 
@@ -421,8 +444,67 @@ public final class ScoreSampler {
             // means it needs less.  Note this is the opposite sense to `steer`
             // alone when the aimed dimension is not binding -- which is why the
             // re-aim above has to `continue` rather than fall through to here.
-            double step = Math.max(MIN_STEP, STEP_GAIN * severity);
-            severity = clamp01(steer > target01 ? severity + step : severity - step);
+            boolean tooClean = steer > target01;
+            if (tooClean) lo = Math.max(lo, severity);
+            else hi = Math.min(hi, severity);
+
+            // The response's slope in score-per-severity, from the last two
+            // measurements. Everything below is expressed through it, because the
+            // target and the tolerance both live in score space while severity is
+            // only the parameter we actually control.
+            double slope = Double.isNaN(lastSev)
+                    ? Double.NaN
+                    : (steer - lastSteer) / (severity - lastSev);
+            boolean haveSlope = Double.isFinite(slope) && slope != 0.0;
+
+            double next;
+            if (haveSlope) {
+                // Secant through the last two measurements. Monotone responses make
+                // this the cheap way to close in, and it is the step that actually
+                // scales with the error.
+                next = severity + (target01 - steer) / slope;
+            } else {
+                // No slope yet: step in the only direction that can help, and take
+                // the table's own gain so the first move matches what the
+                // calibration would have suggested.
+                next = tooClean
+                        ? severity + Math.max(MIN_STEP, STEP_GAIN * severity)
+                        : severity - Math.max(MIN_STEP, STEP_GAIN * severity);
+            }
+            if (!Double.isFinite(next)) {
+                next = severity + Math.signum(target01 - steer) * MIN_STEP;
+            }
+
+            // A secant can overshoot the bracket on a curved response, which would
+            // throw away a bound already paid for. Only clamp against an end we have
+            // actually measured: lo < 0 and hi > 1 are the "no bound yet" sentinels.
+            if (lo >= 0.0 && next <= lo) {
+                next = hi <= 1.0 ? lo + (hi - lo) / 2.0 : lo + MIN_STEP;
+            }
+            if (hi <= 1.0 && next >= hi) {
+                next = lo >= 0.0 ? hi - (hi - lo) / 2.0 : hi - MIN_STEP;
+            }
+
+            // Never stand still, and never take a step too small to change the
+            // score by the tolerance -- a zero-width step would burn the whole
+            // attempt budget on one page instead of recording a miss.
+            //
+            // The floor is in score space, not severity space, and that distinction
+            // is the whole fix. A fixed 0.08 in severity is 0.16 in score on a
+            // response twice as steep as the identity, so it exceeds the tolerance
+            // in both directions and the loop oscillates between two points it can
+            // never land between. Converting the tolerance through the measured
+            // slope gives the smallest step still worth taking.
+            double minStep = haveSlope
+                    ? Math.min(MAX_STEP, tolerance / Math.abs(slope))
+                    : MIN_STEP;
+            if (Math.abs(next - severity) < minStep) {
+                next = severity + (tooClean ? minStep : -minStep);
+            }
+
+            lastSev = severity;
+            lastSteer = steer;
+            severity = clamp01(next);
         }
 
         return withAttempts(best, made);

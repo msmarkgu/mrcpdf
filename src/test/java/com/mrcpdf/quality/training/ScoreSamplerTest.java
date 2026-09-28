@@ -502,6 +502,86 @@ class ScoreSamplerTest {
     }
 
     @Test
+    void convergesInFewRendersWhenTheCalibrationIsFromADifferentPage() throws IOException {
+        // The 375-row corpus had 25% of pages exhaust all six attempts, which is
+        // most of the corpus's render budget spent walking to a target. The step
+        // rule was proportional to severity and could not see how far off the page
+        // was, so a page off by 0.4 and one off by 0.02 moved the same distance.
+        //
+        // The stub stands in for a page whose response differs from the
+        // calibration's -- a steeper curve than the table was built from, which is
+        // the normal case once the curves are merged across reference pages.
+        Stub stub = new Stub(sev -> Math.max(0.0, 1.0 - 1.8 * sev * sev - 0.4 * sev));
+        ScoreSampler sampler = new ScoreSampler(0.05, 6);
+
+        int renders = 0;
+        for (double target : new double[] {0.25, 0.40, 0.55, 0.70, 0.78}) {
+            ScoreSampler.Sample s =
+                    sampler.sample(stub, new Random(11), target, ScoreSampler.Dim.VISUAL, null);
+            assertTrue(s.onTarget(), "target " + target + " not reached, got " + s.steer());
+            assertTrue(s.attempts() < 6,
+                    "target " + target + " should not exhaust the budget, took " + s.attempts());
+            renders += s.attempts();
+        }
+        // Five targets against a six-render budget each. A rule keyed to severity
+        // spends most of that budget walking to the target.
+        assertTrue(renders <= 15, "expected ~3 renders per target, took " + renders);
+    }
+
+    @Test
+    void theStepRuleActuallyRespondsToTheSizeOfTheError() throws IOException {
+        // Same measured error, two different starting severities: a rule keyed to
+        // severity takes the same step for both, one keyed to the error does not.
+        // Here the page is far off the target, so the second move should be large
+        // in both cases and land close, rather than creeping in severity-sized hops.
+        Stub stub = new Stub(sev -> 1.0 - sev);
+        ScoreSampler.Sample s = new ScoreSampler(0.02, 8)
+                .sample(stub, new Random(5), 0.30, ScoreSampler.Dim.VISUAL, null);
+
+        assertTrue(s.onTarget(), "should converge, got " + s.steer());
+        assertTrue(s.attempts() <= 4, "a unit-slope response should need very few renders, took "
+                + s.attempts());
+    }
+
+    @Test
+    void anUnreachableTargetStillStopsAndIsRecordedRatherThanLooping() throws IOException {
+        // The step is bounded and the attempt budget is finite, so a target no
+        // severity can reach must return the best attempt and count as a miss.
+        Stub stub = new Stub(sev -> Math.max(0.0, 0.30 - sev));
+        ScoreSampler.Sample s = new ScoreSampler(0.05, 6)
+                .sample(stub, new Random(3), 0.95, ScoreSampler.Dim.VISUAL, null);
+
+        assertFalse(s.onTarget());
+        assertEquals(6, s.attempts(), "it should spend its budget and stop");
+        assertTrue(s.error() > 0.05);
+        assertNotNull(s.rendered(), "a miss is still a page, and the map needs it");
+    }
+
+    @Test
+    void reAimStartsAFreshBracketBecauseTheOldOneWasMeasuredOnAnotherDimension() throws IOException {
+        // After a re-aim the previous bracket was measured through a different
+        // dimension's drivers and says nothing about this one. Carrying it over
+        // can pin the search outside the range the new dimension reaches.
+        Stub stub = new Stub(sev -> {
+            double v = 1.0 - sev;
+            double k = Math.max(0.0, 1.0 - 1.6 * sev);
+            return Math.min(v, k);
+        });
+        ScoreSampler.Render render = (profile, rng) -> {
+            stub.renders++;
+            double sev = Math.max(severityOf(ScoreSampler.Dim.VISUAL, profile),
+                    severityOf(ScoreSampler.Dim.MASK, profile));
+            return render(page(1.0 - sev, Math.max(0.0, 1.0 - 1.6 * sev), 0.95));
+        };
+
+        ScoreSampler.Sample s = new ScoreSampler(0.05, 8).sample(
+                render, new Random(13), 0.60, ScoreSampler.Dim.VISUAL, null);
+
+        assertEquals(ScoreSampler.Dim.MASK, s.aimed());
+        assertTrue(s.onTarget(), "should still converge after re-aim, got " + s.steer());
+    }
+
+    @Test
     void histogramFailsOnAnEmptyCorpus() {
         ScoreCalibration.Histogram h =
                 ScoreCalibration.histogram(List.of(), 10, 0.20, 0.95);
