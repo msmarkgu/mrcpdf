@@ -4,7 +4,9 @@ import java.awt.image.BufferedImage;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -44,15 +46,20 @@ public final class ScoreCorrCheck {
         Path map = null;
         int dpi = 300;
         int minEvents = 165;
+        double steerLo = ScoreSampler.DEFAULT_LO;
+        double steerHi = ScoreSampler.DEFAULT_HI;
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--src" -> src = Path.of(args[++i]);
                 case "--map" -> map = Path.of(args[++i]);
                 case "--dpi" -> dpi = Integer.parseInt(args[++i]);
                 case "--min-events" -> minEvents = Integer.parseInt(args[++i]);
+                case "--steer-lo" -> steerLo = Double.parseDouble(args[++i]);
+                case "--steer-hi" -> steerHi = Double.parseDouble(args[++i]);
                 default -> {
                     System.err.println("Unknown arg: " + args[i]);
-                    System.err.println("Usage: ScoreCorrCheck --src <pdf> --map <csv> [--dpi 300] [--min-events 165]");
+                    System.err.println("Usage: ScoreCorrCheck --src <pdf> --map <csv> "
+                            + "[--dpi 300] [--min-events 165] [--steer-lo F] [--steer-hi F]");
                     return;
                 }
             }
@@ -130,6 +137,18 @@ public final class ScoreCorrCheck {
             System.out.printf(Locale.ROOT, "  %-6s n=%-4d mean_score=%-6.3f label1=%-4d%s%n",
                     slug, total, mean, ones, center);
         }
+        // A steered page's tier is the dimension it was attacked on, not a
+        // ScannerTier archetype, so the loop above prints nothing for it and its
+        // rows would otherwise be absent from the report without explanation.
+        // This is where they surface, with a count, so a steered corpus cannot be
+        // silently read as an unsteered one that simply lost rows.
+        List<String> otherTiers = unrecognizedTiers(tierHist);
+        if (!otherTiers.isEmpty()) {
+            System.out.printf(Locale.ROOT,
+                    "  (plus %d rows in %d non-archetype tier(s) -- a steered corpus: %s)%n",
+                    otherTiers.stream().mapToLong(k -> tierHist.get(k)[0]).sum(),
+                    otherTiers.size(), String.join(", ", otherTiers));
+        }
 
         // Feature correlations: score -> feature, expect the sign the gate
         // model uses (locked quality-model.json / QualityModelTest):
@@ -170,6 +189,37 @@ public final class ScoreCorrCheck {
             for (int f = 0; f < names.length; f++) sb.append(String.format(" %10.4f", sum[f] / cnt));
             System.out.printf("  %-6s%s%n", slug, sb);
         }
+        // Same reasoning as the stats table: a steered row's tier is a dimension,
+        // not an archetype, and its feature means are the evidence that steering
+        // moved the features in the direction the gate model reads them.
+        for (String slug : otherTiers) {
+            int cnt = 0;
+            double[] sum = new double[names.length];
+            for (int i = 0; i < n; i++) {
+                if (meta.get(i + 1)[2].equals(slug)) {
+                    cnt++;
+                    for (int f = 0; f < names.length; f++) sum[f] += features[i][f];
+                }
+            }
+            if (cnt == 0) continue;
+            StringBuilder sb = new StringBuilder();
+            for (int f = 0; f < names.length; f++) sb.append(String.format(" %10.4f", sum[f] / cnt));
+            System.out.printf(Locale.ROOT, "  %-6s%s%n", slug, sb);
+        }
+
+        // The steering histogram, when the map carries steering columns. This is
+        // the check the whole sampler exists to satisfy: that the corpus fills
+        // the target range instead of piling up at the tails.
+        List<ScoreSampler.SteeringRow> steered = readSteerRows(map);
+        if (!steered.isEmpty()) {
+            ScoreCalibration.Histogram hist =
+                    ScoreCalibration.histogram(steered, 10, steerLo, steerHi);
+            hist.print();
+            if (!hist.ok()) {
+                System.out.println("Steering QA FAILED -- the corpus does not fill the target "
+                        + "marginal; see the empty bins above.");
+            }
+        }
 
         // Score monotonicity vs label as a sanity floor.
         double label0 = meanOf(scoreOrder, labelOrder, 0);
@@ -185,16 +235,114 @@ public final class ScoreCorrCheck {
         }
     }
 
+    /**
+     * Reads the variant map, resolving columns by name.
+     *
+     * <p>This used to be {@code split(",", 6)}, which parses correctly only for
+     * exactly the six columns the map had when it was written.  The limit makes
+     * the sixth field "the rest of the line", so the first trailing column anyone
+     * added would have been glued onto the end of the score -- and the score is
+     * parsed with {@code Double.parseDouble}, so the failure surfaces as a
+     * {@code NumberFormatException} in a place with nothing to do with schemas.
+     * Resolving by name means the next five columns cost nothing.
+     */
     private static Map<Integer, String[]> readMap(Path map) throws Exception {
         Map<Integer, String[]> out = new LinkedHashMap<>();
-        for (String line : Files.readAllLines(map, StandardCharsets.US_ASCII)) {
-            if (line.isBlank() || line.startsWith("page,")) continue;
-            String[] c = line.split(",", 6);
-            if (c.length < 6) throw new IllegalArgumentException("Bad map row: " + line);
-            out.put(Integer.parseInt(c[0]),
-                    new String[]{c[3], c[5], c[4]});
+        List<String> lines = Files.readAllLines(map, StandardCharsets.US_ASCII);
+        int pageCol = -1, labelCol = -1, scoreCol = -1, tierCol = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line.isBlank()) continue;
+            if (i == 0 || pageCol < 0) {
+                String[] h = line.split(",", -1);
+                pageCol = column(h, "page", i, line);
+                labelCol = column(h, "label", i, line);
+                scoreCol = column(h, "score", i, line);
+                tierCol = column(h, "tier", i, line);
+                continue;
+            }
+            String[] c = line.split(",", -1);
+            if (c.length <= Math.max(Math.max(pageCol, labelCol), Math.max(scoreCol, tierCol))) {
+                throw new IllegalArgumentException("Bad map row: " + line);
+            }
+            out.put(Integer.parseInt(c[pageCol]),
+                    new String[]{c[labelCol], c[scoreCol], c[tierCol]});
         }
         return out;
+    }
+
+    private static int column(String[] header, String name, int line, String text) {
+        for (int i = 0; i < header.length; i++) {
+            if (header[i].trim().equals(name)) return i;
+        }
+        throw new IllegalArgumentException("Map is missing a '" + name + "' column: " + text);
+    }
+
+    /**
+     * Tier keys in the map that are not {@link ScannerTier} archetypes.
+     *
+     * <p>Expected to be empty for an unsteered corpus, non-empty for a steered
+     * one, where the tier records the degradation dimension instead.
+     */
+    private static List<String> unrecognizedTiers(Map<String, long[]> tierHist) {
+        List<String> out = new ArrayList<>();
+        for (String k : tierHist.keySet()) {
+            boolean known = false;
+            for (ScannerTier t : ScannerTier.values()) {
+                if (t.slug().equals(k)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) out.add(k);
+        }
+        return out;
+    }
+
+    /**
+     * The steering rows in a map, or an empty list when it predates steering.
+     *
+     * <p>Returns empty rather than throwing for a map with no {@code steerDim}
+     * column, so the same tool checks both corpora.
+     */
+    private static List<ScoreSampler.SteeringRow> readSteerRows(Path map) throws Exception {
+        List<ScoreSampler.SteeringRow> out = new ArrayList<>();
+        List<String> lines = Files.readAllLines(map, StandardCharsets.US_ASCII);
+        int dimCol = -1, targetCol = -1, valueCol = -1, okCol = -1, labelCol = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (line.isBlank()) continue;
+            String[] c = line.split(",", -1);
+            if (i == 0 || dimCol < 0) {
+                String[] h = c;
+                dimCol = optional(h, "steerDim");
+                if (dimCol < 0) return out;
+                targetCol = column(h, "steerTarget", i, line);
+                valueCol = column(h, "steerValue", i, line);
+                okCol = column(h, "onTarget", i, line);
+                labelCol = column(h, "label", i, line);
+                continue;
+            }
+            if (c[dimCol].isEmpty()) continue;
+            // The synthetic label is measured 1-WER, not R_mrc, so there is no
+            // three-class mix to read here. Report the histogram, which is the
+            // part that is about the sampler.
+            int cls = "1".equals(c[labelCol].trim()) ? 0 : 2;
+            out.add(new SteerRow(Double.parseDouble(c[valueCol]),
+                    Double.parseDouble(c[targetCol]), Boolean.parseBoolean(c[okCol]), cls));
+        }
+        return out;
+    }
+
+    private record SteerRow(double steer, double target, boolean onTarget, int cls)
+            implements ScoreSampler.SteeringRow {
+    }
+
+    private static int optional(String[] header, String name) {
+        for (int i = 0; i < header.length; i++) {
+            if (header[i].trim().equals(name)) return i;
+        }
+        return -1;
     }
 
     private static int count(int[] a, int value) {
