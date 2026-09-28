@@ -3,6 +3,7 @@ package com.mrcpdf.quality.training;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Random;
 
 /**
@@ -285,16 +286,24 @@ public final class ScoreCalibration {
         public void print() {
             System.out.printf("  steering histogram over [%.2f,%.2f], %d bins, %d rows%n",
                     lo, hi, bins, rows);
-            System.out.printf("    %-9s %-6s %-9s %-9s %s%n", "bin", "rows", "share", "bad", "mid");
+            System.out.printf("    %-13s %-6s %s%n", "bin", "rows", "share");
             for (int i = 0; i < bins; i++) {
                 double a = lo + (hi - lo) * i / bins;
                 double b = lo + (hi - lo) * (i + 1) / bins;
-                System.out.printf("    %.2f-%.2f %-6d %-9.3f %-9.3f %.3f%n",
-                        a, b, steerCounts[i], share(steerCounts[i]),
-                        share(classCounts[i] * 3), (double) classCounts[i] / 3 / rows);
+                System.out.printf(Locale.ROOT, "    %.2f-%.2f   %-6d %.3f%n",
+                        a, b, steerCounts[i], share(steerCounts[i]));
             }
-            System.out.printf("  %d/%d rows missed their target (%.1f%%), worst error %.3f%n",
-                    misses, rows, 100 * missRate(), maxTargetError);
+            // The class mix is a separate three-number summary, not a per-bin
+            // breakdown: it is graded on the full R_mrc rather than the steer
+            // value, so putting it in the bin table would imply the two are
+            // per-row comparable when they are not.
+            System.out.printf(Locale.ROOT, "  class mix (full R_mrc): good %d (%.3f), "
+                            + "middle %d (%.3f), bad %d (%.3f)%n",
+                    classCounts[0], share(classCounts[0]),
+                    classCounts[1], share(classCounts[1]),
+                    classCounts[2], share(classCounts[2]));
+            System.out.printf(Locale.ROOT, "  %d/%d rows missed their target (%.1f%%), "
+                            + "worst error %.3f%n", misses, rows, 100 * missRate(), maxTargetError);
             for (String p : problems) System.out.printf("  PROBLEM: %s%n", p);
         }
 

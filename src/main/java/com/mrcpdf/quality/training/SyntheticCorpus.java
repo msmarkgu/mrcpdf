@@ -370,7 +370,7 @@ public final class SyntheticCorpus {
      * half a point, and a name that asserts the intent would make that invisible.
      */
     private static String steeredName(ScoreSampler.Sample s) {
-        return String.format(java.util.Locale.ROOT, "%s->%.2f@%dx%s",
+        return String.format(java.util.Locale.ROOT, "%s->%.2f@%d%s",
                 s.aimed().slug(), s.steer(), s.attempts(), s.onTarget() ? "" : "miss");
     }
 

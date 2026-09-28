@@ -176,6 +176,11 @@ public final class ScoreSampler {
      *                 {@code tolerance} of the target; a {@code false} here is a
      *                 page whose target this dimension simply cannot reach, and
      *                 the corpus QA counts them rather than hiding them
+     * @param attempts how many renders the page actually cost, <em>not</em> which
+     *                 attempt produced the accepted image.  The accepted image is
+     *                  the best of the lot, so on a page that converged late this
+     *                  is larger than the winning index, and it is the number
+     *                  that predicts the cost of a corpus run.
      */
     public record Sample(Rendered rendered, Dim aimed, Dim binding, double target,
                          double steer, int attempts, boolean onTarget)
@@ -346,18 +351,26 @@ public final class ScoreSampler {
         double severity = cal == null ? 0.5 : cal.severityFor(dim, target01);
         Dim aimed = dim;
         Sample best = null;
+        int made = 0;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             ScannerProfile profile = profileFor(aimed, severity, tex);
             Rendered r = render.render(profile, rng);
+            made = attempt;
             double steer = steerKappa(r.mrc());
             double err = Math.abs(steer - target01);
             Dim binding = Dim.binding(r.mrc());
 
+            // `made` rather than `attempt`: the two are the same until the loop
+            // runs past a better attempt, and past that point reporting the
+            // winner's index would understate what the page cost by up to
+            // maxAttempts-1 renders.
             if (best == null || err < best.error()) {
-                best = new Sample(r, aimed, binding, target01, steer, attempt, err <= tolerance);
+                best = new Sample(r, aimed, binding, target01, steer, made, err <= tolerance);
             }
-            if (err <= tolerance) return best;
+            if (err <= tolerance) {
+                return withAttempts(best, made);
+            }
 
             // Re-aim on whichever dimension is actually capping the page, not the
             // one we started from: the driver we chose may have been dragged under
@@ -381,7 +394,13 @@ public final class ScoreSampler {
             severity = clamp01(steer > target01 ? severity + step : severity - step);
         }
 
-        return best;
+        return withAttempts(best, made);
+    }
+
+    private static Sample withAttempts(Sample s, int made) {
+        return s.attempts() == made ? s
+                : new Sample(s.rendered(), s.aimed(), s.binding(), s.target(), s.steer(),
+                made, s.onTarget());
     }
 
     static double clamp01(double v) {

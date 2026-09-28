@@ -315,6 +315,23 @@ public final class RealTrainDump {
             for (Row14 r : all) {
                 if (r.steer != null) steeredRows.add(r);
             }
+            // The dimension ranges first, because they explain the histogram. A
+            // dimension that tops out below the upper end of the marginal cannot
+            // be asked for the top bins, and without this line that is invisible.
+            ScoreCalibration.Calibration cal = steering.calibration();
+            if (cal != null) {
+                cal.report(steerLo, steerHi);
+            }
+            long attempts = 0;
+            int misses = 0;
+            for (Row14 r : steeredRows) {
+                attempts += r.steer.attempts();
+                if (!r.steer.onTarget()) misses++;
+            }
+            System.out.printf(Locale.ROOT, "  %d steered pages, %.1f renders each (%d total)%n",
+                    steeredRows.size(),
+                    steeredRows.isEmpty() ? 0.0 : (double) attempts / steeredRows.size(),
+                    attempts);
             ScoreCalibration.Histogram hist =
                     ScoreCalibration.histogram(steeredRows, 10, steerLo, steerHi);
             hist.print();
