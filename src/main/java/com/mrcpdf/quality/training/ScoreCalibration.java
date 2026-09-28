@@ -208,6 +208,32 @@ public final class ScoreCalibration {
         }
 
         /**
+         * The span of targets that <em>some</em> dimension can reach.
+         *
+         * <p>The union of the three curves' ranges, which is not the same as any
+         * one of them.  The QA needs this because the target marginal is a policy
+         * choice while the reachable range is a property of the generator: the
+         * realism texture (motion blur, JPEG, skew, curl) puts a floor under how
+         * clean any degraded page can measure, so on the 10-page slice no
+         * dimension exceeded 0.81 and the top of a [0.20, 0.95] marginal was
+         * unreachable by construction.  Requiring those bins to be filled would
+         * make the check unsatisfiable, and a check that always fails stops being
+         * read.
+         *
+         * <p>The clean variant carries the pristine end of the range, so a
+         * degraded page that cannot reach 0.95 is not a gap in the corpus.
+         */
+        public double[] fillableRange() {
+            double low = 1.0, high = 0.0;
+            for (ScoreSampler.Dim d : ScoreSampler.Dim.values()) {
+                Curve c = curveFor(d);
+                low = Math.min(low, c.dirtiest());
+                high = Math.max(high, c.cleanest());
+            }
+            return new double[]{Math.max(0.0, low), Math.min(1.0, high)};
+        }
+
+        /**
          * Prints each dimension's measured range and flags any that does not
          * cover the target marginal.
          *
@@ -227,6 +253,12 @@ public final class ScoreCalibration {
                                 c.dirtiest(), c.cleanest(), lo, hi);
                 System.out.printf("    %-7s %-13.3f %-13.3f %s%n",
                         d.slug(), c.cleanest(), c.dirtiest(), note);
+            }
+            double[] fill = fillableRange();
+            if (fill[0] > lo || fill[1] < hi) {
+                System.out.printf(Locale.ROOT,
+                        "  the sampler's reachable range is [%.2f,%.2f]; bins outside it are not "
+                                + "required to be filled.%n", fill[0], fill[1]);
             }
         }
     }
@@ -272,6 +304,7 @@ public final class ScoreCalibration {
      * @param problems human-readable failures; empty means the corpus passed
      */
     public record Histogram(int rows, int bins, double lo, double hi,
+                            double fillLo, double fillHi,
                             int[] steerCounts, int[] classCounts, int misses,
                             double maxTargetError, List<String> problems) {
 
@@ -290,8 +323,10 @@ public final class ScoreCalibration {
             for (int i = 0; i < bins; i++) {
                 double a = lo + (hi - lo) * i / bins;
                 double b = lo + (hi - lo) * (i + 1) / bins;
-                System.out.printf(Locale.ROOT, "    %.2f-%.2f   %-6d %.3f%n",
-                        a, b, steerCounts[i], share(steerCounts[i]));
+                boolean fillable = fillHi > fillLo;
+                String tag = (fillable && (b <= fillLo || a >= fillHi)) ? "  (unreachable)" : "";
+                System.out.printf(Locale.ROOT, "    %.2f-%.2f   %-6d %.3f%s%n",
+                        a, b, steerCounts[i], share(steerCounts[i]), tag);
             }
             // The class mix is a separate three-number summary, not a per-bin
             // breakdown: it is graded on the full R_mrc rather than the steer
@@ -327,6 +362,17 @@ public final class ScoreCalibration {
      */
     public static Histogram histogram(List<? extends ScoreSampler.SteeringRow> rows, int bins,
                                       double lo, double hi) {
+        return histogram(rows, bins, lo, hi, lo, hi);
+    }
+
+    /**
+     * As the six-argument form, but with the span of targets that is actually
+     * reachable.  Bins lying entirely outside it are reported and exempt.
+     *
+     * @see Calibration#fillableRange()
+     */
+    public static Histogram histogram(List<? extends ScoreSampler.SteeringRow> rows, int bins,
+                                      double lo, double hi, double fillLo, double fillHi) {
         int n = Math.max(1, bins);
         int[] steerCounts = new int[n];
         int[] classCounts = new int[3];
@@ -348,15 +394,19 @@ public final class ScoreCalibration {
             problems.add("no steered samples at all");
         } else {
             int maxEmpty = (int) Math.floor(MAX_EMPTY_FRACTION * samples);
+            boolean fillable = fillHi > fillLo;
             for (int i = 0; i < n; i++) {
+                double a = lo + (hi - lo) * i / n;
+                double b = lo + (hi - lo) * (i + 1) / n;
+                // A bin the sampler cannot reach is not a distribution failure, so
+                // it is neither required nor counted against the corpus.
+                if (fillable && (b <= fillLo || a >= fillHi)) continue;
                 // Strictly below the threshold, and zero always: a bin holding
                 // exactly MAX_EMPTY_FRACTION of the rows is a populated bin, and
                 // with a uniform marginal that is the expected outcome rather than
                 // a failure.  The explicit zero keeps small corpora honest, where
                 // the floor rounds down to nothing.
                 if (steerCounts[i] == 0 || steerCounts[i] < maxEmpty) {
-                    double a = lo + (hi - lo) * i / n;
-                    double b = lo + (hi - lo) * (i + 1) / n;
                     problems.add(String.format(
                             "empty bin %.2f-%.2f: steering is not uniform over the marginal", a, b));
                 }
@@ -371,7 +421,7 @@ public final class ScoreCalibration {
                 problems.add("class mix does not account for every row");
             }
         }
-        return new Histogram(samples, n, lo, hi, steerCounts, classCounts,
+        return new Histogram(samples, n, lo, hi, fillLo, fillHi, steerCounts, classCounts,
                 misses, worst, problems);
     }
 

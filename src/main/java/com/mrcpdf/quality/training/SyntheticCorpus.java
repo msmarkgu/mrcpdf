@@ -204,8 +204,22 @@ public final class SyntheticCorpus {
      *                  for "this dimension cannot reach that far", which is
      *                  otherwise invisible in the score distribution
      */
-    record Steer(ScoreSampler.Dim dim, double target, double value, int attempts,
+    /**
+     * @param dim  the dimension the page converged on, which is what the steering
+     *             value is that dimension's sub-score for
+     * @param drawn the dimension the page was *drawn* on, before any re-aim. These
+     *             differ whenever the loop found the drawn dimension was not the
+     *             one capping the page, and a page with degradation in both is the
+     *             "a bit of everything" the single-dimension rule exists to avoid
+     *             -- so the corpus has to be able to say which pages those are.
+     */
+    record Steer(ScoreSampler.Dim dim, String drawn, double target, double value, int attempts,
                  boolean onTarget) {
+
+        /** Whether the loop moved the page off the dimension it was drawn on. */
+        boolean reaimed() {
+            return !dim.slug().equals(drawn);
+        }
     }
 
     /**
@@ -277,7 +291,7 @@ public final class SyntheticCorpus {
      * readability measurement of the rendered page against the known text.
      */
     static List<Variant> buildScannedPages(Page page, long docSeed, int count) throws IOException {
-        return buildScannedPages(page, docSeed, count, null);
+        return buildScannedPages(page, docSeed, count, null, ScoreCalibration.DEFAULT_STEPS);
     }
 
     /**
@@ -299,7 +313,21 @@ public final class SyntheticCorpus {
      */
     static List<Variant> buildScannedPages(Page page, long docSeed, int count,
                                            ScoreSampler.Steering steer) throws IOException {
+        return buildScannedPages(page, docSeed, count, steer, ScoreCalibration.DEFAULT_STEPS);
+    }
+
+    /**
+     * @param calibSteps steps used to probe the reference curve when the shared
+     *                   calibration is not yet built. Threaded from the caller's
+     *                   flag rather than hardcoded, because a probe that silently
+     *                   ignored {@code --steer-calib-steps} would make the flag
+     *                   look accepted while having no effect.
+     */
+    static List<Variant> buildScannedPages(Page page, long docSeed, int count,
+                                           ScoreSampler.Steering steer,
+                                           int calibSteps) throws IOException {
         List<Variant> out = new ArrayList<>();
+        int fallbacks = 0;
         for (int v = 0; v < count; v++) {
             long pageSeed = docSeed ^ (v * 0xBF58476D1CE4E5B9L);
             java.util.Random rng = new java.util.Random(pageSeed ^ 0x51a7);
@@ -310,33 +338,68 @@ public final class SyntheticCorpus {
             java.util.Random steerRng = new java.util.Random(pageSeed ^ STEER_SALT);
 
             if (steer == null || !steer.enabled()) {
-                ScannerTier tier = drawTier(rng);
-                ScannerProfile profile = tier.draw(rng);
-                BufferedImage scanned = ScannerSimulator.apply(page.image(), profile, rng);
-                double score = ReadabilityOcr.measure(scanned, page.blocks());
-                out.add(new Variant(variantName(tier, profile), tier.slug(), scanned, score,
-                        SeverityScore.label(score)));
+                out.add(unsteered(page, rng));
                 continue;
             }
 
-            ScoreSampler.Render render = (profile, r) ->
-                    renderSteered(page, profile, r);
-            ScoreCalibration.Calibration cal = steer.calibration();
-            if (cal == null) {
-                cal = steer.calibrate(render, new java.util.Random(pageSeed ^ CALIB_SALT),
-                        ScoreCalibration.DEFAULT_STEPS, page.label());
-            }
-            double target = steer.drawTarget(steerRng);
-            ScoreSampler.Dim dim = steer.drawDim(steerRng);
-            ScoreSampler.Sample s = steer.sampler().sample(render, steerRng, target, dim, cal);
+            // OCR is the only fallible step left in this loop, and a timeout on one
+            // page must not throw away hours of other pages: the full run is
+            // hundreds of pages at tens of seconds each, and Tesseract does
+            // intermittently fail on a heavily degraded raster. Fall back to the
+            // unsteered path for that page, which still yields a scored row and
+            // keeps the row count an invariant. The row is not steered and says so
+            // in the map.
+            //
+            // Capped per document, because an unbounded fallback would quietly
+            // turn a systemic OCR failure into an unsteered corpus that still
+            // exits 0. Past the cap the cause propagates, and a run that loses a
+            // handful of pages is very different from one that loses all of them.
+            try {
+                ScoreSampler.Render render = (profile, r) ->
+                        renderSteered(page, profile, r);
+                ScoreCalibration.Calibration cal = steer.calibration();
+                if (cal == null) {
+                    cal = steer.calibrate(render, new java.util.Random(pageSeed ^ CALIB_SALT),
+                            calibSteps, page.label());
+                }
+                double target = steer.drawTarget(steerRng);
+                ScoreSampler.Dim dim = steer.drawDim(steerRng);
+                ScoreSampler.Sample s =
+                        steer.sampler().sample(render, steerRng, target, dim, cal);
 
-            ScoreSampler.Rendered r = s.rendered();
-            double score = r.ocr().getAuditScore();
-            Steer info = new Steer(s.aimed(), s.target(), s.steer(), s.attempts(), s.onTarget());
-            out.add(new Variant(steeredName(s), s.aimed().slug(), r.image(), score,
-                    SeverityScore.label(score), info, r));
+                ScoreSampler.Rendered r = s.rendered();
+                double score = r.ocr().getAuditScore();
+                Steer info = new Steer(s.aimed(), s.drawn().slug(), s.target(), s.steer(),
+                        s.attempts(), s.onTarget());
+                out.add(new Variant(steeredName(s), s.aimed().slug(), r.image(), score,
+                        SeverityScore.label(score), info, r));
+            } catch (IOException | RuntimeException e) {
+                if (++fallbacks > MAX_STEER_FALLBACKS) throw e;
+                System.err.printf(java.util.Locale.ROOT,
+                        "warning: steering failed on page %d of %s (%s: %s); "
+                                + "falling back to an unsteered row%n",
+                        out.size(), page.label(), e.getClass().getSimpleName(), e.getMessage());
+                out.add(unsteered(page, rng));
+            }
         }
         return out;
+    }
+
+    /**
+     * Unsteered pages tolerated per document before the failure is propagated.
+     * A handful over hundreds of pages is ordinary Tesseract flakiness; more than
+     * that is not.
+     */
+    private static final int MAX_STEER_FALLBACKS = 5;
+
+    /** The unsteered tier draw, shared by the normal and fallback paths. */
+    private static Variant unsteered(Page page, java.util.Random rng) throws IOException {
+        ScannerTier tier = drawTier(rng);
+        ScannerProfile profile = tier.draw(rng);
+        BufferedImage scanned = ScannerSimulator.apply(page.image(), profile, rng);
+        double score = ReadabilityOcr.measure(scanned, page.blocks());
+        return new Variant(variantName(tier, profile), tier.slug(), scanned, score,
+                SeverityScore.label(score));
     }
 
     /**

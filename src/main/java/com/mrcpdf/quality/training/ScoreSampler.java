@@ -182,13 +182,27 @@ public final class ScoreSampler {
      *                  is larger than the winning index, and it is the number
      *                  that predicts the cost of a corpus run.
      */
-    public record Sample(Rendered rendered, Dim aimed, Dim binding, double target,
+    public record Sample(Rendered rendered, Dim drawn, Dim aimed, Dim binding, double target,
                          double steer, int attempts, boolean onTarget)
             implements SteeringRow {
 
         /** Distance the page ended up from its target. */
         public double error() {
             return Math.abs(steer - target);
+        }
+
+        /**
+         * Whether the re-aim loop moved the page off the dimension it was drawn on.
+         *
+         * <p>Worth recording rather than inferring: a page drawn as background
+         * noise that the loop re-aimed onto visual has degradation in both
+         * dimensions, which is the "a bit of everything" the single-dimension rule
+         * exists to avoid. Reporting only the converged dimension would make such
+         * a page look cleanly single-axis, so the corpus would appear to satisfy
+         * the premise when it does not.
+         */
+        public boolean reaimed() {
+            return drawn != aimed;
         }
 
         @Override
@@ -366,7 +380,7 @@ public final class ScoreSampler {
             // winner's index would understate what the page cost by up to
             // maxAttempts-1 renders.
             if (best == null || err < best.error()) {
-                best = new Sample(r, aimed, binding, target01, steer, made, err <= tolerance);
+                best = new Sample(r, dim, aimed, binding, target01, steer, made, err <= tolerance);
             }
             if (err <= tolerance) {
                 return withAttempts(best, made);
@@ -399,8 +413,8 @@ public final class ScoreSampler {
 
     private static Sample withAttempts(Sample s, int made) {
         return s.attempts() == made ? s
-                : new Sample(s.rendered(), s.aimed(), s.binding(), s.target(), s.steer(),
-                made, s.onTarget());
+                : new Sample(s.rendered(), s.drawn(), s.aimed(), s.binding(), s.target(),
+                s.steer(), made, s.onTarget());
     }
 
     static double clamp01(double v) {

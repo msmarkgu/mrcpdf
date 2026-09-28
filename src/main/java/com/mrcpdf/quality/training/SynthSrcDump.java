@@ -90,7 +90,8 @@ private static final float PAGE_W = 612;
                 : null;
 
         StringBuilder csv = new StringBuilder(
-                "page,doc,variant,label,tier,score,steerDim,steerTarget,steerValue,steerAttempts,onTarget\n");
+                "page,doc,variant,label,tier,score,steerDim,steerDrawn,steerTarget,steerValue,"
+                        + "steerAttempts,onTarget\n");
         int pageCount = docs * pagesPerDoc;
         try (PDDocument preview = new PDDocument()) {
             int page = 0;
@@ -114,9 +115,10 @@ private static final float PAGE_W = 612;
                     // of 0.0 is a real measurement of a page destroyed past
                     // recognition, and ScoreCorrCheck bins it as such.
                     if (v.steer() == null) {
-                        csv.append(",,,,\n");
+                        csv.append(",,,,,,\n");
                     } else {
                         csv.append(',').append(v.steer().dim().slug())
+                                .append(',').append(v.steer().drawn())
                                 .append(',').append(String.format(Locale.ROOT, "%.3f", v.steer().target()))
                                 .append(',').append(String.format(Locale.ROOT, "%.3f", v.steer().value()))
                                 .append(',').append(v.steer().attempts())
@@ -142,14 +144,14 @@ private static final float PAGE_W = 612;
             List<ScoreSampler.SteeringRow> steered = new ArrayList<>();
             csv.toString().lines().skip(1).forEach(l -> {
                 String[] c = l.split(",", -1);
-                if (c.length < 11 || c[6].isEmpty()) return;
+                if (c.length < 12 || c[6].isEmpty()) return;
                 // The synthetic label is measured 1-WER, not R_mrc, so there is no
                 // R_mrc class mix to report here; map the 1-WER binary label onto
                 // the three-class bins so the histogram still has something to
                 // check, and let the histogram's steer distribution carry the QA.
                 int cls = "1".equals(c[3]) ? 0 : 2;
-                steered.add(new Row(Double.parseDouble(c[8]), Double.parseDouble(c[7]),
-                        Boolean.parseBoolean(c[10]), cls));
+                steered.add(new Row(Double.parseDouble(c[9]), Double.parseDouble(c[8]),
+                        Boolean.parseBoolean(c[11]), cls));
             });
             ScoreCalibration.Histogram hist = ScoreCalibration.histogram(steered, 10,
                     steering.lo(), steering.hi());

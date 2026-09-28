@@ -331,7 +331,8 @@ class ScoreSamplerTest {
 
     private static ScoreSampler.Sample fake(double steer, double rmrc, boolean onTarget) {
         return new ScoreSampler.Sample(render(page(rmrc, rmrc, rmrc)),
-                ScoreSampler.Dim.VISUAL, ScoreSampler.Dim.VISUAL, steer, steer, 1, onTarget);
+                ScoreSampler.Dim.VISUAL, ScoreSampler.Dim.VISUAL, ScoreSampler.Dim.VISUAL,
+                steer, steer, 1, onTarget);
     }
 
     @Test
@@ -392,6 +393,95 @@ class ScoreSamplerTest {
                 ScoreCalibration.histogram(List.of(), 10, 0.20, 0.95);
         assertFalse(h.ok());
         assertEquals(0, h.rows());
+    }
+
+    @Test
+    void fillableRangeIsTheUnionOfTheDimensionsNotAnyOne() {
+        // The three curves cover different bands -- visual is the widest, mask
+        // tops out low, bg bottoms out high -- so the union is strictly wider than
+        // any single one. Taking any one curve would over-report the range and let
+        // QA demand bins the other two can fill.
+        double[] sev = {0, 0.5, 1.0};
+        ScoreCalibration.Calibration cal = new ScoreCalibration.Calibration(
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.VISUAL, sev, new double[] {0.90, 0.50, 0.10}),
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.MASK, sev, new double[] {0.75, 0.50, 0.45}),
+                ScoreCalibration.Curve.fit(ScoreSampler.Dim.BG, sev, new double[] {0.95, 0.80, 0.40}),
+                "fixture");
+        double[] fill = cal.fillableRange();
+        assertEquals(0.10, fill[0], 1e-9, "the dirtiest anything can get");
+        assertEquals(0.95, fill[1], 1e-9, "the cleanest anything can get");
+        assertTrue(cal.curveFor(ScoreSampler.Dim.MASK).dirtiest() > fill[0],
+                "mask alone cannot reach the bottom of the union");
+    }
+
+    @Test
+    void unreachableBinsAreExemptButStillReported() {
+        // The realism texture puts a ceiling under how clean a degraded page can
+        // measure, so the top of a [0.20,0.95] marginal is unreachable by
+        // construction. Requiring those bins would make the check unsatisfiable,
+        // and a check that always fails stops being read.
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            // Fill 0.20-0.80 densely and leave 0.80-0.95 empty.
+            double t = 0.20 + 0.60 * (i + 0.5) / 1000;
+            xs.add(fake(t, t, true));
+        }
+        ScoreCalibration.Histogram strict =
+                ScoreCalibration.histogram(xs, 10, 0.20, 0.95);
+        assertFalse(strict.ok(), "with no reachable range the empty top is a real failure");
+
+        ScoreCalibration.Histogram aware =
+                ScoreCalibration.histogram(xs, 10, 0.20, 0.95, 0.20, 0.80);
+        assertTrue(aware.ok(), "an unreachable bin should not be a failure: " + aware.problems());
+    }
+
+    @Test
+    void aBinStraddlingTheReachableEdgeIsStillChecked() {
+        // Exempting bins outside the reachable range must not exempt a bin that
+        // merely overlaps it. Bins are 0.075 wide here, so a reachable top of 0.60
+        // leaves 0.50-0.58 and 0.58-0.65 partly fillable and 0.65-0.73 wholly not.
+        List<ScoreSampler.Sample> xs = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            double t = 0.20 + 0.30 * (i + 0.5) / 1000;
+            xs.add(fake(t, t, true));
+        }
+        ScoreCalibration.Histogram h =
+                ScoreCalibration.histogram(xs, 10, 0.20, 0.95, 0.20, 0.60);
+
+        assertTrue(h.problems().stream().anyMatch(p -> p.contains("0.50-0.58")),
+                "a bin inside the reachable range should be required, got " + h.problems());
+        assertTrue(h.problems().stream().anyMatch(p -> p.contains("0.58-0.65")),
+                "the bin straddling the edge should be required, got " + h.problems());
+        assertFalse(h.problems().stream().anyMatch(p -> p.contains("0.65-0.73")),
+                "a bin wholly above the edge should be exempt, got " + h.problems());
+    }
+
+    @Test
+    void reAimIsVisibleSoTheCorpusCannotLookCleanlySingleAxis() throws IOException {
+        // A page drawn as background noise and converged on visual has degradation
+        // in two dimensions. Reporting only the converged one would make the
+        // corpus look like it satisfied the single-dimension premise, so the draw
+        // has to survive into the map.
+        Stub stub = new Stub(ScoreSamplerTest::monotone);
+        ScoreSampler.Render render = (profile, rng) -> {
+            stub.renders++;
+            // Driving background noise also costs contrast, so the visual
+            // sub-score caps the page from the very first attempt: the dimension
+            // drawn is never the one binding.
+            double sev = Math.max(severityOf(ScoreSampler.Dim.BG, profile),
+                    severityOf(ScoreSampler.Dim.VISUAL, profile));
+            return render(page(0.98 - 1.6 * sev, 0.99, 0.99));
+        };
+
+        ScoreSampler.Sample s = new ScoreSampler(0.05, 8).sample(
+                render, new Random(29), 0.60, ScoreSampler.Dim.BG, null);
+
+        assertEquals(ScoreSampler.Dim.BG, s.drawn(), "the draw must be preserved");
+        assertEquals(ScoreSampler.Dim.VISUAL, s.binding(),
+                "fixture no longer exercises re-aim; visual should cap the page");
+        assertEquals(ScoreSampler.Dim.VISUAL, s.aimed());
+        assertTrue(s.reaimed());
+        assertTrue(s.onTarget(), "expected convergence, got steer=" + s.steer());
     }
 
     @Test

@@ -332,12 +332,21 @@ public final class RealTrainDump {
                     steeredRows.size(),
                     steeredRows.isEmpty() ? 0.0 : (double) attempts / steeredRows.size(),
                     attempts);
+            // Only require the bins the generator can actually fill. The realism
+            // texture caps how clean a degraded page measures, so the top of the
+            // marginal is out of reach on all three dimensions at once; demanding
+            // it would make this check unsatisfiable rather than informative.
+            double[] fill = cal != null ? cal.fillableRange() : new double[]{steerLo, steerHi};
             ScoreCalibration.Histogram hist =
-                    ScoreCalibration.histogram(steeredRows, 10, steerLo, steerHi);
+                    ScoreCalibration.histogram(steeredRows, 10, steerLo, steerHi, fill[0], fill[1]);
             hist.print();
             if (!hist.ok()) {
-                System.out.println("  WARNING: steered corpus failed histogram QA; the map CSV "
-                        + "has the per-row detail.");
+                // A corpus whose steering marginal is wrong is not a corpus anyone
+                // should train on, and the map CSV's per-row detail is right there.
+                // Warning and exiting 0 would let a bad run be regenerated over.
+                throw new IllegalStateException("steered corpus failed histogram QA:\n  "
+                        + String.join("\n  ", hist.problems())
+                        + "\n  see " + mapCsv + " for the per-row detail");
             }
         }
 
@@ -426,7 +435,7 @@ public final class RealTrainDump {
                     sheets.add(new SyntheticCorpus.Variant("clean", "clean",
                             SyntheticCorpus.cleanScan(page, pageSeed), -1.0, 0));
                     sheets.addAll(SyntheticCorpus.buildScannedPages(page, pageSeed, pages - 1,
-                            steering));
+                            steering, calibSteps));
                     if (sheets.size() != pages) {
                         throw new IOException("expected " + pages + " variants for base page "
                                 + ir.outPage() + ", got " + sheets.size());
@@ -684,7 +693,7 @@ public final class RealTrainDump {
         StringBuilder sb = new StringBuilder();
         sb.append("page,basePage,variant,variantName,tier,R_mrc,class,binaryLabel,textOk")
                 .append(",auditWordF1,auditOk,mrc_dims")
-                .append(",steerDim,steerTarget,steerValue,steerAttempts,onTarget\n");
+                .append(",steerDim,steerDrawn,steerTarget,steerValue,steerAttempts,onTarget\n");
         int page = 0;
         for (Row14 r : rows) {
             sb.append(++page).append(',').append(r.basePage).append(',').append(r.variant)
@@ -716,10 +725,11 @@ public final class RealTrainDump {
      */
     private static void appendSteer(StringBuilder sb, SyntheticCorpus.Steer s) {
         if (s == null) {
-            sb.append(",,,,");
+            sb.append(",,,,,,");
             return;
         }
         sb.append(',').append(s.dim().slug())
+                .append(',').append(s.drawn())
                 .append(',').append(String.format(Locale.ROOT, "%.6f", s.target()))
                 .append(',').append(String.format(Locale.ROOT, "%.6f", s.value()))
                 .append(',').append(s.attempts())
@@ -735,12 +745,16 @@ public final class RealTrainDump {
     private static final String SHARD_HEADER =
             "schema,variant-set,basePage,variant,variantName,tier,score,class,"
                     + "binaryLabel,textOk,auditWordF1,auditOk,mrc_dims,"
-                    + "steerDim,steerTarget,steerValue,steerAttempts,onTarget";
+                    + "steerDim,steerDrawn,steerTarget,steerValue,steerAttempts,onTarget";
 
     /**
      * Must match {@link #SHARD_HEADER} for a checkpoint to be reusable.
      *
-     * <p>Bumped to {@code rmrc-2} when the steering columns were added.  The rows
+     * <p>Bumped to {@code rmrc-2} when the steering columns were added, and to
+     * {@code rmrc-3} for {@code steerDrawn}, which records the dimension a page
+     * was <em>drawn</em> on as distinct from the one it converged on.
+     *
+     * <p>The rows
      * are read positionally below, so an old checkpoint would be decoded with the
      * new columns shifted one place left -- {@code steerDim} landing in the feature
      * vector, and every label after it garbage.  Worse, it would not *look* wrong:
@@ -748,7 +762,7 @@ public final class RealTrainDump {
      * a schema check that compared only the feature count would let them through.
      * Hence an explicit tag that the reader compares before touching anything.
      */
-    private static final String SHARD_SCHEMA = "rmrc-2";
+    private static final String SHARD_SCHEMA = "rmrc-3";
 
     private static void writeShardRows(Path path, List<Row14> rows) throws IOException {
         StringBuilder sb = new StringBuilder();
@@ -822,22 +836,21 @@ public final class RealTrainDump {
      * page in the histogram as a page that missed a target of zero.
      */
     private static SyntheticCorpus.Steer readSteer(String[] c) {
-        String dim = c[13];
-        boolean empty = c[13].isEmpty() && c[14].isEmpty() && c[15].isEmpty()
-                && c[16].isEmpty() && c[17].isEmpty();
+        boolean empty = true;
+        for (int i = 13; i <= 18; i++) if (!c[i].isEmpty()) empty = false;
         if (empty) return null;
-        if (dim.isEmpty()) {
+        if (c[13].isEmpty()) {
             throw new IllegalArgumentException(
                     "checkpoint has steering values but no steerDim: " + String.join(",", c[13], c[14], c[15]));
         }
-        ScoreSampler.Dim d = switch (dim) {
+        ScoreSampler.Dim d = switch (c[13]) {
             case "visual" -> ScoreSampler.Dim.VISUAL;
             case "mask" -> ScoreSampler.Dim.MASK;
             case "bg" -> ScoreSampler.Dim.BG;
-            default -> throw new IllegalArgumentException("Unknown steerDim in checkpoint: " + dim);
+            default -> throw new IllegalArgumentException("Unknown steerDim in checkpoint: " + c[13]);
         };
-        return new SyntheticCorpus.Steer(d, Double.parseDouble(c[14]), Double.parseDouble(c[15]),
-                Integer.parseInt(c[16]), Boolean.parseBoolean(c[17]));
+        return new SyntheticCorpus.Steer(d, c[14], Double.parseDouble(c[15]),
+                Double.parseDouble(c[16]), Integer.parseInt(c[17]), Boolean.parseBoolean(c[18]));
     }
 
     /**
