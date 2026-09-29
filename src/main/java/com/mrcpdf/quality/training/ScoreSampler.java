@@ -235,26 +235,38 @@ public final class ScoreSampler {
         }
     }
 
-    /**
-     * The value the sampler steers on: the minimum of the three degradable
-     * dimensions, gated by whether the page yielded any glyph boxes at all.
+        /**
+     * The steering value: the page's audited word F1, i.e. the same quantity the
+     * corpus is labelled with.
      *
-     * <p>The gate is not optional.  {@link MrcReadiness}'s full {@code kappa}
-     * includes {@code S_ocr}, which is already floored to zero when OCR finds
-     * nothing, so the composite is safe.  This metric deliberately excludes
-     * {@code S_ocr} (its inputs are fabricated confidences on a synthetic page),
-     * which removes that protection -- and the glyph-local metrics it does use
-     * are exactly the ones that degenerate over an empty box set.  Stroke-width
-     * consistency scores 1.0 on a sample of no strokes and Sauvola margin
-     * scores 1.0 on a sample of no ambiguous pixels, so a page degraded past
-     * recognition would report a steering value near the clean end and the
-     * sampler would happily accept a destroyed page.  A page with no readable
-     * text is destroyed, so it reports zero here and the re-aim backs off until
-     * words reappear.
+     * <p>This used to be the minimum of the visual, mask and background
+     * sub-scores, and that was a mistake that only the corpus build could have
+     * revealed. Steering {@code S_visual} down to 0.2 produced a soft, blurry,
+     * perfectly legible page: the sub-score is a contrast and sharpness
+     * statistic, and at the low end it reports "bad" about a page that OCRs
+     * flawlessly. Over the finished 500-row corpus the correlation between
+     * {@code S_visual} and the audited word F1 had collapsed to +0.10, against
+     * +0.747 in the corpus before steering, and 57 of 93 rows labelled
+     * unreadable were readable. The sampler had done its job exactly; the target
+     * was not a measure of the thing being labelled.
+     *
+     * <p>So the value is now the audit itself, which is what makes the label
+     * unfalsifiable in the useful direction: the corpus is stratified by ground
+     * truth rather than by a proxy that can drift from it. This costs nothing
+     * -- the audit falls out of the same Tesseract call that produces
+     * {@code S_ocr}, and the rendered page already carries it.
+     *
+     * <p>The gate stays, for the case the audit cannot cover. A page whose OCR
+     * found nothing has no words to compare, so the audit is undefined rather
+     * than zero; treating that as anything but destroyed would let the sampler
+     * accept a page with no readable text. A page with no readable text scores
+     * zero, so the re-aim backs off until words reappear.
      */
-    public static double steerKappa(MrcReadiness.Breakdown b) {
+    public static double steerValue(ReadabilityOcr.Result ocr, MrcReadiness.Breakdown b) {
         if (b.glyphBoxes() < MrcReadiness.MIN_GLYPH_BOXES) return 0.0;
-        return Math.min(b.sVisual(), Math.min(b.sMask(), b.sBg()));
+        double audit = ocr.getAuditScore();
+        if (!Double.isFinite(audit)) return 0.0;
+        return clamp01(audit);
     }
 
     // ── Driver mapping ───────────────────────────────────────────────────────
@@ -404,7 +416,7 @@ public final class ScoreSampler {
             ScannerProfile profile = profileFor(aimed, severity, tex);
             Rendered r = render.render(profile, rng);
             made = attempt;
-            double steer = steerKappa(r.mrc());
+            double steer = steerValue(r.ocr(), r.mrc());
             double err = Math.abs(steer - target01);
             Dim binding = Dim.binding(r.mrc());
 

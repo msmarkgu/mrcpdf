@@ -55,7 +55,7 @@ public final class CorpusQa {
         for (int i = 0; i < header.length; i++) {
             ix.put(header[i], i);
         }
-        for (String col : new String[] {"R_mrc", "steerValue"}) {
+        for (String col : new String[] {"labelWordF1", "steerValue"}) {
             if (!ix.containsKey(col)) {
                 throw new IllegalStateException(
                         "map has no " + col + " column; is it a steered corpus? " + map);
@@ -63,6 +63,7 @@ public final class CorpusQa {
         }
 
         List<Row> steered = new ArrayList<>();
+        List<Double> proxy = new ArrayList<>();
         int clean = 0;
         int[] classMix = new int[3];
         for (int i = 1; i < lines.size(); i++) {
@@ -70,13 +71,16 @@ public final class CorpusQa {
                 continue;
             }
             String[] c = lines.get(i).split(",", -1);
-            double mrc = Double.parseDouble(c[ix.get("R_mrc")]);
+            double mrc = Double.parseDouble(c[ix.get("labelWordF1")]);
             int cls = mrc >= MrcReadiness.GOOD_ABOVE ? 0
                     : (mrc < MrcReadiness.BAD_BELOW ? 2 : 1);
             classMix[cls]++;
             if (c[ix.get("steerValue")].isBlank()) {
                 clean++;
                 continue;
+            }
+            if (ix.containsKey("rMrcProxy")) {
+                proxy.add(Double.parseDouble(c[ix.get("rMrcProxy")]));
             }
             steered.add(new Row(
                     Double.parseDouble(c[ix.get("steerValue")]),
@@ -89,13 +93,22 @@ public final class CorpusQa {
         System.out.printf(Locale.ROOT, "%s: %d rows (%d steered, %d unsteered)%n",
                 map, total, steered.size(), clean);
         System.out.printf(Locale.ROOT,
-                "  class mix over all rows (full R_mrc): good %d (%.3f), middle %d (%.3f), bad %d (%.3f)%n",
+                "  class mix over all rows (label word F1): good %d (%.3f), middle %d (%.3f), bad %d (%.3f)%n",
                 classMix[0], classMix[0] / (double) total, classMix[1],
                 classMix[1] / (double) total, classMix[2], classMix[2] / (double) total);
 
         if (steered.isEmpty()) {
             System.out.println("  nothing steered; nothing to check");
             return;
+        }
+
+        // The label-grounding check this whole change exists to satisfy. The label
+        // is now the audit, so it cannot disagree with itself -- which means the
+        // useful question is whether the recorded proxy still tracks it, because
+        // that is the number the design used to trust and the one a future
+        // reader will reach for.
+        if (proxy.size() == steered.size()) {
+            reportProxyAgreement(steered, proxy);
         }
 
         ScoreCalibration.Histogram h = ScoreCalibration.histogram(steered, bins, lo, hi, fillLo, fillHi);
@@ -106,6 +119,49 @@ public final class CorpusQa {
         }
         h.problems().forEach(p -> System.out.println("  PROBLEM: " + p));
         throw new IllegalStateException("corpus failed steering QA: " + map);
+    }
+
+    /**
+     * How well the recorded {@code R_mrc} proxy tracks the label.
+     *
+     * <p>Not a pass/fail gate. The label is the audit now, so this cannot drift
+     * from the truth; what it shows is whether the proxy is still worth anything
+     * as a reference-free stand-in, which is the one thing the design used to
+     * depend on. It was +0.90 before steering and +0.47 after, so this line is
+     * the number to watch on any future corpus.
+     */
+    private static void reportProxyAgreement(List<Row> steered, List<Double> proxy) {
+        // The accepted attempt's audit F1 *is* the label for a steered row, so
+        // this compares the proxy against the label itself, not against the
+        // target the sampler aimed at.
+        List<Double> label = new ArrayList<>();
+        for (Row r : steered) {
+            label.add(r.steer());
+        }
+        System.out.printf(Locale.ROOT,
+                "  corr(label, rMrcProxy) over steered rows: %+.3f%n",
+                corr(proxy, label));
+    }
+
+    private static double corr(List<Double> a, List<Double> b) {
+        if (a.size() != b.size() || a.size() < 3) {
+            return Double.NaN;
+        }
+        double ma = 0, mb = 0;
+        for (int i = 0; i < a.size(); i++) {
+            ma += a.get(i);
+            mb += b.get(i);
+        }
+        ma /= a.size();
+        mb /= b.size();
+        double num = 0, da = 0, db = 0;
+        for (int i = 0; i < a.size(); i++) {
+            double x = a.get(i) - ma, y = b.get(i) - mb;
+            num += x * y;
+            da += x * x;
+            db += y * y;
+        }
+        return (da <= 0 || db <= 0) ? Double.NaN : num / Math.sqrt(da * db);
     }
 
     /** Minimal {@link ScoreSampler.SteeringRow} over one map line. */

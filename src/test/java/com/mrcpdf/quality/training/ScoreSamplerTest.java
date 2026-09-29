@@ -72,14 +72,22 @@ class ScoreSamplerTest {
             // drivers are disjoint.
             sev = Math.max(sev, Math.max(profile.whiteLevel() / SeverityScore.MAX_WHITE_LEVEL,
                     profile.paperOpacity() / SeverityScore.MAX_PAPER));
-            return ScoreSamplerTest.render(page(response.applyAsDouble(sev), 0.95, 0.95));
+            double v = response.applyAsDouble(sev);
+            return ScoreSamplerTest.render(v, page(v, 0.95, 0.95));
         }
     }
 
     private static ScoreSampler.Rendered render(MrcReadiness.Breakdown b) {
+        return render(Double.NaN, b);
+    }
+
+    /** A render whose audit F1 is {@code audit}; NaN models "not measurable". */
+    private static ScoreSampler.Rendered render(double audit, MrcReadiness.Breakdown b) {
         BufferedImage img = new BufferedImage(4, 4, BufferedImage.TYPE_BYTE_GRAY);
         JpegCodec.FinalImage jpeg = new JpegCodec.FinalImage(new byte[0], img);
-        return new ScoreSampler.Rendered(img, jpeg, null, null, b);
+        ReadabilityOcr.Result ocr =
+                new ReadabilityOcr.Result(List.of(), List.of(), audit);
+        return new ScoreSampler.Rendered(img, jpeg, ocr, null, b);
     }
 
     /** Monotone, roughly linear, and the direction a real degradation moves. */
@@ -149,11 +157,11 @@ class ScoreSamplerTest {
 
     @Test
     void reportsAMissInsteadOfThrowingWhenTheTargetIsUnreachable() throws IOException {
-        // No response can reach 0.95 once any severity is applied. The row is
-        // still returned, flagged: dropping it would bias the corpus toward
-        // whichever dimensions have wide ranges.
+        // No response can reach 0.99: this page tops out at 0.80 even untouched.
+        // The row is still returned, flagged: dropping it would bias the corpus
+        // toward whichever dimensions have wide ranges.
         ScoreSampler sampler = new ScoreSampler(0.02, 4);
-        Stub stub = new Stub(sev -> Math.max(0.0, 1.0 - 0.5 * sev));
+        Stub stub = new Stub(sev -> Math.max(0.0, 0.80 - 0.5 * sev));
 
         ScoreSampler.Sample s = sampler.sample(stub, new Random(5), 0.99,
                 ScoreSampler.Dim.VISUAL, null);
@@ -184,7 +192,8 @@ class ScoreSamplerTest {
             stub.renders++;
             double sev = Math.max(severityOf(ScoreSampler.Dim.VISUAL, profile),
                     severityOf(ScoreSampler.Dim.MASK, profile));
-            return render(page(1.0 - sev, Math.max(0.0, 1.0 - 1.6 * sev), 0.95));
+            double v = 1.0 - sev, k = Math.max(0.0, 1.0 - 1.6 * sev);
+            return render(Math.min(v, k), page(v, k, 0.95));
         };
 
         ScoreSampler sampler = new ScoreSampler(0.05, 8);
@@ -207,28 +216,69 @@ class ScoreSamplerTest {
     // ── the evidence gate ─────────────────────────────────────────────────────
 
     @Test
-    void steerKappaIsZeroBelowTheGlyphBoxGate() {
-        // The metrics steerKappa is built from are measured inside OCR word boxes.
-        // With no boxes there are no strokes and no ambiguous pixels, so both
-        // degenerate to 1.0 and a destroyed page would look clean.
-        assertEquals(0.0, ScoreSampler.steerKappa(page(0)), "zero boxes must read as destroyed");
-        assertEquals(0.0, ScoreSampler.steerKappa(
+    void theSteeringValueIsZeroBelowTheGlyphBoxGate() {
+        // A page with no OCR boxes has no words to compare, so the audit is
+        // undefined rather than low. Undefined must not read as clean.
+        assertEquals(0.0, ScoreSampler.steerValue(ocr(0.99), page(0)),
+                "zero boxes must read as destroyed");
+        assertEquals(0.0, ScoreSampler.steerValue(ocr(0.99),
                 MrcReadiness.aggregate(0.95, 0.95, 0.95, 0.95, MrcReadiness.MIN_GLYPH_BOXES - 1)),
                 "just under the gate must read as destroyed");
-
-        // At or above the gate the real values come through, so a destroyed page
-        // can never masquerade as a clean one.
-        assertTrue(ScoreSampler.steerKappa(
-                MrcReadiness.aggregate(0.95, 0.95, 0.95, 0.95, MrcReadiness.MIN_GLYPH_BOXES)) > 0.9);
-        assertEquals(0.0, ScoreSampler.steerKappa(page(1)),
+        assertEquals(0.0, ScoreSampler.steerValue(ocr(0.99), page(1)),
                 "one box is still below the gate");
+
+        // At or above the gate the audit comes through untouched.
+        assertEquals(0.62, ScoreSampler.steerValue(ocr(0.62),
+                MrcReadiness.aggregate(0.95, 0.95, 0.95, 0.95, MrcReadiness.MIN_GLYPH_BOXES)), 1e-9);
     }
 
     @Test
-    void steerKappaIsTheMinimumOfTheThreeDegradableDimensions() {
-        assertEquals(0.3, ScoreSampler.steerKappa(page(0.9, 0.3, 0.8)), 1e-9);
-        assertEquals(0.4, ScoreSampler.steerKappa(page(0.4, 0.9, 0.7)), 1e-9);
-        assertEquals(0.5, ScoreSampler.steerKappa(page(0.7, 0.8, 0.5)), 1e-9);
+    void anUnmeasurableAuditIsTreatedAsDestroyed() {
+        // NaN is what a page with too few reference words produces. Letting NaN
+        // through would put NaN in the target comparison and the page would be
+        // recorded as converged onto nothing.
+        assertEquals(0.0, ScoreSampler.steerValue(ocr(Double.NaN), page(50)), 1e-9);
+    }
+
+    @Test
+    void theSteeringValueIgnoresTheSubScoresEntirely() {
+        // The regression that cost a corpus build. These sub-scores are the ones
+        // that used to be the target, and they say a destroyed page is clean:
+        // every one of them is near the top while the audit is at the bottom. If
+        // the sampler still consulted them it would accept a 0.97 target on a
+        // page that reads at 0.05.
+        MrcReadiness.Breakdown lying = page(0.97, 0.96, 0.98);
+        assertEquals(0.05, ScoreSampler.steerValue(ocr(0.05), lying), 1e-9);
+    }
+
+    private static ReadabilityOcr.Result ocr(double audit) {
+        return new ReadabilityOcr.Result(List.of(), List.of(), audit);
+    }
+
+    // ── the label-grounding gate ──────────────────────────────────────────────
+
+    @Test
+    void theProxyAgreementGateSitsBetweenTheGoodAndTheBrokenCorpus() {
+        // The gate exists to refuse a corpus like the first steered one, whose
+        // proxy sat at +0.47 while every build-time check passed. Pinning both
+        // observed numbers here means someone retuning the constant has to
+        // confront why it was set where it was.
+        assertTrue(RealTrainDump.MIN_PROXY_AGREEMENT > 0.47,
+                "must reject the corpus that was actually wrong (+0.47)");
+        assertTrue(RealTrainDump.MIN_PROXY_AGREEMENT < 0.90,
+                "must accept a healthy corpus (+0.90)");
+    }
+
+    @Test
+    void correlationIsPearsonAndRefusesDegenerateInput() {
+        double[] a = {1, 2, 3, 4, 5};
+        assertEquals(1.0, RealTrainDump.correlation(a, a), 1e-12);
+        assertEquals(-1.0, RealTrainDump.correlation(a, new double[] {5, 4, 3, 2, 1}), 1e-12);
+        // A constant column has no variance, so correlation is undefined rather
+        // than zero -- reporting 0.0 there would read as "unrelated" and fail the
+        // build for the wrong reason.
+        assertTrue(Double.isNaN(RealTrainDump.correlation(a, new double[] {1, 1, 1, 1, 1})));
+        assertTrue(Double.isNaN(RealTrainDump.correlation(new double[] {1, 2}, new double[] {1, 2})));
     }
 
     // ── the calibration table ──────────────────────────────────────────────────
@@ -331,7 +381,7 @@ class ScoreSamplerTest {
     // ── corpus QA ──────────────────────────────────────────────────────────────
 
     private static ScoreSampler.Sample fake(double steer, double rmrc, boolean onTarget) {
-        return new ScoreSampler.Sample(render(page(rmrc, rmrc, rmrc)),
+        return new ScoreSampler.Sample(render(rmrc, page(rmrc, rmrc, rmrc)),
                 ScoreSampler.Dim.VISUAL, ScoreSampler.Dim.VISUAL, ScoreSampler.Dim.VISUAL,
                 steer, steer, 1, onTarget);
     }
@@ -616,7 +666,8 @@ class ScoreSamplerTest {
             stub.renders++;
             double sev = Math.max(severityOf(ScoreSampler.Dim.VISUAL, profile),
                     severityOf(ScoreSampler.Dim.MASK, profile));
-            return render(page(1.0 - sev, Math.max(0.0, 1.0 - 1.6 * sev), 0.95));
+            double v = 1.0 - sev, k = Math.max(0.0, 1.0 - 1.6 * sev);
+            return render(Math.min(v, k), page(v, k, 0.95));
         };
 
         ScoreSampler.Sample s = new ScoreSampler(0.05, 8).sample(
@@ -709,7 +760,7 @@ class ScoreSamplerTest {
             // drawn is never the one binding.
             double sev = Math.max(severityOf(ScoreSampler.Dim.BG, profile),
                     severityOf(ScoreSampler.Dim.VISUAL, profile));
-            return render(page(0.98 - 1.6 * sev, 0.99, 0.99));
+            return render(0.98 - 1.6 * sev, page(0.98 - 1.6 * sev, 0.99, 0.99));
         };
 
         ScoreSampler.Sample s = new ScoreSampler(0.05, 8).sample(

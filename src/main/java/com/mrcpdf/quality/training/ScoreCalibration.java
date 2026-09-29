@@ -411,7 +411,7 @@ public final class ScoreCalibration {
                 sev[i] = s;
                 ScoreSampler.Rendered r =
                         render.render(ScoreSampler.profileFor(dim, s, tex), rng);
-                kappa[i] = ScoreSampler.steerKappa(r.mrc());
+                kappa[i] = ScoreSampler.steerValue(r.ocr(), r.mrc());
             }
             curves[dim.ordinal()] = Curve.fit(dim, sev, kappa);
         }

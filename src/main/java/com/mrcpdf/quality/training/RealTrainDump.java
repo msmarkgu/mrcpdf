@@ -32,18 +32,29 @@ import java.util.concurrent.Future;
  * Turns the 125-page clean review corpus into a 1250-page labeled training set:
  * 1 clean + N-1 stochastic scan variants per base page.
  *
- * <p>The label is {@code R_mrc} ({@link MrcReadiness#compute}), a reference-free
- * measurement of the page's own pixels, bucketed into good/middle/bad at
- * {@link MrcReadiness#GOOD_ABOVE} and {@link MrcReadiness#BAD_BELOW}.  It is
- * deliberately <em>not</em> {@link TextQualityScorer} (which reads the same
- * features the model sees) and <em>not</em> an analytic severity (which reads the
- * generator's own parameters) — either would be circular.  The clean page is
- * measured too, so no score in the output is fabricated.
+ * <p>The label is a word-multiset F1 against the source page
+ * ({@link ReadabilityOcr#measureWithWords}) — Tesseract reading the rendered
+ * page, compared word-by-word to the text the generator actually printed.
+ * 1.0 means every reference word was read and nothing was invented.
  *
- * <p>Word-multiset F1 against the source page ({@link ReadabilityOcr#measureWithWords})
- * is recorded alongside as {@code auditWordF1} for correlation analysis, but it
- * does <em>not</em> define the label: it needs the reference text, so it cannot
- * score a page at runtime.
+ * <p><b>The label was {@code R_mrc} until the steering work, and that was
+ * wrong.</b>  {@code R_mrc} ({@link MrcReadiness#compute}) is a reference-free
+ * composite of the page's own pixels, and it was a good label only because it
+ * happened to agree with the audit: correlation +0.90 on the corpus built
+ * before steering.  Steering exposed the disagreement.  Driving
+ * {@code S_visual} to 0.2 makes a soft, blurry, perfectly legible page, so
+ * over the steered corpus the two fell to +0.47, {@code S_visual}'s own
+ * correlation with the audit collapsed to +0.10, and 57 of the 93 rows labelled
+ * unreadable were readable.  A composite that can report "bad" about a page
+ * anyone can read is not a label.  It is still recorded, as
+ * {@code rMrcProxy}, so the proxy can be studied against the truth rather than
+ * quietly assumed.
+ *
+ * <p>Using the audit as the label is not circular: the reference text is
+ * available here, at corpus-build time, because the corpus is built from
+ * sources whose text is known.  A model trained on it still has to predict
+ * readability from image features alone.  The clean page is measured too, so
+ * no score in the output is fabricated.
  *
  * <p>Ground truth comes from re-reading the <em>source</em> PDF page named in the
  * review index via {@link RealSrcDump#extractBlocks}, so reference words are
@@ -76,10 +87,11 @@ public final class RealTrainDump {
     /**
      * One emitted corpus page.
      *
-     * <p>{@code score} is the {@code R_MRC} label; {@code auditScore} is the
-     * independent ground-truth word F1, carried alongside rather than used as the
-     * label.  {@code auditOk} is false where the page had too few reference words
-     * for the audit to mean anything, and {@code auditScore} is NaN there.
+     * <p>{@code score} is the label, the ground-truth word F1; {@code rMrcProxy}
+     * is the reference-free composite, carried alongside as a diagnostic rather
+     * than used as the label.  {@code auditOk} is false where the page had too
+     * few reference words for the audit to mean anything, and such a page is
+     * labelled 0 rather than being trusted.
      * {@code mrcBreakdown} keeps the sub-score summary so a label can always be
      * explained after the fact.  {@code steer} is null for the clean page and for
      * every page of a {@code --no-steer} run.
@@ -93,7 +105,7 @@ public final class RealTrainDump {
         final int cls;
         final int binaryLabel;
         final double[] features;
-        final double auditScore;
+        final double rMrcProxy;
         final boolean auditOk;
         final String mrcBreakdown;
         final SyntheticCorpus.Steer steer;
@@ -101,7 +113,7 @@ public final class RealTrainDump {
 
         Row14(int basePage, int variant, String variantName, String tier, double score,
               int cls, int binaryLabel, double[] features, boolean textOk,
-              double auditScore, boolean auditOk, String mrcBreakdown,
+              double rMrcProxy, boolean auditOk, String mrcBreakdown,
               SyntheticCorpus.Steer steer) {
             this.basePage = basePage;
             this.variant = variant;
@@ -112,7 +124,7 @@ public final class RealTrainDump {
             this.binaryLabel = binaryLabel;
             this.features = features;
             this.textOk = textOk;
-            this.auditScore = auditScore;
+            this.rMrcProxy = rMrcProxy;
             this.auditOk = auditOk;
             this.mrcBreakdown = mrcBreakdown;
             this.steer = steer;
@@ -179,10 +191,13 @@ public final class RealTrainDump {
         // population is the same image this builder labels tier=clean.
         long seed = 42;
         int workers = 3;
-        // Defaults come from the scorer so the label cuts cannot silently drift
-        // apart from MrcReadiness.tier().
-        double goodAbove = MrcReadiness.GOOD_ABOVE;
-        double badBelow = MrcReadiness.BAD_BELOW;
+        // The label is the audited word F1, and the class cuts are the terciles
+        // of the steering marginal. Deriving them from the marginal rather than
+        // hard-coding them is what keeps the corpus balanced by construction: the
+        // sampler is asked to fill [lo,hi] uniformly, so cutting at lo+(hi-lo)/3
+        // and lo+2(hi-lo)/3 splits the steered rows into thirds. The baseline's
+        // mix was 23/14/63, which is not a useful thing to train on.
+        double goodAbove = Double.NaN, badBelow = Double.NaN;
         boolean resume = true;
         boolean cleanShards = false;
         boolean steer = true;
@@ -233,6 +248,12 @@ public final class RealTrainDump {
                             + steerLo + ".." + steerHi);
         }
         ScoreSampler.Dim[] steerDimList = parseDims(steerDims);
+        if (Double.isNaN(goodAbove)) {
+            double third = (steerHi - steerLo) / 3.0;
+            badBelow = steerLo + third;
+            goodAbove = steerLo + 2.0 * third;
+        }
+
         ScoreSampler.Steering steering = new ScoreSampler.Steering(steer, steerLo, steerHi,
                 steerTolerance, steerMaxAttempts, steerDimList);
 
@@ -243,9 +264,10 @@ public final class RealTrainDump {
         if (!Files.isDirectory(bases)) throw new IOException("Missing base dir: " + bases);
 
         int effWorkers = Math.max(1, Math.min(workers, nBase));
-        System.out.printf("RealTrainDump: %d base pages x %d variants = %d pages, workers=%d, "
-                        + "thresholds good>=%.2f / bad<%.2f%n",
-                nBase, pages, nBase * pages, effWorkers, goodAbove, badBelow);
+        System.out.printf("RealTrainDump: %d base pages x %d variants = %d pages, workers=%d%n",
+                nBase, pages, nBase * pages, effWorkers);
+        System.out.printf("  label = audited word F1; class cuts good>=%.2f / bad<%.2f "
+                        + "(terciles of the marginal)%n", goodAbove, badBelow);
         System.out.printf(steer
                         ? "  steering ON: target uniform [%.2f,%.2f], dims %s, tolerance %.2f, "
                                 + "max %d attempts, %d calibration steps on %d reference pages%n"
@@ -345,6 +367,28 @@ public final class RealTrainDump {
             // texture caps how clean a degraded page measures, so the top of the
             // marginal is out of reach on all three dimensions at once; demanding
             // it would make this check unsatisfiable rather than informative.
+            // The label-grounding gate. The label is the audit, so it cannot
+            // contradict ground truth -- but the R_mrc proxy is still recorded
+            // beside it, and the reason it was demoted is that its agreement with
+            // the audit quietly decayed to +0.47. Nothing about that was visible
+            // at build time: the marginal filled, the bins passed, and the corpus
+            // would have been trained on. So the proxy's agreement is measured and
+            // reported on every build, and the corpus is refused if it collapses
+            // again. This is the check that would have caught that corpus.
+            double proxyAgreement = agreement(steeredRows);
+            System.out.printf(Locale.ROOT,
+                    "  corr(label, rMrcProxy) over steered rows: %+.3f%n", proxyAgreement);
+            if (proxyAgreement < MIN_PROXY_AGREEMENT) {
+                throw new IllegalStateException(String.format(Locale.ROOT,
+                        "corr(label, rMrcProxy) = %+.3f, below %.2f: the R_mrc proxy has "
+                                + "drifted from ground truth again, so nothing recorded beside "
+                                + "the label can be trusted%n"
+                                + "  this is the failure that invalidated the first steered "
+                                + "corpus, and it was invisible until evaluation%n"
+                                + "  see notes/plan-2026-09-27.md",
+                        proxyAgreement, MIN_PROXY_AGREEMENT));
+            }
+
             double[] fill = cal != null ? cal.fillableRange() : new double[]{steerLo, steerHi};
             ScoreCalibration.Histogram hist =
                     ScoreCalibration.histogram(steeredRows, 10, steerLo, steerHi, fill[0], fill[1]);
@@ -591,16 +635,22 @@ public final class RealTrainDump {
                             mrc = MrcReadiness.score(mrcRaw, usable, pw, ph);
                         }
 
-                        double score = mrc.score();
-                        int cls = classOf(score, goodAbove, badBelow);
+                        // The label is the audit. R_mrc is still recorded, as the
+                        // proxy column it is, but it is no longer what the classes
+                        // are cut from: over the steered corpus its agreement with
+                        // the audit fell to +0.47, from +0.90 before steering, and
+                        // 57 of 93 rows it called unreadable were readable.
                         double auditScore = ocr.getAuditScore();
                         boolean auditOk = ReferenceAnchor.isUsable(page.blocks())
                                 && Double.isFinite(auditScore);
+                        double score = auditOk ? auditScore : 0.0;
+                        int cls = classOf(score, goodAbove, badBelow);
+                        double mrcProxy = mrc.score();
                         Feat14 f = features14(finalImg, ocr.getBlocks());
                         embedPage(shardDoc, jpeg.jpeg(), score, cls, ir.outPage(), var.tier());
                         rows.add(new Row14(ir.outPage(), v, var.name(), var.tier(), score, cls,
-                                SeverityScore.label(score), f.v(), f.textOk(),
-                                auditScore, auditOk, formatBreakdown(mrc, mrcRaw), var.steer()));
+                                SeverityScore.label(mrcProxy), f.v(), f.textOk(),
+                                mrcProxy, auditOk, formatBreakdown(mrc, mrcRaw), var.steer()));
                     }
                     done++;
                     // Every base page, not every 10th: a shard holds only 8-9
@@ -793,15 +843,16 @@ public final class RealTrainDump {
     }
 
     /**
-     * {@code R_mrc} is the reference-free label; {@code auditWordF1} is the
-     * independent OCR readback used to police it — a word-level F1 against the
-     * assembled text, not a raw error rate, and 1.0 means Tesseract read every
-     * reference word and invented nothing.
+     * {@code labelWordF1} is the label: a word-level F1 against the assembled
+     * text, not a raw error rate, and 1.0 means Tesseract read every reference
+     * word and invented nothing.  {@code rMrcProxy} is the reference-free
+     * composite, kept next to it so the two can be compared on every corpus
+     * instead of one being assumed on the strength of a single build.
      */
     private static void writeMapCsv(Path path, List<Row14> rows) throws IOException {
         StringBuilder sb = new StringBuilder();
-        sb.append("page,basePage,variant,variantName,tier,R_mrc,class,binaryLabel,textOk")
-                .append(",auditWordF1,auditOk,mrc_dims")
+        sb.append("page,basePage,variant,variantName,tier,labelWordF1,class,binaryLabel,textOk")
+                .append(",rMrcProxy,auditOk,mrc_dims")
                 .append(",steerDim,steerDrawn,steerTarget,steerValue,steerAttempts,onTarget\n");
         int page = 0;
         for (Row14 r : rows) {
@@ -811,8 +862,8 @@ public final class RealTrainDump {
                     .append(',').append(CLASS_NAMES[r.cls])
                     .append(',').append(r.binaryLabel)
                     .append(',').append(r.textOk).append(',');
-            if (Double.isFinite(r.auditScore)) {
-                sb.append(String.format(Locale.ROOT, "%.6f", r.auditScore));
+            if (Double.isFinite(r.rMrcProxy)) {
+                sb.append(String.format(Locale.ROOT, "%.6f", r.rMrcProxy));
             }
             // An empty field, not a 0: a page with too few reference words has no
             // readback at all, and 0.0 would read as "completely unreadable".
@@ -853,13 +904,14 @@ public final class RealTrainDump {
      */
     private static final String SHARD_HEADER =
             "schema,variant-set,basePage,variant,variantName,tier,score,class,"
-                    + "binaryLabel,textOk,auditWordF1,auditOk,mrc_dims,"
+                    + "binaryLabel,textOk,rMrcProxy,auditOk,mrc_dims,"
                     + "steerDim,steerDrawn,steerTarget,steerValue,steerAttempts,onTarget";
 
     /**
      * Must match {@link #SHARD_HEADER} for a checkpoint to be reusable.
      *
      * <p>Bumped to {@code rmrc-2} when the steering columns were added, and to
+     * {@code rmrc-4} for the audit-as-label columns, and
      * {@code rmrc-3} for {@code steerDrawn}, which records the dimension a page
      * was <em>drawn</em> on as distinct from the one it converged on.
      *
@@ -871,7 +923,50 @@ public final class RealTrainDump {
      * a schema check that compared only the feature count would let them through.
      * Hence an explicit tag that the reader compares before touching anything.
      */
-    private static final String SHARD_SCHEMA = "rmrc-3";
+    private static final String SHARD_SCHEMA = "rmrc-4";
+
+    /**
+     * How closely the {@code R_mrc} proxy must track the label before the corpus is
+     * accepted.
+     *
+     * <p>It was +0.90 on the corpus built before steering, +0.47 on the first
+     * steered corpus, and the +0.47 corpus was accepted because no build-time
+     * check looked. 0.75 is above both bad numbers and below the good one, so it
+     * fails the regression it exists to catch and passes a healthy build.
+     */
+    static final double MIN_PROXY_AGREEMENT = 0.75;
+
+    /** Pearson correlation between the label and the R_mrc proxy. */
+    static double agreement(List<Row14> rows) {
+        double[] label = new double[rows.size()];
+        double[] proxy = new double[rows.size()];
+        for (int i = 0; i < rows.size(); i++) {
+            label[i] = rows.get(i).score;
+            proxy[i] = rows.get(i).rMrcProxy;
+        }
+        return correlation(label, proxy);
+    }
+
+    static double correlation(double[] a, double[] b) {
+        if (a.length != b.length || a.length < 3) {
+            return Double.NaN;
+        }
+        int n = a.length;
+        double sx = 0, sy = 0;
+        for (int i = 0; i < n; i++) {
+            sx += a[i];
+            sy += b[i];
+        }
+        double mx = sx / n, my = sy / n;
+        double num = 0, dx = 0, dy = 0;
+        for (int i = 0; i < n; i++) {
+            double u = a[i] - mx, v = b[i] - my;
+            num += u * v;
+            dx += u * u;
+            dy += v * v;
+        }
+        return (dx <= 0 || dy <= 0) ? Double.NaN : num / Math.sqrt(dx * dy);
+    }
 
     /**
      * Reference pages probed to build the run's steering calibration.
@@ -902,8 +997,8 @@ public final class RealTrainDump {
                     .append(String.format(Locale.ROOT, "%.6f", r.score)).append(',')
                     .append(CLASS_NAMES[r.cls]).append(',').append(r.binaryLabel).append(',')
                     .append(r.textOk).append(',');
-            if (Double.isFinite(r.auditScore)) {
-                sb.append(String.format(Locale.ROOT, "%.6f", r.auditScore));
+            if (Double.isFinite(r.rMrcProxy)) {
+                sb.append(String.format(Locale.ROOT, "%.6f", r.rMrcProxy));
             }
             sb.append(',').append(r.auditOk).append(',').append(r.mrcBreakdown);
             appendSteer(sb, r.steer);

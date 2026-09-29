@@ -133,7 +133,7 @@ public final class MrcReadiness {
      *
      * <p>The four-sub-score form has no page behind it, so it reports zero boxes.
      * That is fine for testing the aggregation algebra, but it makes the box count
-     * untestable in isolation, and the count gates {@code steerKappa} in
+     * untestable in isolation, and the count gates the steering value in
      * {@code ScoreSampler} -- the safety that stops a page degraded past
      * recognition from reporting a clean steering value.  So the count is
      * overridable here rather than left to a synthetic raster.
