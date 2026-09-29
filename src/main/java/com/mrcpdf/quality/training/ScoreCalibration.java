@@ -462,10 +462,10 @@ public final class ScoreCalibration {
                         a, b, steerCounts[i], share(steerCounts[i]), tag);
             }
             // The class mix is a separate three-number summary, not a per-bin
-            // breakdown: it is graded on the full R_mrc rather than the steer
+            // breakdown: it is graded on the audited word F1 rather than the steer
             // value, so putting it in the bin table would imply the two are
             // per-row comparable when they are not.
-            System.out.printf(Locale.ROOT, "  class mix (full R_mrc): good %d (%.3f), "
+            System.out.printf(Locale.ROOT, "  class mix (label word F1): good %d (%.3f), "
                             + "middle %d (%.3f), bad %d (%.3f)%n",
                     classCounts[0], share(classCounts[0]),
                     classCounts[1], share(classCounts[1]),

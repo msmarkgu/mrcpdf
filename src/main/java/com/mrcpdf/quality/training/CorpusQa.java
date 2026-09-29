@@ -28,6 +28,9 @@ public final class CorpusQa {
     public static void main(String[] args) throws Exception {
         Path map = null;
         double lo = ScoreSampler.DEFAULT_LO, hi = ScoreSampler.DEFAULT_HI;
+        // Overridden by --good-above/--bad-below; the defaults are the terciles of
+        // the [0.40,0.80] marginal that RealTrainDump steers by default.
+        double goodAbove = 0.6667, badBelow = 0.5333;
         double fillLo = 0.0, fillHi = 1.0;
         int bins = 10;
 

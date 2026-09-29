@@ -29,6 +29,12 @@ Two directories that look like scratch but are not:
 
 ## Before committing
 
-Run `./gradlew test`. 129 tests cover the scorers, the metric calibration
+Run `./gradlew test`. 172 tests cover the scorers, the metric calibration
 anchors and the pipeline regressions; they are the only guard that a retune
 has not quietly broken an invariant.
+
+A test that cannot fail is worse than no test, because it is read as coverage.
+Every test added for a retune should be checked once against the old
+behaviour -- reintroduce the bug, watch the test go red, revert. Two tests
+written to "prove" an RNG defect here passed against the unfixed code, and the
+defect they were built around was an artifact of the analysis script.

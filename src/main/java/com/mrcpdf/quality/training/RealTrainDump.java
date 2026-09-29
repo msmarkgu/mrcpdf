@@ -648,7 +648,13 @@ public final class RealTrainDump {
                         Feat14 f = features14(finalImg, ocr.getBlocks());
                         embedPage(shardDoc, jpeg.jpeg(), score, cls, ir.outPage(), var.tier());
                         rows.add(new Row14(ir.outPage(), v, var.name(), var.tier(), score, cls,
-                                SeverityScore.label(mrcProxy), f.v(), f.textOk(),
+                                // The binary form of the *label*, not of the
+                                // composite. Deriving it from rMrcProxy left a
+                                // column named binaryLabel disagreeing with the
+                                // label column on the same row, which is the kind
+                                // of thing that gets trusted by whoever reads the
+                                // CSV next.
+                                SeverityScore.label(score), f.v(), f.textOk(),
                                 mrcProxy, auditOk, formatBreakdown(mrc, mrcRaw), var.steer()));
                     }
                     done++;

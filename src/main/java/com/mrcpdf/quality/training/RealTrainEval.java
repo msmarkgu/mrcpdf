@@ -25,10 +25,12 @@ import java.util.Set;
  * text, so a random split puts near-duplicates on both sides and inflates
  * accuracy.
  *
- * <p>The label is the audited word F1 written by {@link RealTrainDump}. It is
- * deliberately spread rather than bimodal -- it is a weighted geometric
- * mean over four dimensions, so it degrades smoothly as a page is scanned worse
- * -- which is why it is usable with fixed cuts.  By default the two cut points
+ * <p>The label is the audited word F1 written by {@link RealTrainDump}: the
+ * word-multiset F1 of what Tesseract read against the text the generator
+ * printed. It replaces the R_mrc composite, which turned out to be a poor label
+ * for this -- steering a page to a target R_mrc produced pages that were still
+ * perfectly legible, because a page can be scored unreadable and read correctly
+ * at the same time. The audit cannot drift that way.  By default the two cut points
  * are still taken as terciles <em>of the training split's scores</em>, because
  * that keeps the classes balanced whatever the corpus turns out to look like and
  * leaks nothing from the test rows.  Pass {@code --good-above}/{@code --bad-below}
@@ -442,7 +444,7 @@ public final class RealTrainEval {
                                  boolean absolute, Double goodAbove, Double badBelow) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
-        sb.append("  \"label\": \"measured R_mrc (reference-free page-readability score)\",\n");
+        sb.append("  \"label\": \"audited word F1 (Tesseract vs the text the generator printed)\",\n");
         sb.append("  \"classes\": [\"good\", \"middle\", \"bad\"],\n");
         sb.append("  \"featureNames\": [");
         for (int i = 0; i < names.size(); i++) {

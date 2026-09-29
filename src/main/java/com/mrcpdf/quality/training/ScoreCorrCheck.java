@@ -308,7 +308,7 @@ public final class ScoreCorrCheck {
     private static List<ScoreSampler.SteeringRow> readSteerRows(Path map) throws Exception {
         List<ScoreSampler.SteeringRow> out = new ArrayList<>();
         List<String> lines = Files.readAllLines(map, StandardCharsets.US_ASCII);
-        int dimCol = -1, targetCol = -1, valueCol = -1, okCol = -1, labelCol = -1;
+        int dimCol = -1, targetCol = -1, valueCol = -1, okCol = -1, classCol = -1;
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
             if (line.isBlank()) continue;
@@ -320,18 +320,27 @@ public final class ScoreCorrCheck {
                 targetCol = column(h, "steerTarget", i, line);
                 valueCol = column(h, "steerValue", i, line);
                 okCol = column(h, "onTarget", i, line);
-                labelCol = column(h, "label", i, line);
+                // rmrc-4 dropped the old "label" column in favour of
+                // "labelWordF1" plus a named "class"; an older map still has
+                // neither, and the class mix is the only part that needs them.
+                classCol = optional(h, "class");
                 continue;
             }
             if (c[dimCol].isEmpty()) continue;
-            // The synthetic label is measured 1-WER, not R_mrc, so there is no
-            // three-class mix to read here. Report the histogram, which is the
-            // part that is about the sampler.
-            int cls = "1".equals(c[labelCol].trim()) ? 0 : 2;
+            int cls = classCol < 0 ? 1 : classOf(c[classCol].trim());
             out.add(new SteerRow(Double.parseDouble(c[valueCol]),
                     Double.parseDouble(c[targetCol]), Boolean.parseBoolean(c[okCol]), cls));
         }
         return out;
+    }
+
+    /** The map writes the class by name; the histogram wants an index. */
+    private static int classOf(String name) {
+        return switch (name.toLowerCase(java.util.Locale.ROOT)) {
+            case "good" -> 0;
+            case "bad" -> 2;
+            default -> 1;
+        };
     }
 
     private record SteerRow(double steer, double target, boolean onTarget, int cls)
