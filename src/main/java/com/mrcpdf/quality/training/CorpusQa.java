@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-import com.mrcpdf.quality.model.MrcReadiness;
 
 /**
  * Re-runs the steering histogram QA against a map that already exists.
@@ -41,6 +40,8 @@ public final class CorpusQa {
                 case "--steer-hi" -> hi = Double.parseDouble(args[++i]);
                 case "--fill-lo" -> fillLo = Double.parseDouble(args[++i]);
                 case "--fill-hi" -> fillHi = Double.parseDouble(args[++i]);
+                case "--good-above" -> goodAbove = Double.parseDouble(args[++i]);
+                case "--bad-below" -> badBelow = Double.parseDouble(args[++i]);
                 case "--bins" -> bins = Integer.parseInt(args[++i]);
                 default -> throw new IllegalArgumentException("Unknown arg: " + args[i]);
             }
@@ -67,6 +68,7 @@ public final class CorpusQa {
 
         List<Row> steered = new ArrayList<>();
         List<Double> proxy = new ArrayList<>();
+        List<Double> proxyCol = new ArrayList<>();
         int clean = 0;
         int[] classMix = new int[3];
         for (int i = 1; i < lines.size(); i++) {
@@ -75,15 +77,20 @@ public final class CorpusQa {
             }
             String[] c = lines.get(i).split(",", -1);
             double mrc = Double.parseDouble(c[ix.get("labelWordF1")]);
-            int cls = mrc >= MrcReadiness.GOOD_ABOVE ? 0
-                    : (mrc < MrcReadiness.BAD_BELOW ? 2 : 1);
+            // The audit label has no natural good/bad cut -- it is a word F1, not
+            // the R_mrc composite that used to carry the thresholds. RealTrainDump
+            // derives the cuts from the marginal's terciles and prints them, so take
+            // them as arguments; guessing them here would grade the corpus against a
+            // partition it was not built for.
+            int cls = mrc >= goodAbove ? 0 : (mrc < badBelow ? 2 : 1);
             classMix[cls]++;
+            if (ix.containsKey("rMrcProxy")) {
+                proxy.add(mrc);
+                proxyCol.add(Double.parseDouble(c[ix.get("rMrcProxy")]));
+            }
             if (c[ix.get("steerValue")].isBlank()) {
                 clean++;
                 continue;
-            }
-            if (ix.containsKey("rMrcProxy")) {
-                proxy.add(Double.parseDouble(c[ix.get("rMrcProxy")]));
             }
             steered.add(new Row(
                     Double.parseDouble(c[ix.get("steerValue")]),
@@ -110,8 +117,8 @@ public final class CorpusQa {
         // useful question is whether the recorded proxy still tracks it, because
         // that is the number the design used to trust and the one a future
         // reader will reach for.
-        if (proxy.size() == steered.size()) {
-            reportProxyAgreement(steered, proxy);
+        if (!proxy.isEmpty()) {
+            reportProxyAgreement(proxy, proxyCol);
         }
 
         ScoreCalibration.Histogram h = ScoreCalibration.histogram(steered, bins, lo, hi, fillLo, fillHi);
@@ -132,18 +139,19 @@ public final class CorpusQa {
      * as a reference-free stand-in, which is the one thing the design used to
      * depend on. It was +0.90 before steering and +0.47 after, so this line is
      * the number to watch on any future corpus.
+     *
+     * <p>Over <em>all</em> rows, not the steered ones. Restricted to steered
+     * rows it is a meaningless -0.015, because their labels are pinned to the
+     * targets the sampler chose and carry no information about the page -- which
+     * is a number that reads like the proxy has stopped working, when in fact it
+     * says nothing either way. The all-rows figure is +0.53 and is the one the
+     * dump reports.
      */
-    private static void reportProxyAgreement(List<Row> steered, List<Double> proxy) {
-        // The accepted attempt's audit F1 *is* the label for a steered row, so
-        // this compares the proxy against the label itself, not against the
-        // target the sampler aimed at.
-        List<Double> label = new ArrayList<>();
-        for (Row r : steered) {
-            label.add(r.steer());
-        }
+    private static void reportProxyAgreement(List<Double> label, List<Double> proxy) {
         System.out.printf(Locale.ROOT,
-                "  corr(label, rMrcProxy) over steered rows: %+.3f%n",
-                corr(proxy, label));
+                "  corr(label, rMrcProxy) over all rows: %+.3f "
+                        + "(diagnostic; the label is the audit, the proxy is not load-bearing)%n",
+                corr(label, proxy));
     }
 
     private static double corr(List<Double> a, List<Double> b) {

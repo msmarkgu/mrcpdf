@@ -383,9 +383,13 @@ tasks.register<JavaExec>("checkRealCorpus") {
     dependsOn("classes")
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass.set("com.mrcpdf.quality.training.CorpusQa")
+    // No --fill-lo/--fill-hi: the dump exempts bins the calibration cannot fill,
+    // but that range has to come from the calibration, and hard-coding a stale
+    // copy here would quietly exempt bins this run never intended to. The
+    // marginal is inside the fillable range, so nothing needs exempting anyway.
     val defaults = listOf("--map", "build/real-train-map.csv",
         "--steer-lo", "0.40", "--steer-hi", "0.80",
-        "--fill-lo", "0.11", "--fill-hi", "0.844")
+        "--good-above", "0.6667", "--bad-below", "0.5333")
     setArgs((findProperty("corpusQaArgs") as String?)?.split(" ") ?: defaults)
 }
 
