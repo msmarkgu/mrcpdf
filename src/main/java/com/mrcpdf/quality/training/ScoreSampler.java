@@ -471,22 +471,7 @@ public final class ScoreSampler {
             // table's guess is the right starting point for the new dimension --
             // carrying over a severity tuned for a different parameter mapping
             // would just be a worse guess than the one already in hand.
-            // Only follow the binding dimension if it can actually serve the
-            // target. Otherwise there is nowhere better to go: the knob that
-            // capped the page is useless, and the one in hand is the only
-            // remaining way to move the score at all.
-            //
-            // Skipping this check is how the reachability filter above gets
-            // undone one render later. A page whose background stayed clean
-            // reports VISUAL as binding -- a fully visual-degraded page still
-            // measures 0.892, while an untouched background measures 0.998 -- so
-            // the loop would re-aim onto visual and then spend every remaining
-            // attempt turning a knob that cannot descend past 0.892, on a target
-            // drawn from [0.40, 0.80]. That is where the surviving overshoot
-            // misses came from: the page stayed far *above* the target it was
-            // supposed to be degraded into.
-            boolean canReach = cal == null || cal.curveFor(binding).reachable(target01);
-            if (binding != aimed && canReach) {
+            if (binding != aimed) {
                 aimed = binding;
                 severity = cal == null ? severity : cal.severityFor(aimed, target01);
                 // The bracket was measured through a different dimension's drivers,
