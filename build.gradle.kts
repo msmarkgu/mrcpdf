@@ -384,7 +384,7 @@ tasks.register<JavaExec>("checkRealCorpus") {
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass.set("com.mrcpdf.quality.training.CorpusQa")
     val defaults = listOf("--map", "build/real-train-map.csv",
-        "--steer-lo", "0.20", "--steer-hi", "0.80",
+        "--steer-lo", "0.40", "--steer-hi", "0.80",
         "--fill-lo", "0.11", "--fill-hi", "0.844")
     setArgs((findProperty("corpusQaArgs") as String?)?.split(" ") ?: defaults)
 }

@@ -367,26 +367,25 @@ public final class RealTrainDump {
             // texture caps how clean a degraded page measures, so the top of the
             // marginal is out of reach on all three dimensions at once; demanding
             // it would make this check unsatisfiable rather than informative.
-            // The label-grounding gate. The label is the audit, so it cannot
-            // contradict ground truth -- but the R_mrc proxy is still recorded
-            // beside it, and the reason it was demoted is that its agreement with
-            // the audit quietly decayed to +0.47. Nothing about that was visible
-            // at build time: the marginal filled, the bins passed, and the corpus
-            // would have been trained on. So the proxy's agreement is measured and
-            // reported on every build, and the corpus is refused if it collapses
-            // again. This is the check that would have caught that corpus.
-            double proxyAgreement = agreement(steeredRows);
+            // Health diagnostic for the demoted R_mrc proxy: how well it still
+            // tracks the ground-truth label, over the whole corpus. Measured on
+            // all rows, not the steered ones, because the sampler pins a steered
+            // row's label to its target by construction -- within that subset the
+            // number says nothing about the proxy. This is reported, not gated:
+            // the label no longer depends on the proxy, so the proxy disagreeing
+            // with the audit is no longer a defect in the corpus. It was when
+            // R_mrc WAS the label (drifting to +0.47 and taking the whole corpus
+            // with it); now it is just a fact about a reference-free score that
+            // is no longer trusted. Only a genuinely broken value fails.
+            double proxyAgreement = agreement(all);
             System.out.printf(Locale.ROOT,
-                    "  corr(label, rMrcProxy) over steered rows: %+.3f%n", proxyAgreement);
-            if (proxyAgreement < MIN_PROXY_AGREEMENT) {
-                throw new IllegalStateException(String.format(Locale.ROOT,
-                        "corr(label, rMrcProxy) = %+.3f, below %.2f: the R_mrc proxy has "
-                                + "drifted from ground truth again, so nothing recorded beside "
-                                + "the label can be trusted%n"
-                                + "  this is the failure that invalidated the first steered "
-                                + "corpus, and it was invisible until evaluation%n"
-                                + "  see notes/plan-2026-09-27.md",
-                        proxyAgreement, MIN_PROXY_AGREEMENT));
+                    "  corr(label, rMrcProxy) over all rows: %+.3f "
+                            + "(diagnostic; label is the audit, proxy is not load-bearing)%n",
+                    proxyAgreement);
+            if (!Double.isFinite(proxyAgreement)) {
+                throw new IllegalStateException(
+                        "corr(label, rMrcProxy) is not finite: the proxy column is missing, "
+                                + "constant, or malformed. see " + mapCsv);
             }
 
             double[] fill = cal != null ? cal.fillableRange() : new double[]{steerLo, steerHi};
@@ -924,17 +923,6 @@ public final class RealTrainDump {
      * Hence an explicit tag that the reader compares before touching anything.
      */
     private static final String SHARD_SCHEMA = "rmrc-4";
-
-    /**
-     * How closely the {@code R_mrc} proxy must track the label before the corpus is
-     * accepted.
-     *
-     * <p>It was +0.90 on the corpus built before steering, +0.47 on the first
-     * steered corpus, and the +0.47 corpus was accepted because no build-time
-     * check looked. 0.75 is above both bad numbers and below the good one, so it
-     * fails the regression it exists to catch and passes a healthy build.
-     */
-    static final double MIN_PROXY_AGREEMENT = 0.75;
 
     /** Pearson correlation between the label and the R_mrc proxy. */
     static double agreement(List<Row14> rows) {

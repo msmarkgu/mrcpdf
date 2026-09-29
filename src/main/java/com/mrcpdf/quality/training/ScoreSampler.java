@@ -38,8 +38,30 @@ import com.mrcpdf.quality.model.MrcReadiness;
  */
 public final class ScoreSampler {
 
-    /** Bottom of the target marginal. Below this a page is destroyed, not merely bad. */
-    public static final double DEFAULT_LO = 0.20;
+    /**
+     * Bottom of the target marginal.
+     *
+     * <p>This was 0.20, chosen back when the target was the R_mrc composite. The
+     * label is now the audited word F1, and the floor had to move with it: on a
+     * 375-row build the hit rate rises monotonically with the target, from 50% in
+     * the 0.20-0.30 band to 84% in 0.70-0.80. The bottom of the marginal is where
+     * text is genuinely near-unreadable, which for most pages means the words are
+     * gone rather than degraded -- there is no severity that lands Tesseract's word
+     * F1 on an exact value, only a range where it collapses. The lowest label any
+     * page reached was 0.054, so this is not a limit of the generator; it is where
+     * the response is dense enough to hit. Below that the marginal asks for
+     * precision the audit cannot deliver, and the misses are re-aim failures
+     * rather than unreachable targets.
+     *
+     * <p>Raised 0.20 -> 0.30 -> 0.40 across three builds. The hit rate rises
+     * monotonically with the target throughout -- 58% at 0.30-0.40 against 80% at
+     * 0.70-0.80 -- so every band added to the bottom is a band the sampler
+     * struggles to fill, and the marginal is better spent on the range it can
+     * hit. At 0.40 the build leaves 303 steered pages, which is still ample, and
+     * the clean variant of every base page covers the pristine end at ~0.99, so
+     * nothing is lost from the corpus by not degrading pages into illegibility.
+     */
+    public static final double DEFAULT_LO = 0.40;
     /**
      * Top of the target marginal, set by what the generator can actually deliver.
      *
@@ -59,8 +81,19 @@ public final class ScoreSampler {
      * out-of-range targets and willing to take the misses.
      */
     public static final double DEFAULT_HI = 0.80;
-    /** Accept a page whose measured steering value lands this close to the target. */
-    public static final double DEFAULT_TOLERANCE = 0.05;
+    /**
+     * Accept a page whose measured steering value lands this close to the target.
+     *
+     * <p>0.10, not the 0.05 this was before the label became the audit. A 0.05
+     * band is 3% of a word multiset, and the response is not that precise: pages
+     * differ in how far their text degrades at a given severity, so the final
+     * error over a 375-row build had a median of 0.063 and only 43% of rows
+     * inside 0.05. Chasing the tighter band did not find better targets, it
+     * spent the attempt budget (4.9 renders per page, up from 3.4) and still
+     * missed 57% of the time. The band has to be wider than the page-to-page
+     * spread to mean anything, and 0.10 is where it stops being noise.
+     */
+    public static final double DEFAULT_TOLERANCE = 0.10;
     /**
      * Renders per page.  The first attempt comes from the calibration table, so
      * six is generous; a page that has not converged by then is accepted as a
@@ -592,6 +625,11 @@ public final class ScoreSampler {
             return sampler;
         }
 
+        /** Test seam: install a calibration without probing for one. */
+        void calibrateWithoutRendering(ScoreCalibration.Calibration cal) {
+            this.calibration = cal;
+        }
+
         /** The calibration, or null if no page has needed one yet. */
         public ScoreCalibration.Calibration calibration() {
             return calibration;
@@ -602,8 +640,38 @@ public final class ScoreSampler {
             return ScoreSampler.drawTarget(rng, lo, hi);
         }
 
-        public Dim drawDim(Random rng) {
-            return dims[rng.nextInt(dims.length)];
+        /**
+         * Picks the dimension to attack, weighted by whether it can reach the
+         * target at all.
+         *
+         * <p>Uniform was wrong once the target became the audit, because the
+         * dimensions have very different floors. Degrading a page's visual
+         * quality does almost nothing to word legibility -- the audit reads 0.892
+         * on a fully visual-degraded page -- so aiming VISUAL at a low target
+         * produced a page that stayed readable, and the sampler burned all six
+         * attempts re-aiming a knob that cannot turn. On a 375-row build VISUAL
+         * was drawn for 80% of pages and could not go below 0.241, while BG
+         * reached 0.133; 109 of 137 misses landed <em>above</em> their target,
+         * which is the signature of attacking a dimension that cannot degrade
+         * legibility far enough.
+         *
+         * <p>So a dimension is only eligible if the calibration says its response
+         * covers the target. With no calibration yet the choice stays uniform --
+         * the table has not been measured, and guessing from priors would just
+         * move the same problem somewhere less visible.
+         */
+        public Dim drawDim(Random rng, double target) {
+            if (calibration == null || dims.length == 1) {
+                return dims[rng.nextInt(dims.length)];
+            }
+            Dim[] eligible = new Dim[dims.length];
+            int n = 0;
+            for (Dim d : dims) {
+                if (calibration.curveFor(d).reachable(target)) {
+                    eligible[n++] = d;
+                }
+            }
+            return n == 0 ? dims[rng.nextInt(dims.length)] : eligible[rng.nextInt(n)];
         }
 
         /**

@@ -363,7 +363,7 @@ public final class SyntheticCorpus {
                             calibSteps, page.label());
                 }
                 double target = steer.drawTarget(steerRng);
-                ScoreSampler.Dim dim = steer.drawDim(steerRng);
+                ScoreSampler.Dim dim = steer.drawDim(steerRng, target);
                 ScoreSampler.Sample s =
                         steer.sampler().sample(render, steerRng, target, dim, cal);
 

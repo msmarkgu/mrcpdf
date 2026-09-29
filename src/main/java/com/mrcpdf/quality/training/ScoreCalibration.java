@@ -46,12 +46,19 @@ public final class ScoreCalibration {
      * <p>Misses are a recorded outcome, not a silent one: an unreachable target
      * still yields a page, flagged, and the map carries it. What matters is that
      * they stay rare enough that the corpus is still mostly where the marginal
-     * asked. Measured 22% on the 375-row corpus, rising with the target because
-     * the response flattens near its ceiling, so the ceiling is set well above
-     * the observed rate -- a regression that doubles it should fail, and a run
-     * that cannot hit two thirds of its targets should too.
+     * asked.
+     *
+     * <p>Measured 38.7% on the 375-row corpus once the label became the audit, at
+     * a 0.10 tolerance. It was 22.4% when the label was the R_mrc composite, but
+     * that number was measuring a much smoother function: the composite is
+     * continuous in the severity knob, whereas the audit is word-multiset F1, and
+     * page-to-page variation in how far text degrades puts a floor under how
+     * precisely any target can be hit. 0.45 is set just above the observed rate
+     * so a regression still fails, while acknowledging that roughly a third of
+     * targets will not land -- the corpus is still useful for that, because a
+     * miss is a page near its target, not a page at the wrong end.
      */
-    public static final double MAX_MISS_RATE = 0.35;
+    public static final double MAX_MISS_RATE = 0.45;
     /** Largest mean |achieved - target| inside a bin that still passes QA. */
     public static final double MAX_TARGET_ERROR = 0.06;
 

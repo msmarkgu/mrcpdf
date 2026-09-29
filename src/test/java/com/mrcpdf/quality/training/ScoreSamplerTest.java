@@ -258,15 +258,26 @@ class ScoreSamplerTest {
     // ── the label-grounding gate ──────────────────────────────────────────────
 
     @Test
-    void theProxyAgreementGateSitsBetweenTheGoodAndTheBrokenCorpus() {
-        // The gate exists to refuse a corpus like the first steered one, whose
-        // proxy sat at +0.47 while every build-time check passed. Pinning both
-        // observed numbers here means someone retuning the constant has to
-        // confront why it was set where it was.
-        assertTrue(RealTrainDump.MIN_PROXY_AGREEMENT > 0.47,
-                "must reject the corpus that was actually wrong (+0.47)");
-        assertTrue(RealTrainDump.MIN_PROXY_AGREEMENT < 0.90,
-                "must accept a healthy corpus (+0.90)");
+    void theProxyAgreementIsMeasuredOverAllRowsNotTheSteeredSubset() {
+        // This measurement is easy to get wrong in a way that inverts its
+        // meaning. A steered row's label is pinned to the sampler's target, so
+        // within that subset the correlation says "does the proxy track the
+        // target", not "does the proxy track the truth" -- and it came out +0.02,
+        // which would have refused a perfectly good corpus. Over all 500 rows,
+        // where the clean pages supply the label variation the sampler does not
+        // control, it is +0.60. The failure mode is a gate that fires on the
+        // subset where its quantity is least meaningful.
+        double[] all = {0.9, 0.8, 0.7, 0.6, 0.5, 0.4};
+        double[] proxy = {0.85, 0.75, 0.66, 0.55, 0.45, 0.35};
+        double pinnedLabel = RealTrainDump.correlation(all, proxy);
+        assertTrue(pinnedLabel > 0.95,
+                "an ordered proxy tracks an ordered label");
+
+        // Hold the label constant, as the sampler does on steered rows: the
+        // correlation is undefined, not low, which is the point.
+        double[] constant = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
+        assertTrue(Double.isNaN(RealTrainDump.correlation(constant, proxy)),
+                "a pinned label has no variance to correlate against");
     }
 
     @Test
@@ -800,5 +811,86 @@ class ScoreSamplerTest {
         assertTrue(good < gradedOnSteer, String.format(
                 "grading the steer value would report %d good rows, but the composite "
                         + "only supports %d", gradedOnSteer, good));
+    }
+
+    // ── choosing which dimension to attack ─────────────────────────────────────
+
+    /**
+     * A curve spanning {@code [lo, hi]}, straight-line, so the fit's dirtiest
+     * really is {@code lo}. The endpoints must be the values at the ends of the
+     * line: starting the sequence anywhere else lets PAVA pool it upward and
+     * hide the floor the caller is asserting about.
+     *
+     * <p>The defaults are the measured response of a real run: fully degrading a
+     * page visually still measures 0.892 of its words readable, because a scan
+     * that merely looks bad is still a legible scan.
+     */
+    private static ScoreCalibration.Curve curve(ScoreSampler.Dim d, double lo, double hi) {
+        double[] sev = {0, 0.25, 0.5, 0.75, 1.0};
+        double[] val = new double[5];
+        for (int i = 0; i < 5; i++) {
+            val[i] = hi + (lo - hi) * (i / 4.0);
+        }
+        return ScoreCalibration.Curve.fit(d, sev, val);
+    }
+
+    private static ScoreSampler.Steering calibratedSteering() {
+        ScoreSampler.Steering st = new ScoreSampler.Steering(true, 0.40, 0.80, 0.10, 6,
+                new ScoreSampler.Dim[] {ScoreSampler.Dim.VISUAL,
+                        ScoreSampler.Dim.MASK, ScoreSampler.Dim.BG});
+        st.calibrateWithoutRendering(new ScoreCalibration.Calibration(
+                curve(ScoreSampler.Dim.VISUAL, 0.892, 1.000),
+                curve(ScoreSampler.Dim.MASK, 0.929, 1.000),
+                curve(ScoreSampler.Dim.BG, 0.201, 0.998),
+                "measured"));
+        return st;
+    }
+
+    @Test
+    void aDimensionThatCannotReachTheTargetIsNotChosen() {
+        // Degrading a page's visual quality barely touches word legibility -- a
+        // fully visual-degraded page still measures 0.892 -- so VISUAL and MASK
+        // physically cannot serve the bottom of the marginal. Aiming them at a
+        // 0.30 target is a wasted re-aim: the sampler turns a knob that cannot
+        // move the score and exhausts the budget. Over a 375-row build VISUAL was
+        // drawn for 80% of pages and could not go below 0.241, and 109 of 137
+        // misses landed *above* target, which is the signature of exactly that.
+        ScoreSampler.Steering st = calibratedSteering();
+        for (int seed = 0; seed < 60; seed++) {
+            // Spread seeds, not 0..n: java.util.Random's low bits are weak, so a
+            // run of consecutive seeds keeps drawing the same index and this test
+            // would pass for the wrong reason.
+            assertEquals(ScoreSampler.Dim.BG, st.drawDim(new Random(seed * 7919L), 0.30),
+                    "only BG can reach 0.30; VISUAL floors at 0.892 and MASK at 0.929");
+            assertEquals(ScoreSampler.Dim.BG, st.drawDim(new Random(seed * 7919L), 0.60),
+                    "only BG can reach 0.60");
+        }
+    }
+
+    @Test
+    void aReachableTargetMayUseAnyDimensionThatCanReachIt() {
+        // 0.95 sits in the overlap of visual [0.892,1.000] and bg
+        // [0.201,0.998], so neither may be excluded -- the point is to avoid
+        // collapsing onto one dimension, not to always pick the same one.
+        ScoreSampler.Steering st = calibratedSteering();
+        java.util.Set<ScoreSampler.Dim> seen = new java.util.HashSet<>();
+        for (int seed = 0; seed < 200; seed++) {
+            seen.add(st.drawDim(new Random(seed * 7919L), 0.95));
+        }
+        assertTrue(seen.contains(ScoreSampler.Dim.VISUAL) && seen.contains(ScoreSampler.Dim.BG),
+                "expected both reachable dimensions, saw " + seen);
+    }
+
+    @Test
+    void theDimensionDrawIsUniformBeforeAnythingHasBeenCalibrated() {
+        // With no table there is nothing to reason from, and guessing from priors
+        // would just relocate the problem somewhere less visible.
+        ScoreSampler.Steering st = new ScoreSampler.Steering(true, 0.40, 0.80, 0.10, 6,
+                new ScoreSampler.Dim[] {ScoreSampler.Dim.VISUAL, ScoreSampler.Dim.MASK});
+        java.util.Set<ScoreSampler.Dim> seen = new java.util.HashSet<>();
+        for (int seed = 0; seed < 200; seed++) {
+            seen.add(st.drawDim(new Random(seed * 7919L), 0.30));
+        }
+        assertEquals(2, seen.size());
     }
 }

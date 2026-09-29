@@ -25,8 +25,8 @@ import java.util.Set;
  * text, so a random split puts near-duplicates on both sides and inflates
  * accuracy.
  *
- * <p>The label is the measured R_mrc score written by {@link RealTrainDump}.
- * R_mrc is deliberately spread rather than bimodal -- it is a weighted geometric
+ * <p>The label is the audited word F1 written by {@link RealTrainDump}. It is
+ * deliberately spread rather than bimodal -- it is a weighted geometric
  * mean over four dimensions, so it degrades smoothly as a page is scanned worse
  * -- which is why it is usable with fixed cuts.  By default the two cut points
  * are still taken as terciles <em>of the training split's scores</em>, because
@@ -40,6 +40,8 @@ import java.util.Set;
 public final class RealTrainEval {
 
     private static final int N_CLASSES = 3;
+    /** The map column holding the label; see {@link #readScores}. */
+    private static final String LABEL_COLUMN = "labelWordF1";
     private static final int IMAGE_FEATURES = FeatureExtractor.IMAGE_FEATURE_NAMES.length;
 
     private RealTrainEval() {
@@ -324,11 +326,13 @@ public final class RealTrainEval {
     // ──────────────────────────────────────────────────────────────────────────
 
     /**
-     * Reads the R_mrc column from the shard map.
+     * Reads the label column from the shard map.
      *
      * <p>The column is resolved by name rather than index: the map has been
-     * renamed more than once ({@code score} to {@code R_mrc}), and a hardcoded
-     * index would quietly train on the wrong field instead of failing.
+     * renamed more than once ({@code score}, then {@code R_mrc}, then
+     * {@code labelWordF1} when the label became the audit rather than the
+     * composite), and a hardcoded index would quietly train on the wrong field
+     * instead of failing.
      */
     private static double[] readScores(Path map) throws IOException {
         List<String> lines = Files.readAllLines(map);
@@ -338,13 +342,13 @@ public final class RealTrainEval {
         String[] header = lines.get(0).trim().split(",");
         int col = -1;
         for (int i = 0; i < header.length; i++) {
-            if (header[i].trim().equalsIgnoreCase("R_mrc")) {
+            if (header[i].trim().equalsIgnoreCase(LABEL_COLUMN)) {
                 col = i;
                 break;
             }
         }
         if (col < 0) {
-            throw new IllegalArgumentException("no R_mrc column in " + map
+            throw new IllegalArgumentException("no " + LABEL_COLUMN + " column in " + map
                     + "; header was " + String.join(",", header));
         }
         List<Double> out = new ArrayList<>();
@@ -378,7 +382,7 @@ public final class RealTrainEval {
         StringBuilder sb = new StringBuilder();
         sb.append("Good/middle/bad readability model -- test-set results\n");
         sb.append("=".repeat(78)).append('\n');
-        sb.append("label          measured R_mrc (MrcReadiness.compute; reference-free)\n");
+        sb.append("label          audited word F1 (Tesseract vs the text the generator printed)\n");
         sb.append("                audited separately by word-multiset F1, not by this model\n");
         sb.append("features       14 = 11 image + 3 conditional text; 11 = image-only baseline\n");
         sb.append("thresholds     ")
