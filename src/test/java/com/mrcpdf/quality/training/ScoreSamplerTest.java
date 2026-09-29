@@ -893,4 +893,28 @@ class ScoreSamplerTest {
         }
         assertEquals(2, seen.size());
     }
+
+    @Test
+    void theReAimOntoTheBindingDimensionRespectsReachability() throws IOException {
+        // The binding dimension is the lowest sub-score, so on a page whose
+        // background was left clean it is VISUAL -- which cannot descend past
+        // 0.892. Following it there on a low target burns the whole budget on a
+        // dead knob and leaves the page far above target.
+        //
+        // The stub reports VISUAL as binding on every render and answers a
+        // response that only BG could produce, so the only way to converge is to
+        // refuse the re-aim and keep turning the dimension already in hand.
+        Stub stub = new Stub(sev -> Math.max(0.0, 1.0 - 1.5 * sev));
+        ScoreSampler.Sample s = new ScoreSampler(0.10, 6)
+                .sample(stub, new Random(3), 0.45, ScoreSampler.Dim.BG,
+                        new ScoreCalibration.Calibration(
+                                curve(ScoreSampler.Dim.VISUAL, 0.892, 1.000),
+                                curve(ScoreSampler.Dim.MASK, 0.929, 1.000),
+                                curve(ScoreSampler.Dim.BG, 0.05, 1.000),
+                                "measured"));
+
+        assertEquals(ScoreSampler.Dim.BG, s.aimed(),
+                "must not re-aim onto a dimension that cannot reach 0.45");
+        assertTrue(s.onTarget(), "expected convergence, got " + s.steer());
+    }
 }
