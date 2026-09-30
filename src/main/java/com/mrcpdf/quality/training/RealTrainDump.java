@@ -646,7 +646,8 @@ public final class RealTrainDump {
                         int cls = classOf(score, goodAbove, badBelow);
                         double mrcProxy = mrc.score();
                         Feat14 f = features14(finalImg, ocr.getBlocks());
-                        embedPage(shardDoc, jpeg.jpeg(), score, cls, ir.outPage(), var.tier());
+                        embedPage(shardDoc, jpeg.jpeg(), score, mrc, cls,
+                                ir.outPage(), var.tier());
                         rows.add(new Row14(ir.outPage(), v, var.name(), var.tier(), score, cls,
                                 // The binary form of the *label*, not of the
                                 // composite. Deriving it from rMrcProxy left a
@@ -783,21 +784,53 @@ public final class RealTrainDump {
      * Emits one labeled page. {@code jpeg} is the exact stream the label and
      * features were measured on, so the rendered page and the labeled raster
      * agree bit for bit.
+     *
+     * <p>The banner takes {@code mrc} rather than loose doubles so the composite
+     * and the sub-scores it was computed from cannot be drawn from different
+     * breakdowns.
      */
-    private static void embedPage(PDDocument doc, byte[] jpeg, double score, int cls,
+    private static void embedPage(PDDocument doc, byte[] jpeg, double score,
+                                  MrcReadiness.Breakdown mrc, int cls,
                                   int basePage, String tier) throws IOException {
         PDPage pd = new PDPage(new PDRectangle((float) PAGE_W, (float) PAGE_H));
         doc.addPage(pd);
         try (PDPageContentStream cs = new PDPageContentStream(doc, pd)) {
             JpegCodec.embedBytes(doc, cs, jpeg, 0, 0, PAGE_W, PAGE_H);
-            drawLabelBanner(cs, score, cls, basePage, tier);
+            drawLabelBanner(cs, score, mrc, cls, basePage, tier);
         }
     }
 
-    /** Top band: the measured score and its good/middle/bad class, plus provenance. */
-    private static void drawLabelBanner(PDPageContentStream cs, double score, int cls,
+    /**
+     * The banner text: every quantity the label decision rests on.
+     *
+     * <p>This used to print a single value under the key {@code R_MRC}.  That
+     * was correct when the label was the R_mrc composite, and silently wrong
+     * after the corpus was relabelled onto the audited word F1 (47cc4b5): the
+     * value changed, the format string did not.  The banner therefore names all
+     * four metrics it prints, and prints both the composite and the sub-scores
+     * behind it, so a reader cannot mistake one for another.
+     *
+     * <p>{@code kappa} is printed because it is the whole point of the composite:
+     * {@code score = rGeom * bottleneck(kappa)}, where {@code kappa} is the
+     * minimum of the four sub-scores.  A page can be perfectly legible
+     * (high {@code audit}, high {@code S_ocr}) and still score low on R_mrc
+     * because {@code S_visual} collapsed -- MRC's 1-bit foreground mask breaks
+     * thin strokes on soft, low-contrast scans.  Both failure modes matter and
+     * they call for opposite responses, so the banner shows all of them.
+     */
+    static String bannerText(double audit, MrcReadiness.Breakdown mrc, int cls) {
+        return String.format(Locale.ROOT,
+                "audit=%.3f  R_mrc=%.3f  k=%.3f  S_vis=%.3f  S_mask=%.3f  "
+                        + "S_ocr=%.3f  S_bg=%.3f  class=%s",
+                audit, mrc.score(), mrc.kappa(), mrc.sVisual(), mrc.sMask(),
+                mrc.sOcr(), mrc.sBg(), CLASS_NAMES[cls]);
+    }
+
+    /** Top band: the measured metrics and their good/middle/bad class, plus provenance. */
+    private static void drawLabelBanner(PDPageContentStream cs, double score,
+                                        MrcReadiness.Breakdown mrc, int cls,
                                         int basePage, String tier) throws IOException {
-        String text = String.format(Locale.ROOT, "R_MRC=%.3f  class=%s", score, CLASS_NAMES[cls]);
+        String text = bannerText(score, mrc, cls);
         PDType1Font font = new PDType1Font(Standard14Fonts.FontName.HELVETICA_BOLD);
         float fontSize = 8;
         float tw = font.getStringWidth(text) / 1000f * fontSize;

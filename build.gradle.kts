@@ -369,13 +369,13 @@ tasks.register<JavaExec>("calibrateMrc") {
     }
 }
 
-// Generates the labeled training set (1 clean + 9 stochastic scan variants per
-// base page) from the review corpus.  Each variant is labeled by R_mrc
-// (MrcReadiness, bucketed good/middle/bad), a reference-free measurement of the
-// page's own pixels -- deliberately not by an analytic severity (which reads the
-// generator's parameters) nor by the same features the model consumes, either
-// of which would be circular.  Measured OCR word-multiset F1 is recorded
-// alongside as auditWordF1 for validation, but does not define the label.
+// Generates the labeled training set (1 clean + 3 steered scan variants per
+// base page) from the review corpus.  Each variant is labeled by the audited OCR
+// word-multiset F1, bucketed good/middle/bad.  That label is measured against the
+// page's ground-truth words, not against the same features the model consumes,
+// which would be circular.  R_mrc (MrcReadiness) is recorded alongside as
+// rMrcProxy for validation, but does NOT define the label: over the steered
+// corpus its agreement with the audit fell to +0.47, from +0.90 before steering.
 // Long: ~1.5-2 h with --workers 3.
 // Re-runs the steering histogram QA against a map that already exists, so a
 // change to the check itself can be validated without paying for a regeneration.
@@ -403,7 +403,11 @@ tasks.register<JavaExec>("dumpRealTrain") {
     val defaults = listOf("--review", reviewPdf, "--index", baseIndex, "--bases", basesDir,
         "--out", "build/real-train-src.pdf", "--features", "build/real-train-features.csv",
         "--map", "build/real-train-map.csv", "--shard-dir", "build/real-train-shards",
-        "--pages", "10", "--seed", "42", "--workers", "3")
+        // 1 clean + 3 steered. This was 10 while the corpus was 1 clean + 9
+        // stochastic variants; the steered design replaced the 9 with 3 measured
+        // draws, and the default was left behind. It must be 4 to match the
+        // 500-row artifact, the features file, and checkRealCorpus.
+        "--pages", "4", "--seed", "42", "--workers", "3")
     setArgs(defaults)
     doFirst {
         val missing = listOf(reviewPdf, baseIndex).filter { !file(it).isFile }
