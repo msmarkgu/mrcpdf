@@ -389,7 +389,11 @@ tasks.register<JavaExec>("checkRealCorpus") {
     // marginal is inside the fillable range, so nothing needs exempting anyway.
     val defaults = listOf("--map", "build/real-train-map.csv",
         "--steer-lo", "0.40", "--steer-hi", "0.80",
-        "--good-above", "0.6667", "--bad-below", "0.5333")
+        // Must match the cuts dumpRealTrain was run with, or the reported class
+        // mix contradicts the class= column of the map being checked.
+        // badBelow is SeverityScore.LABEL_CUTOFF, keeping class=bad and
+        // binaryLabel=1 the same set of pages.
+        "--good-above", "0.90", "--bad-below", "0.60")
     setArgs((findProperty("corpusQaArgs") as String?)?.split(" ") ?: defaults)
 }
 
@@ -438,7 +442,15 @@ tasks.register<JavaExec>("evalRealTrainModel") {
     jvmArgs("-Xmx2g")
     val features = "build/real-train-features.csv"
     val map = "build/real-train-map.csv"
+    // The eval re-derives the classes from labelWordF1 itself and ignores the
+    // map's class= column, so these must be passed here too; leaving them off
+    // silently reverts to terciles while the report says "absolute". Same cuts
+    // as dumpRealTrain and checkRealCorpus. badBelow is
+    // SeverityScore.LABEL_CUTOFF.
+    val goodAbove = "0.90"
+    val badBelow = "0.60"
     val defaults = listOf("--features", features, "--map", map,
+        "--good-above", goodAbove, "--bad-below", badBelow,
         "--out-json", "build/real-train-model.json", "--report", "build/real-train-report.txt",
         "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
     setArgs(defaults)
@@ -458,6 +470,10 @@ tasks.register<JavaExec>("evalRealTrainModel") {
     inputs.file(features)
     inputs.file(map)
     inputs.property("realTrainEvalArgs", providers.gradleProperty("realTrainEvalArgs").orElse(""))
+    // Tracked so that changing the cuts reruns the task instead of reporting
+    // the previous split's metrics as up-to-date.
+    inputs.property("goodAbove", goodAbove)
+    inputs.property("badBelow", badBelow)
 }
 
 // Vendors a pinned pdfjs legacy UMD build into build/label/vendor/pdfjs so the

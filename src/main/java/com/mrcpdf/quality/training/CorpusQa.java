@@ -27,9 +27,17 @@ public final class CorpusQa {
     public static void main(String[] args) throws Exception {
         Path map = null;
         double lo = ScoreSampler.DEFAULT_LO, hi = ScoreSampler.DEFAULT_HI;
-        // Overridden by --good-above/--bad-below; the defaults are the terciles of
-        // the [0.40,0.80] marginal that RealTrainDump steers by default.
-        double goodAbove = 0.6667, badBelow = 0.5333;
+        // Must match the cuts RealTrainDump was run with, or this grades the map
+        // against a partition it was not built for and reports a class mix that
+        // contradicts every class= field in the file. The defaults were the
+        // terciles of the [0.40,0.80] steering marginal until the cuts became
+        // absolute; see RealTrainDump's own comment for why.
+        //
+        // badBelow is deliberately SeverityScore.LABEL_CUTOFF, so class=bad and
+        // binaryLabel=1 name the same pages. Grading them separately is how a map
+        // ends up calling a page unreadable while telling the pipeline to keep
+        // compressing it.
+        double goodAbove = 0.90, badBelow = SeverityScore.LABEL_CUTOFF;
         double fillLo = 0.0, fillHi = 1.0;
         int bins = 10;
 

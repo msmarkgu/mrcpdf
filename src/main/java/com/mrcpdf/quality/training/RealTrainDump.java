@@ -191,12 +191,27 @@ public final class RealTrainDump {
         // population is the same image this builder labels tier=clean.
         long seed = 42;
         int workers = 3;
-        // The label is the audited word F1, and the class cuts are the terciles
-        // of the steering marginal. Deriving them from the marginal rather than
-        // hard-coding them is what keeps the corpus balanced by construction: the
-        // sampler is asked to fill [lo,hi] uniformly, so cutting at lo+(hi-lo)/3
-        // and lo+2(hi-lo)/3 splits the steered rows into thirds. The baseline's
-        // mix was 23/14/63, which is not a useful thing to train on.
+        // The label is the audited word F1, and the class cuts decide what
+        // "good" means.  Left unset they default to the terciles of the steering
+        // marginal, which is what this corpus used to do and is retained only as
+        // the fallback.  That made the classes balanced by construction -- the
+        // sampler fills [lo,hi] uniformly, so cutting at the terciles splits the
+        // steered rows into thirds, against a pre-sampling baseline mix of
+        // 23/14/63 that was not a useful thing to train on.
+        //
+        // But a tercile is a rank, not a verdict, and reading `good` off the page
+        // invited exactly the wrong comparison.  Under the terciles good spanned
+        // 0.669..1.000, reached down onto pages that had visibly failed their
+        // steering target, and 127 of its 301 rows sat below 0.85.  The
+        // consequence was a page with audit 0.827 -- 17% of its words unreadable
+        // -- printing `class=good` beside `R_mrc=0.265`.  Both numbers were
+        // correct; the name was not.
+        //
+        // Absolute cuts make the class mean something on its own.  `bad` sits at
+        // SeverityScore.LABEL_CUTOFF so that class=bad and binaryLabel=1 name the
+        // same pages: a page the map calls unreadable must not also be told to
+        // keep MRC.  Middle is consequently the widest class, and that is the
+        // trade.
         double goodAbove = Double.NaN, badBelow = Double.NaN;
         boolean resume = true;
         boolean cleanShards = false;
@@ -248,7 +263,18 @@ public final class RealTrainDump {
                             + steerLo + ".." + steerHi);
         }
         ScoreSampler.Dim[] steerDimList = parseDims(steerDims);
-        if (Double.isNaN(goodAbove)) {
+        // Both or neither. Passing only --good-above used to leave badBelow NaN,
+        // and `goodAbove <= NaN` is false, so the check above did not catch it and
+        // classOf fell through to `middle` for every row -- a silently balanced-
+        // looking corpus that had no bad pages at all.
+        boolean haveGood = !Double.isNaN(goodAbove);
+        boolean haveBad = !Double.isNaN(badBelow);
+        if (haveGood != haveBad) {
+            throw new IllegalArgumentException(
+                    "--good-above and --bad-below must be given together");
+        }
+        boolean absoluteCuts = haveGood;
+        if (!absoluteCuts) {
             double third = (steerHi - steerLo) / 3.0;
             badBelow = steerLo + third;
             goodAbove = steerLo + 2.0 * third;
@@ -266,8 +292,9 @@ public final class RealTrainDump {
         int effWorkers = Math.max(1, Math.min(workers, nBase));
         System.out.printf("RealTrainDump: %d base pages x %d variants = %d pages, workers=%d%n",
                 nBase, pages, nBase * pages, effWorkers);
-        System.out.printf("  label = audited word F1; class cuts good>=%.2f / bad<%.2f "
-                        + "(terciles of the marginal)%n", goodAbove, badBelow);
+        System.out.printf("  label = audited word F1; class cuts good>=%.4f / bad<%.4f (%s)%n",
+                goodAbove, badBelow,
+                absoluteCuts ? "absolute" : "terciles of the steering marginal");
         System.out.printf(steer
                         ? "  steering ON: target uniform [%.2f,%.2f], dims %s, tolerance %.2f, "
                                 + "max %d attempts, %d calibration steps on %d reference pages%n"
