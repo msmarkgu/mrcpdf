@@ -19,9 +19,11 @@ import java.util.Set;
  * Trains and evaluates good/middle/bad logistic-regression models on the corpus
  * produced by {@link RealTrainDump}.
  *
- * <p>Reports four combinations: {14 features, 11 image-only} x {random 250/1000
- * split, grouped split holding out 25 whole base pages}.  The grouped split is
- * the honest number: the 10 variants of a base page share its font, layout and
+ * <p>Reports four combinations: {14 features, 11 image-only} x {random split,
+ * grouped split}.  Both split the 500-row corpus 80/20 into 400 train / 100 test
+ * ({@code --test-frac}, default 0.20); the grouped split holds out 25 whole base
+ * pages (all of their variants) rather than 100 rows chosen independently.  It is
+ * the honest number: the 4 variants of a base page share its font, layout and
  * text, so a random split puts near-duplicates on both sides and inflates
  * accuracy.
  *
@@ -41,7 +43,7 @@ import java.util.Set;
  */
 public final class RealTrainEval {
 
-    private static final int N_CLASSES = 3;
+    private static final int N_CLASSES = ClassMetrics.N_CLASSES;
     /** The map column holding the label; see {@link #readScores}. */
     private static final String LABEL_COLUMN = "labelWordF1";
     private static final int IMAGE_FEATURES = FeatureExtractor.IMAGE_FEATURE_NAMES.length;
@@ -189,8 +191,6 @@ public final class RealTrainEval {
             heads[c] = new Head(c, LogisticRegression.fit(xTr, yc, epochs, lr, lambda, batch, seed + c));
         }
 
-        int[] confusion = new int[N_CLASSES * N_CLASSES];
-        int[] testCounts = new int[N_CLASSES];
         int[] truth = new int[testIdx.length];
         int[] pred = new int[testIdx.length];
         double[][] probs = new double[testIdx.length][N_CLASSES];
@@ -205,55 +205,14 @@ public final class RealTrainEval {
                     bestC = c;
                 }
             }
-            int t = y[testIdx[i]];
-            truth[i] = t;
+            truth[i] = y[testIdx[i]];
             pred[i] = bestC;
-            testCounts[t]++;
-            confusion[t * N_CLASSES + bestC]++;
         }
 
-        int correct = 0;
-        for (int i = 0; i < testIdx.length; i++) {
-            if (truth[i] == pred[i]) correct++;
-        }
-        double accuracy = (double) correct / testIdx.length;
-
-        double[] precision = new double[N_CLASSES];
-        double[] recall = new double[N_CLASSES];
-        double[] f1 = new double[N_CLASSES];
-        double macro = 0;
-        for (int c = 0; c < N_CLASSES; c++) {
-            int tp = confusion[c * N_CLASSES + c];
-            int fp = 0;
-            int fn = 0;
-            for (int k = 0; k < N_CLASSES; k++) {
-                if (k != c) {
-                    fp += confusion[k * N_CLASSES + c];
-                    fn += confusion[c * N_CLASSES + k];
-                }
-            }
-            precision[c] = tp + fp == 0 ? 0 : (double) tp / (tp + fp);
-            recall[c] = tp + fn == 0 ? 0 : (double) tp / (tp + fn);
-            f1[c] = precision[c] + recall[c] == 0 ? 0
-                    : 2 * precision[c] * recall[c] / (precision[c] + recall[c]);
-            macro += f1[c];
-        }
-        macro /= N_CLASSES;
-
-        double[] auc = new double[N_CLASSES];
-        for (int c = 0; c < N_CLASSES; c++) {
-            int[] yc = new int[testIdx.length];
-            double[] sc = new double[testIdx.length];
-            for (int i = 0; i < testIdx.length; i++) {
-                yc[i] = truth[i] == c ? 1 : 0;
-                sc[i] = probs[i][c];
-            }
-            auc[c] = LogisticRegression.auc(yc, sc);
-        }
-
+        ClassMetrics.Scores m = ClassMetrics.of(truth, pred, probs);
         return new Result(featureLabel, splitName, trainIdx.length, testIdx.length,
-                goodCut, badCut, confusion, precision, recall, f1, auc, accuracy, macro,
-                testCounts, heads);
+                goodCut, badCut, m.confusion(), m.precision(), m.recall(), m.f1(), m.auc(),
+                m.accuracy(), m.macroF1(), m.truthCounts(), heads);
     }
 
     private static Dataset slice(double[][] raw, String[] docs, int[] idx, int nFeatures,
@@ -265,7 +224,7 @@ public final class RealTrainEval {
         return Dataset.of(names, rows);
     }
 
-    private static int bucket(double score, double goodCut, double badCut) {
+    static int bucket(double score, double goodCut, double badCut) {
         if (score >= goodCut) return 0;
         if (score >= badCut) return 1;
         return 2;
@@ -298,7 +257,7 @@ public final class RealTrainEval {
         return new int[][]{toInt(tr), toInt(te)};
     }
 
-    /** Holds out whole base pages, so all 10 variants of a page land on one side. */
+    /** Holds out whole base pages, so all 4 variants of a page land on one side. */
     private static int[][] splitGrouped(String[] docs, double testFrac, long seed) {
         List<String> uniq = new ArrayList<>(new LinkedHashSet<>(Arrays.asList(docs)));
         uniq.sort(Comparator.naturalOrder());
@@ -336,7 +295,7 @@ public final class RealTrainEval {
      * composite), and a hardcoded index would quietly train on the wrong field
      * instead of failing.
      */
-    private static double[] readScores(Path map) throws IOException {
+    static double[] readScores(Path map) throws IOException {
         List<String> lines = Files.readAllLines(map);
         if (lines.isEmpty()) {
             throw new IllegalArgumentException("empty map: " + map);
@@ -393,7 +352,7 @@ public final class RealTrainEval {
                         : String.format(Locale.ROOT, "terciles of each split's training scores "
                         + "(absolute cuts reported per row)%n"))
                 .append("split          random = shuffled rows; grouped = 25 whole base pages held out\n");
-        sb.append("               (all 10 variants of a base page share one side in the grouped split)\n");
+        sb.append("               (all 4 variants of a base page share one side in the grouped split)\n");
         sb.append("test fraction  ").append(String.format(Locale.ROOT, "%.2f%n", testFrac)).append('\n');
 
         sb.append(String.format("%-8s %-26s %6s %8s %8s %8s%n",

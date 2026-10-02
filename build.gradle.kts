@@ -476,6 +476,50 @@ tasks.register<JavaExec>("evalRealTrainModel") {
     inputs.property("badBelow", badBelow)
 }
 
+// Grouped K-fold cross-validation of the readability model: every fold is
+// predicted by a model fitted on the other folds, and the held-out predictions
+// are pooled.  Unlike evalRealTrainModel (a single 80/20 split) this uses all
+// 500 rows for scoring, so the number does not depend on which 100 rows the
+// split happened to pick.  Folds hold out whole base pages, because the 4
+// variants of a page share its font, layout and text.  Cuts are the same
+// absolute ones as dumpRealTrain/checkRealCorpus/evalRealTrainModel, declared
+// as inputs so a stale report cannot pass as up-to-date.  Seconds, not minutes.
+tasks.register<JavaExec>("cvRealTrainModel") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainCrossVal")
+    jvmArgs("-Xmx2g")
+    val features = "build/real-train-features.csv"
+    val map = "build/real-train-map.csv"
+    val goodAbove = "0.90"
+    val badBelow = "0.60"
+    val folds = "5"
+    val defaults = listOf("--features", features, "--map", map,
+        "--good-above", goodAbove, "--bad-below", badBelow, "--cv", folds,
+        "--out-json", "build/real-train-cv.json",
+        "--report", "build/real-train-cv-report.txt",
+        "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(features).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing ${missing.joinToString(", ")} — run ./gradlew dumpRealTrain first")
+        }
+        val extra = providers.gradleProperty("realTrainCvArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(
+        layout.buildDirectory.file("real-train-cv.json"),
+        layout.buildDirectory.file("real-train-cv-report.txt"))
+    inputs.file(features)
+    inputs.file(map)
+    inputs.property("realTrainCvArgs", providers.gradleProperty("realTrainCvArgs").orElse(""))
+    inputs.property("goodAbove", goodAbove)
+    inputs.property("badBelow", badBelow)
+    inputs.property("folds", folds)
+}
+
 // Vendors a pinned pdfjs legacy UMD build into build/label/vendor/pdfjs so the
 // static labeling page can render PDFs over file:// (classic script, not ES
 // modules).  Requires network; one-time fetch.
