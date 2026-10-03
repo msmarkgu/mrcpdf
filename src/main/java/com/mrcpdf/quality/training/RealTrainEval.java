@@ -19,8 +19,8 @@ import java.util.Set;
  * Trains and evaluates good/middle/bad logistic-regression models on the corpus
  * produced by {@link RealTrainDump}.
  *
- * <p>Reports four combinations: {14 features, 11 image-only} x {random split,
- * grouped split}.  Both split the 500-row corpus 80/20 into 400 train / 100 test
+ * <p>Reports six combinations: {20 all, 14 image+text, 11 image-only} x {random
+ * split, grouped split}.  Both split the 500-row corpus 80/20 into 400 train / 100 test
  * ({@code --test-frac}, default 0.20); the grouped split holds out 25 whole base
  * pages (all of their variants) rather than 100 rows chosen independently.  It is
  * the honest number: the 4 variants of a base page share its font, layout and
@@ -47,6 +47,8 @@ public final class RealTrainEval {
     /** The map column holding the label; see {@link #readScores}. */
     private static final String LABEL_COLUMN = "labelWordF1";
     private static final int IMAGE_FEATURES = FeatureExtractor.IMAGE_FEATURE_NAMES.length;
+    private static final int TEXT_FEATURES = FeatureExtractor.TEXT_FEATURE_NAMES.length;
+    private static final int BASE_FEATURES = IMAGE_FEATURES + TEXT_FEATURES;
 
     private RealTrainEval() {
     }
@@ -119,25 +121,28 @@ public final class RealTrainEval {
 
         System.out.println("RealTrainEval: " + n + " rows, " + unique(docs).size()
                 + " base pages, " + names.size() + " features ("
-                + IMAGE_FEATURES + " image + " + (names.size() - IMAGE_FEATURES) + " text)");
+                + IMAGE_FEATURES + " image + " + TEXT_FEATURES + " text + "
+                + (names.size() - BASE_FEATURES) + " readiness)");
         System.out.println("  random split : train=" + random[0].length + " test=" + random[1].length);
         System.out.println("  grouped split: train=" + grouped[0].length + " test=" + grouped[1].length
                 + " across " + unique(docs, grouped[1]).size() + " held-out base pages");
 
         List<Result> results = new ArrayList<>();
         int allFeatures = names.size();
-        results.add(evaluate("random", allFeatures + " features (image+text)", raw, docs, scores,
-                random, names, allFeatures, epochs, lr, lambda, batch, seed, absolute,
-                goodAbove, badBelow));
-        results.add(evaluate("random", IMAGE_FEATURES + " features (image only)", raw, docs, scores,
-                random, names, IMAGE_FEATURES, epochs, lr, lambda, batch, seed, absolute,
-                goodAbove, badBelow));
-        results.add(evaluate("grouped", allFeatures + " features (image+text)", raw, docs, scores,
-                grouped, names, allFeatures, epochs, lr, lambda, batch, seed, absolute,
-                goodAbove, badBelow));
-        results.add(evaluate("grouped", IMAGE_FEATURES + " features (image only)", raw, docs, scores,
-                grouped, names, IMAGE_FEATURES, epochs, lr, lambda, batch, seed, absolute,
-                goodAbove, badBelow));
+        // Reported in increasing feature order so the readiness contribution can
+        // be read off as a delta rather than hunted for between two rows.
+        String imageLabel = IMAGE_FEATURES + " features (image only)";
+        String baseLabel = BASE_FEATURES + " features (image+text)";
+        String allLabel = allFeatures + " features (image+text+readiness)";
+        for (String split : new String[]{"random", "grouped"}) {
+            int[][] sp = split.equals("random") ? random : grouped;
+            results.add(evaluate(split, imageLabel, raw, docs, scores, sp, names, IMAGE_FEATURES,
+                    epochs, lr, lambda, batch, seed, absolute, goodAbove, badBelow));
+            results.add(evaluate(split, baseLabel, raw, docs, scores, sp, names, BASE_FEATURES,
+                    epochs, lr, lambda, batch, seed, absolute, goodAbove, badBelow));
+            results.add(evaluate(split, allLabel, raw, docs, scores, sp, names, allFeatures,
+                    epochs, lr, lambda, batch, seed, absolute, goodAbove, badBelow));
+        }
 
         String text = renderReport(results, absolute, goodAbove, badBelow, testFrac);
         Files.createDirectories(report.toAbsolutePath().getParent());
@@ -345,7 +350,8 @@ public final class RealTrainEval {
         sb.append("=".repeat(78)).append('\n');
         sb.append("label          audited word F1 (Tesseract vs the text the generator printed)\n");
         sb.append("                audited separately by word-multiset F1, not by this model\n");
-        sb.append("features       14 = 11 image + 3 conditional text; 11 = image-only baseline\n");
+        sb.append("features       20 = 11 image + 3 conditional text + 6 MrcReadiness sub-scores\n");
+        sb.append("               14 = image+text; 11 = image-only baseline\n");
         sb.append("thresholds     ")
                 .append(absolute
                         ? String.format(Locale.ROOT, "absolute good>=%.3f, bad<%.3f%n", goodAbove, badBelow)
@@ -355,11 +361,11 @@ public final class RealTrainEval {
         sb.append("               (all 4 variants of a base page share one side in the grouped split)\n");
         sb.append("test fraction  ").append(String.format(Locale.ROOT, "%.2f%n", testFrac)).append('\n');
 
-        sb.append(String.format("%-8s %-26s %6s %8s %8s %8s%n",
+        sb.append(String.format("%-8s %-34s %6s %8s %8s %8s%n",
                 "split", "features", "acc", "macroF1", "goodF1", "note"));
         sb.append("-".repeat(78)).append('\n');
         for (Result r : results) {
-            sb.append(String.format(Locale.ROOT, "%-8s %-26s %6.3f %8.3f %8.3f   cuts %.3f/%.3f%n",
+            sb.append(String.format(Locale.ROOT, "%-8s %-34s %6.3f %8.3f %8.3f   cuts %.3f/%.3f%n",
                     r.split(), r.featureSet(), r.accuracy(), r.macroF1(), r.f1()[0],
                     r.badCut(), r.goodCut()));
         }

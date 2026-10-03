@@ -174,8 +174,12 @@ public final class RealTrainDump {
                 raw.noiseSigma(), raw.tileSigma());
     }
 
-    /** 14 features, flagging whether the conditional 3 were actually extractable. */
-    private record Feat14(double[] v, boolean textOk) {
+    /**
+     * One page's feature vector: 11 image + 3 conditional text + 6 readiness.
+     * {@code textOk} flags only the conditional three; the readiness sub-scores
+     * are always present, so they are never imputed.
+     */
+    private record FeatureVec(double[] v, boolean textOk) {
     }
 
     public static void main(String[] args) throws Exception {
@@ -672,7 +676,7 @@ public final class RealTrainDump {
                         double score = auditOk ? auditScore : 0.0;
                         int cls = classOf(score, goodAbove, badBelow);
                         double mrcProxy = mrc.score();
-                        Feat14 f = features14(finalImg, ocr.getBlocks());
+                        FeatureVec f = features(finalImg, ocr.getBlocks(), mrc);
                         embedPage(shardDoc, jpeg.jpeg(), score, mrc, cls,
                                 ir.outPage(), var.tier());
                         rows.add(new Row14(ir.outPage(), v, var.name(), var.tier(), score, cls,
@@ -756,49 +760,86 @@ public final class RealTrainDump {
     // Features
     // ──────────────────────────────────────────────────────────────────────────
 
-    private static Feat14 features14(BufferedImage img, List<TextBlock> blocks) {
+    /**
+     * Builds the full feature vector for a page: the 11 image features, the 3
+     * conditional glyph features (left at 0 when extraction fails, then
+     * {@link #imputeMissingText} fills them), and the 6 {@link MrcReadiness}
+     * sub-scores.
+     *
+     * <p>The readiness sub-scores are appended because the class=good analysis
+     * found the model's misses were OCR-readiness misses: a legible page whose
+     * pixels look degraded was called middle, and a sharp page whose OCR failed
+     * was called good.  {@code S_ocr} alone separates good from the rest with AUC
+     * 0.986, against 0.952 for the whole 14-feature model, and it is computed
+     * from Tesseract's own confidences -- available at inference -- so it is a
+     * legal feature, not a leak of the audited label.
+     */
+    private static FeatureVec features(BufferedImage img, List<TextBlock> blocks,
+                                       MrcReadiness.Breakdown mrc) {
         int[] gray = ImageOps.toGrayscale(img);
         int w = img.getWidth();
         int h = img.getHeight();
         double[] image = FeatureExtractor.extractImage(gray, w, h, DPI);
+        int textN = FeatureExtractor.TEXT_FEATURE_NAMES.length;
         double[] text = null;
         if (!blocks.isEmpty()) {
             float[] mag = FeatureExtractor.gradientMagnitudes(gray, w, h);
             text = FeatureExtractor.extractText(gray, mag, w, h, blocks);
         }
-        if (text == null) {
-            double[] v = new double[image.length + FeatureExtractor.TEXT_FEATURE_NAMES.length];
-            System.arraycopy(image, 0, v, 0, image.length);
-            return new Feat14(v, false);
-        }
-        double[] v = new double[image.length + text.length];
+        double[] v = new double[image.length + textN + READINESS_FEATURE_NAMES.length];
         System.arraycopy(image, 0, v, 0, image.length);
-        System.arraycopy(text, 0, v, image.length, text.length);
-        return new Feat14(v, true);
+        if (text != null) {
+            System.arraycopy(text, 0, v, image.length, text.length);
+        }
+        double[] ready = {
+                mrc.sVisual(), mrc.sMask(), mrc.sOcr(), mrc.sBg(),
+                mrc.kappa(), mrc.glyphBoxes()
+        };
+        System.arraycopy(ready, 0, v, image.length + textN, ready.length);
+        return new FeatureVec(v, text != null);
+    }
+
+    /** Applies {@link #imputeMissingText(double[][], boolean[])} to the row list. */
+    private static int imputeMissingText(List<Row14> rows) {
+        double[][] features = new double[rows.size()][];
+        boolean[] textOk = new boolean[rows.size()];
+        for (int i = 0; i < rows.size(); i++) {
+            features[i] = rows.get(i).features;
+            textOk[i] = rows.get(i).textOk;
+        }
+        return imputeMissingText(features, textOk);
     }
 
     /**
-     * Fills the 3 conditional text columns of any row where extraction failed,
-     * using the per-column median of the rows that succeeded, so the 14-feature
-     * matrix stays rectangular.  Returns the number of rows touched.
+     * Fills only the 3 conditional text columns of any row whose text extraction
+     * failed, using the per-column median of the rows that succeeded, so the
+     * feature matrix stays rectangular.
+     *
+     * <p>The image and readiness columns are always measured, so they must not be
+     * touched here: imputing a readiness sub-score would replace a real
+     * measurement with a population median.  Package-private so a test can pin
+     * which columns are imputable.
+     *
+     * @return the number of rows whose text features were missing
      */
-    private static int imputeMissingText(List<Row14> rows) {
-        int width = rows.get(0).features.length;
-        for (int c = 0; c < width; c++) {
+    static int imputeMissingText(double[][] features, boolean[] textOk) {
+        int first = FeatureExtractor.IMAGE_FEATURE_NAMES.length;
+        int last = first + FeatureExtractor.TEXT_FEATURE_NAMES.length;
+        for (int c = first; c < last; c++) {
             List<Double> vals = new ArrayList<>();
-            for (Row14 r : rows) {
-                if (r.textOk && Double.isFinite(r.features[c])) vals.add(r.features[c]);
+            for (int i = 0; i < features.length; i++) {
+                if (textOk[i] && Double.isFinite(features[i][c])) vals.add(features[i][c]);
             }
             if (vals.isEmpty()) continue;
             vals.sort(Comparator.naturalOrder());
             double med = vals.get(vals.size() / 2);
-            for (Row14 r : rows) {
-                if (!r.textOk || !Double.isFinite(r.features[c])) r.features[c] = med;
+            for (int i = 0; i < features.length; i++) {
+                if (!textOk[i] || !Double.isFinite(features[i][c])) features[i][c] = med;
             }
         }
         int n = 0;
-        for (Row14 r : rows) {
-            if (!r.textOk) n++;
+        for (boolean ok : textOk) {
+            if (!ok) n++;
         }
         return n;
     }
@@ -975,10 +1016,12 @@ public final class RealTrainDump {
     /**
      * Must match {@link #SHARD_HEADER} for a checkpoint to be reusable.
      *
-     * <p>Bumped to {@code rmrc-2} when the steering columns were added, and to
-     * {@code rmrc-4} for the audit-as-label columns, and
-     * {@code rmrc-3} for {@code steerDrawn}, which records the dimension a page
-     * was <em>drawn</em> on as distinct from the one it converged on.
+     * <p>Bumped to {@code rmrc-2} when the steering columns were added, to
+     * {@code rmrc-3} for {@code steerDrawn} (the dimension a page was
+     * <em>drawn</em> on, as distinct from the one it converged on), to
+     * {@code rmrc-4} for the audit-as-label columns, and to {@code rmrc-5} when
+     * the 6 {@link #READINESS_FEATURE_NAMES readiness sub-scores} joined the
+     * feature vector.
      *
      * <p>The rows
      * are read positionally below, so an old checkpoint would be decoded with the
@@ -988,7 +1031,7 @@ public final class RealTrainDump {
      * a schema check that compared only the feature count would let them through.
      * Hence an explicit tag that the reader compares before touching anything.
      */
-    private static final String SHARD_SCHEMA = "rmrc-4";
+    private static final String SHARD_SCHEMA = "rmrc-5";
 
     /** Pearson correlation between the label and the R_mrc proxy. */
     static double agreement(List<Row14> rows) {
@@ -1226,10 +1269,22 @@ public final class RealTrainDump {
     // Helpers
     // ──────────────────────────────────────────────────────────────────────────
 
+    /**
+     * The {@link MrcReadiness} sub-scores appended to the image+text features.
+     * {@code mrcKappa} is the minimum of the four dimensions and {@code mrcBoxes}
+     * the usable-glyph count behind them, both of which the composite already
+     * uses; they are kept as separate columns so the learned model can weight
+     * the evidence differently from the hand-written bottleneck rule.
+     */
+    static final String[] READINESS_FEATURE_NAMES = {
+            "mrcVisual", "mrcMask", "mrcOcr", "mrcBg", "mrcKappa", "mrcBoxes"
+    };
+
     static List<String> featureNames() {
         List<String> names = new ArrayList<>();
         for (String n : FeatureExtractor.IMAGE_FEATURE_NAMES) names.add(n);
         for (String n : FeatureExtractor.TEXT_FEATURE_NAMES) names.add(n);
+        for (String n : READINESS_FEATURE_NAMES) names.add(n);
         return names;
     }
 

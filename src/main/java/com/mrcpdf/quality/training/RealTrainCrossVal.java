@@ -42,6 +42,7 @@ public final class RealTrainCrossVal {
 
     private static final int N_CLASSES = ClassMetrics.N_CLASSES;
     private static final int IMAGE_FEATURES = FeatureExtractor.IMAGE_FEATURE_NAMES.length;
+    private static final int BASE_FEATURES = IMAGE_FEATURES + FeatureExtractor.TEXT_FEATURE_NAMES.length;
 
     private RealTrainCrossVal() {
     }
@@ -50,10 +51,18 @@ public final class RealTrainCrossVal {
     private record FoldMetrics(int nTest, int[] truthCounts, double accuracy, double macroF1) {
     }
 
+    /**
+     * One held-out (out-of-fold) prediction. Kept so the error analysis can see
+     * exactly which rows the model fails on, not just the aggregate confusion.
+     */
+    record ErrorRow(int row, String doc, int fold, String featureLabel, int truth, int pred,
+                    double pGood, double pMiddle, double pBad, double margin) {
+    }
+
     /** Everything measured for one feature set. */
-    private record CvResult(String featureLabel, int nFeatures, int n,
-                            ClassMetrics.Scores pooled, FoldMetrics[] perFold,
-                            int[] foldDocCounts) {
+    record CvResult(String featureLabel, int nFeatures, int n,
+                    ClassMetrics.Scores pooled, FoldMetrics[] perFold,
+                    int[] foldDocCounts, ErrorRow[] errors) {
     }
 
     public static void main(String[] args) throws Exception {
@@ -61,6 +70,7 @@ public final class RealTrainCrossVal {
         Path map = Path.of("build/real-train-map.csv");
         Path outJson = Path.of("build/real-train-cv.json");
         Path report = Path.of("build/real-train-cv-report.txt");
+        Path errors = null;
         long seed = 42;
         int k = 5;
         int epochs = 400;
@@ -76,6 +86,7 @@ public final class RealTrainCrossVal {
                 case "--map" -> map = Path.of(args[++i]);
                 case "--out-json" -> outJson = Path.of(args[++i]);
                 case "--report" -> report = Path.of(args[++i]);
+                case "--errors" -> errors = Path.of(args[++i]);
                 case "--cv" -> k = Integer.parseInt(args[++i]);
                 case "--seed" -> seed = Long.parseLong(args[++i]);
                 case "--epochs" -> epochs = Integer.parseInt(args[++i]);
@@ -119,11 +130,15 @@ public final class RealTrainCrossVal {
         }
 
         int allFeatures = names.size();
+        // Increasing feature order, so the readiness contribution is a visible
+        // delta rather than a number to hunt for between two rows.
         List<CvResult> results = List.of(
-                crossValidate(allFeatures + " features (image+text)", raw, docs, y, names,
-                        allFeatures, k, seed, epochs, lr, lambda, batch),
                 crossValidate(IMAGE_FEATURES + " features (image only)", raw, docs, y, names,
-                        IMAGE_FEATURES, k, seed, epochs, lr, lambda, batch));
+                        IMAGE_FEATURES, k, seed, epochs, lr, lambda, batch),
+                crossValidate(BASE_FEATURES + " features (image+text)", raw, docs, y, names,
+                        BASE_FEATURES, k, seed, epochs, lr, lambda, batch),
+                crossValidate(allFeatures + " features (image+text+readiness)", raw, docs, y, names,
+                        allFeatures, k, seed, epochs, lr, lambda, batch));
 
         String text = renderReport(results, n, nGroups, k, seed, goodAbove, badBelow);
         Files.createDirectories(report.toAbsolutePath().getParent());
@@ -134,6 +149,34 @@ public final class RealTrainCrossVal {
         Files.createDirectories(outJson.toAbsolutePath().getParent());
         Files.writeString(outJson, toJson(results, names, IMAGE_FEATURES, k, seed, goodAbove, badBelow));
         System.out.println("cv json " + outJson);
+
+        if (errors != null) {
+            Files.createDirectories(errors.toAbsolutePath().getParent());
+            Files.writeString(errors, renderErrors(results));
+            System.out.println("errors  " + errors);
+        }
+    }
+
+    /**
+     * Per-row out-of-fold predictions, one line per corpus row per feature set,
+     * for error analysis.  Rows come out in fold order, so the analysis must
+     * join back to the map/features files on the {@code row} column (the corpus
+     * row index), not on line order.
+     */
+    static String renderErrors(List<CvResult> results) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("row,doc,fold,features,truth,pred,pGood,pMiddle,pBad,margin\n");
+        for (CvResult r : results) {
+            for (ErrorRow e : r.errors()) {
+                sb.append(e.row()).append(',').append(e.doc()).append(',')
+                        .append(e.fold()).append(',').append(e.featureLabel()).append(',')
+                        .append(RealTrainDump.CLASS_NAMES[e.truth()]).append(',')
+                        .append(RealTrainDump.CLASS_NAMES[e.pred()]).append(',')
+                        .append(String.format(Locale.ROOT, "%.6f,%.6f,%.6f,%.6f%n",
+                                e.pGood(), e.pMiddle(), e.pBad(), e.margin()));
+            }
+        }
+        return sb.toString();
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -150,6 +193,7 @@ public final class RealTrainCrossVal {
         int[] allTruth = new int[n];
         int[] allPred = new int[n];
         double[][] allProbs = new double[n][N_CLASSES];
+        ErrorRow[] errors = new ErrorRow[n];
         FoldMetrics[] perFold = new FoldMetrics[k];
         int[] foldDocCounts = new int[k];
         int cursor = 0;
@@ -184,13 +228,17 @@ public final class RealTrainCrossVal {
             double[][] fProbs = new double[testIdx.length][N_CLASSES];
             for (int i = 0; i < testIdx.length; i++) {
                 double best = -1;
+                double second = -1;
                 int bestC = 0;
                 for (int c = 0; c < N_CLASSES; c++) {
                     double p = heads[c].predict(xTe[i]);
                     fProbs[i][c] = p;
                     if (p > best) {
+                        second = best;
                         best = p;
                         bestC = c;
+                    } else if (p > second) {
+                        second = p;
                     }
                 }
                 fTruth[i] = y[testIdx[i]];
@@ -198,6 +246,9 @@ public final class RealTrainCrossVal {
                 allTruth[cursor] = fTruth[i];
                 allPred[cursor] = bestC;
                 allProbs[cursor] = fProbs[i];
+                errors[cursor] = new ErrorRow(testIdx[i], docs[testIdx[i]], f, featureLabel,
+                        fTruth[i], bestC, fProbs[i][0], fProbs[i][1], fProbs[i][2],
+                        best - second);
                 cursor++;
             }
             ClassMetrics.Scores fm = ClassMetrics.of(fTruth, fPred, fProbs);
@@ -207,7 +258,7 @@ public final class RealTrainCrossVal {
         }
 
         ClassMetrics.Scores pooled = ClassMetrics.of(allTruth, allPred, allProbs);
-        return new CvResult(featureLabel, nFeatures, n, pooled, perFold, foldDocCounts);
+        return new CvResult(featureLabel, nFeatures, n, pooled, perFold, foldDocCounts, errors);
     }
 
     /**
@@ -302,7 +353,8 @@ public final class RealTrainCrossVal {
                 .append("-fold cross-validation\n");
         sb.append("=".repeat(78)).append('\n');
         sb.append("label          audited word F1 (Tesseract vs the text the generator printed)\n");
-        sb.append("features       14 = 11 image + 3 conditional text; 11 = image-only baseline\n");
+        sb.append("features       20 = 11 image + 3 conditional text + 6 MrcReadiness sub-scores\n");
+        sb.append("               14 = image+text; 11 = image-only baseline\n");
         sb.append(String.format(Locale.ROOT,
                 "thresholds     absolute good>=%.3f, bad<%.3f (fixed; never derived per fold)%n",
                 goodAbove, badBelow));
@@ -315,37 +367,37 @@ public final class RealTrainCrossVal {
                 .append(" base pages\n\n");
 
         sb.append("summary (pooled out-of-fold, n=").append(n).append(")\n");
-        sb.append(String.format("%-28s %6s %8s %8s %7s %7s%n",
+        sb.append(String.format("%-34s %6s %8s %8s %7s %7s%n",
                 "features", "acc", "macroF1", "goodF1", "midF1", "badF1"));
         sb.append("-".repeat(78)).append('\n');
         for (CvResult r : results) {
-            sb.append(String.format(Locale.ROOT, "%-28s %6.3f %8.3f %8.3f %7.3f %7.3f%n",
+            sb.append(String.format(Locale.ROOT, "%-34s %6.3f %8.3f %8.3f %7.3f %7.3f%n",
                     r.featureLabel(), r.pooled().accuracy(), r.pooled().macroF1(),
                     r.pooled().f1()[0], r.pooled().f1()[1], r.pooled().f1()[2]));
         }
 
         sb.append("\nper-fold macroF1 (accuracy in parentheses)\n");
         sb.append(String.format("%-5s %6s", "fold", "nTest"));
-        for (CvResult r : results) sb.append(String.format("  %-24s", r.featureLabel()));
+        for (CvResult r : results) sb.append(String.format("  %-36s", r.featureLabel()));
         sb.append('\n');
         for (int f = 0; f < k; f++) {
             sb.append(String.format("%-5d %6d", f, results.get(0).perFold()[f].nTest()));
             for (CvResult r : results) {
                 FoldMetrics fm = r.perFold()[f];
-                sb.append(String.format(Locale.ROOT, "  %-24s",
+                sb.append(String.format(Locale.ROOT, "  %-36s",
                         String.format(Locale.ROOT, "%.3f (%.3f)", fm.macroF1(), fm.accuracy())));
             }
             sb.append('\n');
         }
         sb.append(String.format("%-5s %6s", "mean", ""));
         for (CvResult r : results) {
-            sb.append(String.format(Locale.ROOT, "  %-24s",
+            sb.append(String.format(Locale.ROOT, "  %-36s",
                     String.format(Locale.ROOT, "%.3f (%.3f)", meanMacro(r), meanAcc(r))));
         }
         sb.append('\n');
         sb.append(String.format("%-5s %6s", "std", ""));
         for (CvResult r : results) {
-            sb.append(String.format(Locale.ROOT, "  %-24s",
+            sb.append(String.format(Locale.ROOT, "  %-36s",
                     String.format(Locale.ROOT, "%.3f (%.3f)", stdMacro(r), stdAcc(r))));
         }
         sb.append('\n');

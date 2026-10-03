@@ -497,6 +497,7 @@ tasks.register<JavaExec>("cvRealTrainModel") {
         "--good-above", goodAbove, "--bad-below", badBelow, "--cv", folds,
         "--out-json", "build/real-train-cv.json",
         "--report", "build/real-train-cv-report.txt",
+        "--errors", "build/real-train-cv-errors.csv",
         "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
     setArgs(defaults)
     doFirst {
@@ -511,7 +512,8 @@ tasks.register<JavaExec>("cvRealTrainModel") {
     }
     outputs.files(
         layout.buildDirectory.file("real-train-cv.json"),
-        layout.buildDirectory.file("real-train-cv-report.txt"))
+        layout.buildDirectory.file("real-train-cv-report.txt"),
+        layout.buildDirectory.file("real-train-cv-errors.csv"))
     inputs.file(features)
     inputs.file(map)
     inputs.property("realTrainCvArgs", providers.gradleProperty("realTrainCvArgs").orElse(""))

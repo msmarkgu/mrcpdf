@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 
 import org.junit.jupiter.api.Test;
@@ -152,5 +153,67 @@ class RealTrainCrossValTest {
     void classMetricsRejectsOutOfRangeClasses() {
         assertThrows(IllegalArgumentException.class,
                 () -> ClassMetrics.of(new int[]{0}, new int[]{3}, new double[][]{{0, 0, 0}}));
+    }
+
+    /** 10 base pages, 4 variants each, 3 deterministic features. */
+    private static RealTrainCrossVal.CvResult smallCv() {
+        int n = 40;
+        String[] docs = new String[n];
+        int[] y = new int[n];
+        double[][] raw = new double[n][3];
+        for (int d = 0; d < 10; d++) {
+            for (int j = 0; j < 4; j++) {
+                int i = d * 4 + j;
+                docs[i] = "p" + (d + 1);
+                y[i] = (d + j) % N_CLASSES;
+                for (int c = 0; c < 3; c++) {
+                    raw[i][c] = Math.sin(0.7 * i + 1.3 * c) + 0.1 * c;
+                }
+            }
+        }
+        return RealTrainCrossVal.crossValidate("test set", raw, docs, y,
+                List.of("a", "b", "c"), 3, 5, 42, 50, 0.5, 0.01, 8);
+    }
+
+    /**
+     * The error dump is what the class=good analysis reads, so it must describe
+     * exactly the predictions behind the pooled confusion. A dump that dropped
+     * or duplicated rows would look plausible while pointing the analysis at
+     * the wrong pages.
+     */
+    @Test
+    void errorRowsMatchThePooledConfusion() {
+        RealTrainCrossVal.CvResult r = smallCv();
+        RealTrainCrossVal.ErrorRow[] errors = r.errors();
+        assertEquals(r.n(), errors.length);
+        boolean[] rowSeen = new boolean[r.n()];
+        int[] truthCounts = new int[N_CLASSES];
+        int[] predCounts = new int[N_CLASSES];
+        for (RealTrainCrossVal.ErrorRow e : errors) {
+            assertTrue(e.row() >= 0 && e.row() < r.n(), "row index in range");
+            assertTrue(!rowSeen[e.row()], "row " + e.row() + " appears twice in the dump");
+            rowSeen[e.row()] = true;
+            assertTrue(e.margin() >= 0, "margin is top1 - top2 and cannot be negative");
+            truthCounts[e.truth()]++;
+            predCounts[e.pred()]++;
+        }
+        assertArrayEquals(r.pooled().truthCounts(), truthCounts,
+                "dump truth counts must equal the pooled confusion's");
+        for (int c = 0; c < N_CLASSES; c++) {
+            int col = 0;
+            for (int t = 0; t < N_CLASSES; t++) {
+                col += r.pooled().confusion()[t * N_CLASSES + c];
+            }
+            assertEquals(col, predCounts[c], "dump predicted counts must equal the confusion column");
+        }
+    }
+
+    @Test
+    void renderedErrorsHaveAHeaderAndOneLinePerRow() {
+        RealTrainCrossVal.CvResult r = smallCv();
+        String csv = RealTrainCrossVal.renderErrors(List.of(r));
+        String[] lines = csv.split("\n", -1);
+        assertEquals("row,doc,fold,features,truth,pred,pGood,pMiddle,pBad,margin", lines[0]);
+        assertEquals(r.n() + 2, lines.length, "header + one line per row + trailing newline");
     }
 }

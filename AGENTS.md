@@ -29,7 +29,7 @@ Two directories that look like scratch but are not:
 
 ## Before committing
 
-Run `./gradlew test`. 189 tests cover the scorers, the metric calibration
+Run `./gradlew test`. 193 tests cover the scorers, the metric calibration
 anchors and the pipeline regressions; they are the only guard that a retune
 has not quietly broken an invariant.
 
