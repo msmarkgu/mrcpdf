@@ -1271,13 +1271,18 @@ public final class RealTrainDump {
 
     /**
      * The {@link MrcReadiness} sub-scores appended to the image+text features.
-     * {@code mrcKappa} is the minimum of the four dimensions and {@code mrcBoxes}
+     * {@code kappa} is the minimum of the four dimensions and {@code boxes}
      * the usable-glyph count behind them, both of which the composite already
      * uses; they are kept as separate columns so the learned model can weight
      * the evidence differently from the hand-written bottleneck rule.
+     *
+     * <p>Named for the quantities they measure, without an {@code mrc} prefix:
+     * the OCR column in particular is computed standalone by
+     * {@code TesseractOcrScore}, so a prefix naming the composite it also feeds
+     * would misdescribe it.
      */
     static final String[] READINESS_FEATURE_NAMES = {
-            "mrcVisual", "mrcMask", "mrcOcr", "mrcBg", "mrcKappa", "mrcBoxes"
+            "visual", "mask", "ocr", "bg", "kappa", "boxes"
     };
 
     static List<String> featureNames() {
