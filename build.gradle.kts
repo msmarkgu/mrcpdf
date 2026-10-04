@@ -73,6 +73,18 @@ tasks.register<JavaExec>("trainQualityModel") {
          "--variant", "image-only", "--docs", "25", "--seed", "42")
 }
 
+// Standalone extractor for the Tesseract OCR score (S_ocr), independent of the
+// MRC pipeline.  Reads a Tesseract TSV plus the searchable PDF that carries the
+// OCR raster's pixel extent.  Pass CLI arguments via -PtesseractOcrArgs, e.g.
+//   ./gradlew tesseractOcrScore -PtesseractOcrArgs="page.tsv page.pdf"
+//   ./gradlew tesseractOcrScore -PtesseractOcrArgs="--dir pages --out scores.txt"
+tasks.register<JavaExec>("tesseractOcrScore") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.tools.TesseractOcrScore")
+    val extra = providers.gradleProperty("tesseractOcrArgs").orNull
+    if (!extra.isNullOrBlank()) setArgs(extra.trim().split(Regex("\\s+")))
+}
+
 // Emits build/synthetic-pages.pdf: one labeled preview sheet per synthetic doc
 // (all clean/mild/degraded variants) so the training pages can be eyeballed.
 tasks.register<JavaExec>("dumpSyntheticPages") {
