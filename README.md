@@ -138,6 +138,7 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 - Tests: `src/test/java/com/mrcpdf/` (JUnit 5; requires Java 21)
 - How MRC compression works, and when not to use it: [`docs/mrc-compression-explained.md`](docs/mrc-compression-explained.md), [`docs/when-not-to-mrc.md`](docs/when-not-to-mrc.md)
 - Quality-gate training / synthetic-corpus labeling: [`docs/synthetic-labels.md`](docs/synthetic-labels.md); dev-only corpus tooling lives in [`src/main/java/com/mrcpdf/tools/`](src/main/java/com/mrcpdf/tools/README.md)
+- Retraining the quality gate on your own scans: [`docs/quality-gate-training.md`](docs/quality-gate-training.md)
 - Performance/compression analysis: [`docs/MRC-compression-effect.md`](docs/MRC-compression-effect.md), [`docs/report-mrc.md`](docs/report-mrc.md)
 - Design notes: [`docs/mrc-only-plan.md`](docs/mrc-only-plan.md), [`docs/bookmarks-hyperlinks-attachments.md`](docs/bookmarks-hyperlinks-attachments.md)
 - Test runs (sample CLI output, compression results): [`docs/test-runs.md`](docs/test-runs.md)

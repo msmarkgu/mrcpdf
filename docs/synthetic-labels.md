@@ -10,6 +10,11 @@ gradle tasks are defined in `build.gradle.kts` (see the `dumpSyntheticSrc` /
 `downloadPdfjs` / `exportLabelHtml` blocks); the Java-side generators live in
 `src/main/java/com/mrcpdf/quality/training/`.
 
+> Training the gate on **your own** documents (rather than this synthetic corpus) is
+> [`docs/quality-gate-training.md`](quality-gate-training.md). Note in particular that
+> the pipeline gates on `quality-image-screen.json`, **not** the `quality-model.json`
+> this workflow regenerates.
+
 ```text
 dumpSyntheticSrc                    exportLabelHtml
   (variant pages PDF + map CSV)       (labeling page, opens in browser)
