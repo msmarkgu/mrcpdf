@@ -534,6 +534,81 @@ tasks.register<JavaExec>("cvRealTrainModel") {
     inputs.property("folds", folds)
 }
 
+// Fits the OCR-free good-vs-rest screen on the 11 image features and writes
+// build/real-train-image-model.json.  Same grouped 80/20 split and same absolute
+// cuts as evalRealTrainModel, so the artifact is fitted on the same 400 rows and
+// the two artifacts are comparable; the cross-validated screen metrics come from
+// cvRealTrainModel instead, because they must come from per-fold models.  Seconds.
+tasks.register<JavaExec>("trainRealImageModel") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainImageModel")
+    jvmArgs("-Xmx2g")
+    val features = "build/real-train-features.csv"
+    val map = "build/real-train-map.csv"
+    val goodAbove = "0.90"
+    val badBelow = "0.60"
+    // The operating point, passed explicitly so the artifact records the number
+    // that was actually used rather than the one compiled into the class.
+    val threshold = "0.70"
+    val defaults = listOf("--features", features, "--map", map,
+        "--good-above", goodAbove, "--bad-below", badBelow,
+        "--threshold", threshold,
+        "--out-json", "build/real-train-image-model.json",
+        "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(features).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing ${missing.joinToString(", ")} — run ./gradlew dumpRealTrain first")
+        }
+        val extra = providers.gradleProperty("realTrainImageArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(layout.buildDirectory.file("real-train-image-model.json"))
+    inputs.file(features)
+    inputs.file(map)
+    inputs.property("realTrainImageArgs", providers.gradleProperty("realTrainImageArgs").orElse(""))
+    inputs.property("goodAbove", goodAbove)
+    inputs.property("badBelow", badBelow)
+    inputs.property("threshold", threshold)
+}
+
+// Regenerates the committed per-page MRC gate from the same data as
+// trainRealImageModel, but writes it where the pipeline reads it.  The two
+// tasks differ only in --out-json: trainRealImageModel keeps a research copy in
+// build/, this one replaces src/main/resources/quality-image-screen.json, which
+// QualityModel.loadScreenDefault() loads at runtime.  Run it after changing
+// FeatureExtractor, the corpus, or the fitter, then ./gradlew test -- the
+// polarity identity test reads the committed file.
+tasks.register<JavaExec>("trainQualityScreen") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainImageModel")
+    jvmArgs("-Xmx2g")
+    val features = "build/real-train-features.csv"
+    val map = "build/real-train-map.csv"
+    val defaults = listOf("--features", features, "--map", map,
+        "--good-above", "0.90", "--bad-below", "0.60",
+        "--threshold", "0.70",
+        "--out-json", "src/main/resources/quality-image-screen.json",
+        "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(features).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing ${missing.joinToString(", ")} — run ./gradlew dumpRealTrain first")
+        }
+        val extra = providers.gradleProperty("realTrainScreenArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    inputs.file(features)
+    inputs.file(map)
+    inputs.property("realTrainScreenArgs", providers.gradleProperty("realTrainScreenArgs").orElse(""))
+}
+
 // Vendors a pinned pdfjs legacy UMD build into build/label/vendor/pdfjs so the
 // static labeling page can render PDFs over file:// (classic script, not ES
 // modules).  Requires network; one-time fetch.

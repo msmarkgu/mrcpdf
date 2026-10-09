@@ -60,10 +60,22 @@
     // DPI (e.g. 600) each page needs ~1 GB, so cap this and raise the JVM heap.
     "pipeline.maxThreads": 0,
 
+    // ===== Origin =====
+    // Pass digital-native pages through unchanged: a page with no page-filling
+    // raster on it is carried into the output exactly as it came in -- no
+    // render, no segmentation, no re-encoded text layer.
+    //   true  = native pages are imported untouched (default)
+    //   false = every page is rendered and rebuilt, native or not
+    // Independent of pipeline.mrc.enabled: it applies with MRC off and under
+    // PDF/A as well.  Override via --no-pass-through / --pass-through.
+    "pipeline.origin.passThrough": true,
+
     // ===== MRC =====
     // Enable Mixed Raster Content compression.
     //   true  = segment background (JPEG) + foreground (JBIG2) + text layer
     //   false = original images (JPEG) + text layer only (no MRC compression)
+    // Digital-native pass-through (pipeline.origin.passThrough) still applies
+    // when this is false.
     "pipeline.mrc.enabled": true,
 
     // Per-page text-quality gate (only applies when MRC is enabled).
@@ -78,11 +90,14 @@
     // default; clean pages score well above it, blank/degraded pages below.
     "pipeline.quality.threshold": 0.5,
 
-    // Phase-2 gate model: when true (and the bundled quality-model.json
-    // artifact is present) the worker's skip decision uses the logistic
-    // degraded probability from TextQualityScorer instead of the geometric
-    // composite threshold above. The geometric threshold remains the
-    // fallback when no model is available.
+    // Per-page gate model: when true (and the bundled quality-image-screen.json
+    // artifact is present) the worker's skip decision uses the 11-feature image
+    // screen's logistic score instead of the geometric composite threshold
+    // above. The artifact's polarity is flipped on load, so the score it
+    // exposes is p(not good) and the threshold reads as "skip when
+    // p(not good) >= 0.30". The geometric threshold remains the fallback
+    // when no artifact is available. quality-model.json is the superseded
+    // research gate and is no longer loaded.
     "pipeline.quality.model.enabled": true,
 
     // Background downscale factor for MRC (0.1 - 1.0).

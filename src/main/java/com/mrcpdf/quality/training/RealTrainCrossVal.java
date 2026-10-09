@@ -402,6 +402,45 @@ public final class RealTrainCrossVal {
         }
         sb.append('\n');
 
+        sb.append('\n');
+        sb.append("=== good-vs-rest screen (pooled out-of-fold, no OCR needed) ===\n");
+        sb.append("rule           good iff pGood >= ").append(String.format(Locale.ROOT, "%.2f",
+                        RealTrainImageModel.SCREEN_THRESHOLD))
+                .append("  -- not argmax over the three heads\n");
+        sb.append(String.format("%-34s %6s %6s %6s %6s %6s %8s%n",
+                "features", "P", "R", "F1", "tp", "fp", "AUC"));
+        sb.append("-".repeat(78)).append('\n');
+        for (CvResult r : results) {
+            GoodScreen.Screen sc = screenOf(r, k);
+            sb.append(String.format(Locale.ROOT, "%-34s %6.3f %6.3f %6.3f %6d %6d %8.3f%n",
+                    r.featureLabel(), sc.pooled().precision(), sc.pooled().recall(),
+                    sc.pooled().f1(), sc.pooled().tp(), sc.pooled().fp(), sc.auc()));
+        }
+        sb.append("\nper-fold screen precision at the same threshold (the floor is what matters;\n");
+        sb.append("a threshold that only holds on some folds is not a screen)\n");
+        for (CvResult r : results) {
+            GoodScreen.Screen sc = screenOf(r, k);
+            sb.append(String.format("%-34s", r.featureLabel()));
+            for (GoodScreen.Counts c : sc.perFold()) {
+                sb.append(String.format(Locale.ROOT, " %6.3f", c.precision()));
+            }
+            sb.append(String.format(Locale.ROOT, "   worst %.3f%n", sc.minFoldPrecision()));
+        }
+        sb.append("\nsweep on the image-only set (F1 is nearly flat, so the threshold is a\n");
+        sb.append("product choice; the sweep is reported rather than optimised)\n");
+        sb.append(GoodScreen.renderSweep(screenOf(results.get(0), k).sweep()));
+        sb.append("\nThe 3 conditional text features add nothing to the screen; OCR does:\n");
+        if (results.size() >= 3) {
+            GoodScreen.Counts image = screenOf(results.get(0), k).pooled();
+            GoodScreen.Counts all = screenOf(results.get(results.size() - 1), k).pooled();
+            sb.append(String.format(Locale.ROOT,
+                    "false-good errors fall from %d to %d and missed-good from %d to %d going "
+                            + "from %d to %d features.%n",
+                    image.fp(), all.fp(), image.fn(), all.fn(),
+                    results.get(0).nFeatures(), results.get(results.size() - 1).nFeatures()));
+        }
+        sb.append("Middle-vs-bad is not separable without OCR text\n");
+
         for (CvResult r : results) {
             sb.append('\n');
             sb.append("=== ").append(r.featureLabel()).append(" -- pooled out-of-fold (n=")
@@ -452,6 +491,17 @@ public final class RealTrainCrossVal {
         return sb.toString();
     }
 
+    /**
+     * The screen for one feature set, at the shipped operating point.
+     *
+     * <p>Derived from the same out-of-fold probabilities as the confusion above,
+     * so the two cannot drift: same rows, same models, same numbers.
+     */
+    private static GoodScreen.Screen screenOf(CvResult r, int k) {
+        return GoodScreen.of(r.errors(), k, RealTrainImageModel.SCREEN_THRESHOLD,
+                GoodScreen.DEFAULT_SWEEP);
+    }
+
     private static double meanAcc(CvResult r) {
         return mean(r, true);
     }
@@ -498,6 +548,11 @@ public final class RealTrainCrossVal {
         sb.append(String.format(Locale.ROOT,
                 "  \"thresholds\": {\"mode\": \"absolute\", \"goodAbove\": %.3f, \"badBelow\": %.3f},%n",
                 goodAbove, badBelow));
+        sb.append(String.format(Locale.ROOT,
+                "  \"screen\": {\"rule\": \"good iff pGood >= threshold\", \"threshold\": %.3f,"
+                        + " \"note\": \"threshold picked on these out-of-fold predictions, so its"
+                        + " precision/recall are mildly optimistic\"},%n",
+                RealTrainImageModel.SCREEN_THRESHOLD));
         sb.append("  \"featureNames\": [");
         for (int i = 0; i < names.size(); i++) {
             if (i > 0) sb.append(", ");
@@ -533,6 +588,37 @@ public final class RealTrainCrossVal {
             sb.append("],\n");
             sb.append("      \"heldOutBasePagesPerFold\": ").append(iarr(r.foldDocCounts()))
                     .append(",\n");
+            GoodScreen.Screen sc = screenOf(r, k);
+            sb.append("      \"goodVsRest\": {\"tp\": ").append(sc.pooled().tp())
+                    .append(", \"fp\": ").append(sc.pooled().fp())
+                    .append(", \"fn\": ").append(sc.pooled().fn())
+                    .append(", \"tn\": ").append(sc.pooled().tn())
+                    .append(String.format(Locale.ROOT, ", \"precision\": %.6f, \"recall\": %.6f,"
+                            + " \"f1\": %.6f, \"auc\": %.6f,%n",
+                            sc.pooled().precision(), sc.pooled().recall(), sc.pooled().f1(),
+                            sc.auc()));
+            sb.append(String.format(Locale.ROOT, " \"minPerFoldPrecision\": %.6f,%n",
+                    sc.minFoldPrecision()));
+            sb.append(" \"argmaxDisagreements\": ").append(sc.argmaxDisagreements()).append(",\n");
+            sb.append("        \"perFold\": [");
+            for (int f = 0; f < k; f++) {
+                if (f > 0) sb.append(", ");
+                GoodScreen.Counts c = sc.perFold()[f];
+                sb.append(String.format(Locale.ROOT,
+                        "{\"fold\": %d, \"tp\": %d, \"fp\": %d, \"fn\": %d, \"precision\": %.6f}",
+                        f, c.tp(), c.fp(), c.fn(), c.precision()));
+            }
+            sb.append("],\n");
+            sb.append("        \"sweep\": [");
+            for (int s = 0; s < sc.sweep().length; s++) {
+                GoodScreen.SweepPoint sp = sc.sweep()[s];
+                if (s > 0) sb.append(", ");
+                sb.append(String.format(Locale.ROOT,
+                        "{\"threshold\": %.2f, \"precision\": %.6f, \"recall\": %.6f, \"f1\": %.6f}",
+                        sp.threshold(), sp.counts().precision(), sp.counts().recall(),
+                        sp.counts().f1()));
+            }
+            sb.append("]},\n");
             sb.append("      \"perFold\": [\n");
             for (int f = 0; f < k; f++) {
                 FoldMetrics fm = r.perFold()[f];

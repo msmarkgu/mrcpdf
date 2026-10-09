@@ -13,10 +13,17 @@ import java.util.Map;
  * z-score statistics, weights, bias, and a decision threshold chosen at
  * degraded-recall ~0.9 on a held-out validation split.
  *
- * Serializable to/from the {@code quality-model.json} artifact via {@link
- * QualityJson} (zero runtime dependencies).  Loaded by the pipeline scorer to
- * replace the Phase-1 geometric gate when available; the scorer falls back to
- * the geometric threshold when {@code loadDefault()} returns null.
+ * Serializable to/from the bundled artifacts via {@link QualityJson} (zero
+ * runtime dependencies). The pipeline gates on {@link #loadScreenDefault};
+ * when that returns null the scorer falls back to the Phase-1 geometric
+ * threshold.
+ *
+ * <p>Two artifacts load into this class. {@link #load} reads
+ * {@code quality-model.json} verbatim (legacy; still pinned by tests but no
+ * longer used by the pipeline). {@link #loadScreen} reads
+ * {@code quality-image-screen.json}, the good-vs-rest screen the pipeline gates
+ * on, and resolves its opposite polarity -- see the method for why that cannot
+ * be left to the caller.
  */
 public final class QualityModel {
 
@@ -84,7 +91,11 @@ public final class QualityModel {
     // Inference
     // ──────────────────────────────────────────────────────────────────────
 
-    /** Predicted degraded probability for a raw feature vector. */
+    /**
+     * Predicted skip-side probability for a raw feature vector: the probability
+     * that the gate's "yes, skip MRC" side holds. Which side that is depends on
+     * the artifact -- see {@link #load} and {@link #loadScreen}.
+     */
     public double predict(double[] features) {
         if (features.length != featureNames.size()) {
             throw new IllegalArgumentException("Expected " + featureNames.size()
@@ -105,7 +116,14 @@ public final class QualityModel {
         return out;
     }
 
-    /** Gate: true ⇒ degraded ⇒ MRC should be skipped (fidelity path). */
+    /**
+     * Gate: true ⇒ degraded ⇒ MRC should be skipped (fidelity path).
+     *
+     * <p>Which probability {@link #predict} is returning is decided when the
+     * artifact is loaded, not here: {@link #load} leaves it as the file's own
+     * polarity (higher = more degraded), while {@link #loadScreen} negates the
+     * weights of a {@code pGood} screen so that "higher = worse" holds for both.
+     */
     public boolean gate(double[] features) {
         return predict(features) >= threshold;
     }
@@ -154,7 +172,11 @@ public final class QualityModel {
                 weights, bias, threshold, auc, recall, precision);
     }
 
-    /** Loads the bundled artifact from the classpath, or null when absent. */
+    /**
+     * Loads the legacy {@code quality-model.json} artifact from the classpath,
+     * or null when absent. Superseded by {@link #loadScreenDefault}: the
+     * pipeline no longer calls this, only its own tests do.
+     */
     public static QualityModel loadDefault() {
         try (InputStream in = QualityModel.class.getResourceAsStream("/quality-model.json")) {
             if (in == null) return null;
@@ -162,6 +184,143 @@ public final class QualityModel {
         } catch (IOException e) {
             return null;
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // The good-vs-rest screen
+    // ──────────────────────────────────────────────────────────────────────
+
+    /** Classpath location of the bundled screen artifact. */
+    static final String SCREEN_RESOURCE = "/quality-image-screen.json";
+
+    /**
+     * Loads the bundled good-vs-rest screen, or null when absent or malformed.
+     *
+     * <p>{@code quality-image-screen.json} is written by
+     * {@code ./gradlew trainQualityScreen}. It is <em>not</em> a {@link #load}
+     * artifact: the scaler sits under {@code scaler}, the weights under
+     * {@code heads[class=="good"]}, there is no {@code version}, and -- the one
+     * that matters -- it stores {@code pGood}, where higher means <em>better</em>.
+     * {@link #load} on this file either throws or, worse, would read a good page
+     * as a degraded one.
+     *
+     * <p>So the polarity is resolved here, once: the weights and bias are negated
+     * and the threshold flipped to {@code 1 - pGoodThreshold}, making
+     * {@code predict(x) == 1 - pGood(x)} and leaving {@link #gate} with its usual
+     * meaning of "true ⇒ skip MRC". Every other caller sees one polarity. The
+     * identity is pinned by {@code QualityModelTest}; the alternative -- a
+     * direction flag threaded through the scorer -- would leave two opposite
+     * meanings behind the same method name.
+     */
+    public static QualityModel loadScreen(InputStream in) {
+        String json;
+        try {
+            json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to read screen artifact", e);
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> root = (Map<String, Object>) QualityJson.parse(json);
+
+        List<String> featureNames = strings(root.get("featureNames"), "featureNames");
+        int d = featureNames.size();
+
+        Map<String, Object> scaler = map(root.get("scaler"), "scaler");
+        double[] lo = doubles(scaler, "winsorizeLower", d);
+        double[] hi = doubles(scaler, "winsorizeUpper", d);
+        double[] means = doubles(scaler, "means", d);
+        double[] stds = doubles(scaler, "stds", d);
+
+        Map<String, Object> head = goodHead(root.get("heads"));
+        double[] rawWeights = doubles(head, "weights", d);
+        double rawBias = number(head, "bias");
+
+        Map<String, Object> screen = map(root.get("screen"), "screen");
+        double pGoodThreshold = number(screen, "threshold");
+        if (!(pGoodThreshold > 0.0 && pGoodThreshold < 1.0)) {
+            throw new IllegalArgumentException("screen.threshold must be in (0, 1), got "
+                    + pGoodThreshold);
+        }
+
+        // Optional: the metrics block is reporting, not structure. Absent, the
+        // model still scores identically and the banner just prints zeros.
+        Map<String, Object> metrics = optionalMap(root.get("metrics"));
+        double auc = optNumber(metrics, "auc");
+        double recall = optNumber(metrics, "recall");
+        double precision = optNumber(metrics, "precision");
+
+        double[] weights = new double[d];
+        for (int i = 0; i < d; i++) weights[i] = -rawWeights[i];
+        return new QualityModel(VARIANT_IMAGE_ONLY, featureNames, lo, hi, means, stds,
+                weights, -rawBias, 1.0 - pGoodThreshold, auc, recall, precision);
+    }
+
+    /** The screen artifact from the classpath, or null when absent or malformed. */
+    public static QualityModel loadScreenDefault() {
+        try (InputStream in = QualityModel.class.getResourceAsStream(SCREEN_RESOURCE)) {
+            if (in == null) return null;
+            return loadScreen(in);
+        } catch (IOException | IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /** The single {@code heads} entry standing for the good class. */
+    private static Map<String, Object> goodHead(Object value) {
+        if (!(value instanceof List<?> list)) {
+            throw new IllegalArgumentException("Missing 'heads' array");
+        }
+        Map<String, Object> found = null;
+        for (Object o : list) {
+            Map<String, Object> head = map(o, "heads[]");
+            if ("good".equals(head.get("class"))) {
+                if (found != null) {
+                    throw new IllegalArgumentException("Screen artifact has more than one "
+                            + "head for class 'good'");
+                }
+                found = head;
+            }
+        }
+        if (found == null) {
+            throw new IllegalArgumentException("Screen artifact has no head for class 'good'");
+        }
+        return found;
+    }
+
+    private static Map<String, Object> map(Object value, String field) {
+        if (!(value instanceof Map<?, ?> m)) {
+            throw new IllegalArgumentException("Missing '" + field + "' object");
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> cast = (Map<String, Object>) m;
+        return cast;
+    }
+
+    private static Map<String, Object> optionalMap(Object value) {
+        if (value == null) return Map.of();
+        return map(value, "metrics");
+    }
+
+    private static List<String> strings(Object value, String field) {
+        if (!(value instanceof List<?> list)) {
+            throw new IllegalArgumentException("Missing '" + field + "' array");
+        }
+        List<String> out = new ArrayList<>(list.size());
+        for (Object o : list) {
+            if (!(o instanceof String s)) {
+                throw new IllegalArgumentException(field + " must be strings");
+            }
+            out.add(s);
+        }
+        if (out.isEmpty()) {
+            throw new IllegalArgumentException("'" + field + "' must not be empty");
+        }
+        return out;
+    }
+
+    private static double optNumber(Map<String, Object> root, String field) {
+        Object o = root.get(field);
+        return o instanceof Number n ? n.doubleValue() : 0.0;
     }
 
     /** Serializes this model to the artifact JSON format. */

@@ -19,6 +19,7 @@ import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDFont;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
@@ -471,6 +472,37 @@ PDFont pageFont = resolveFont(output);
         }
 
         return outPage;
+    }
+
+    /**
+     * Carries a source page into the output untouched: its own content stream,
+     * fonts and images, with no rasterisation and no re-encoded text layer.
+     * Used for digital-native pages, where rendering could only lose what is
+     * already there.
+     *
+     * <p>{@link PDDocument#importPage} shallow-copies the page's own entries, so
+     * a page that owns its {@code /Resources} comes through as it is. A page
+     * that <em>inherits</em> them from its {@code /Pages} parent does not: the
+     * page dictionary has no such entry to copy, and the content stream would
+     * then name fonts and images nothing resolves (PDFBox's own javadoc calls
+     * this out and asks callers to restore them).
+     *
+     * @param output    The output PDDocument being built.
+     * @param source    The source PDDocument (already loaded).
+     * @param pageIndex 0-based page index in source.
+     * @return The imported page, added to output.
+     */
+    public PDPage importOriginalPage(PDDocument output, PDDocument source, int pageIndex)
+            throws IOException {
+        PDPage srcPage = source.getPage(pageIndex);
+        PDPage imported = output.importPage(srcPage);
+        if (!srcPage.getCOSObject().containsKey(COSName.RESOURCES)) {
+            PDResources resources = srcPage.getResources();
+            if (resources != null) {
+                imported.setResources(resources);
+            }
+        }
+        return imported;
     }
 
     /**

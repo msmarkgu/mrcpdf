@@ -3,6 +3,8 @@ package com.mrcpdf.quality.model;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
@@ -103,5 +105,160 @@ class QualityModelTest {
         System.out.println("GOLDEN_DEGRADED prediction: " + pDegraded);
         assertEquals(5.271871468898777E-6, pClean, 1e-12, "clean-row prediction changed");
         assertEquals(0.9992585432742552, pDegraded, 1e-12, "degraded-row prediction changed");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // quality-image-screen.json -- the artifact the pipeline actually gates on
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * {@link QualityModel#loadScreen} documents itself as the exact negation of
+     * the shipped good head: {@code predict(x) == 1 - pGood(x)} with the
+     * threshold flipped to match, so {@link QualityModel#gate} keeps its
+     * "true ⇒ skip MRC" meaning for the screen as it had for the legacy gate.
+     *
+     * <p>Both {@code pGood} and the threshold are recomputed here from the raw
+     * bytes with this test's own parser and its own sigmoid, so no production
+     * parsing or scoring code is shared with the loader under test. If
+     * {@code loadScreen} stopped negating, or negated only the weights, or left
+     * the threshold pointing at the good side, this fails.
+     *
+     * <p>The tie falls on the skip side, because {@code gate} is
+     * {@code predict >= threshold} and {@code 1 - pGood >= 1 - 0.700} holds at
+     * equality. The artifact's own {@code screen.rule} says "good iff
+     * pGood >= threshold", so at exactly 0.700 the two disagree by a
+     * measure-zero set -- and the conservative reading (skip) is the one the
+     * pipeline executes. That direction is pinned by the exact threshold
+     * assertion below rather than by a vector engineered to land on equality,
+     * which no floating-point construction could do reliably.
+     */
+    @Test
+    void loadScreenIsTheNegationOfTheShippedGoodHead() throws Exception {
+        String json = rawScreenArtifact();
+
+        int scalerAt = json.indexOf("\"scaler\"");
+        assertTrue(scalerAt > 0, "artifact has no scaler block");
+        double[] lo = arrayAfter(json, "winsorizeLower", scalerAt);
+        double[] hi = arrayAfter(json, "winsorizeUpper", scalerAt);
+        double[] means = arrayAfter(json, "means", scalerAt);
+        double[] stds = arrayAfter(json, "stds", scalerAt);
+
+        int headsAt = json.indexOf("\"heads\"");
+        int goodHeadAt = json.indexOf("\"good\"", headsAt);
+        assertTrue(headsAt > 0 && goodHeadAt > headsAt, "artifact has no good head");
+        double headBias = numberAfter(json, "bias", goodHeadAt);
+        double[] headWeights = arrayAfter(json, "weights", goodHeadAt);
+
+        int screenAt = json.indexOf("\"screen\"");
+        double pGoodThreshold = numberAfter(json, "threshold", screenAt);
+
+        QualityModel screen = QualityModel.loadScreen(
+                new ByteArrayInputStream(json.getBytes(StandardCharsets.UTF_8)));
+
+        assertEquals(1.0 - pGoodThreshold, screen.threshold(), 0.0,
+                "the threshold must be flipped, not reused verbatim");
+
+        double[][] vectors = {
+                parse(GOLDEN_CLEAN),          // below the lower winsor bounds
+                parse(GOLDEN_DEGRADED),       // a mix of both sides
+                means.clone(),                // every z-score 0
+                {hi[0] + 1, hi[1] + 1, hi[2] + 1, hi[3] + 1, hi[4] + 1, hi[5] + 1,
+                        hi[6] + 1, hi[7] + 1, hi[8] + 1, hi[9] + 1, hi[10] + 1},
+        };
+        boolean sawGood = false;
+        boolean sawSkip = false;
+        for (double[] v : vectors) {
+            double pGood = pGood(v, lo, hi, means, stds, headWeights, headBias);
+            assertEquals(1.0 - pGood, screen.predict(v), 1e-9,
+                    "predict must be 1 - pGood for " + java.util.Arrays.toString(v));
+            assertEquals(pGood <= pGoodThreshold, screen.gate(v),
+                    "gate must fire exactly when pGood <= " + pGoodThreshold
+                            + " (pGood=" + pGood + ")");
+            sawGood |= pGood > pGoodThreshold;
+            sawSkip |= pGood <= pGoodThreshold;
+        }
+        assertTrue(sawGood && sawSkip,
+                "the vectors must straddle the threshold or this test proves nothing");
+    }
+
+    /**
+     * The tie, isolated: at exactly {@code pGood == threshold} the page is not
+     * good, so the gate fires. With {@code screen.threshold} at 0.5 and every
+     * z-score at 0 the negated head lands on 0.5 exactly, so this needs no
+     * floating-point construction to hit an equality -- {@code gate} is a plain
+     * {@code predict >= threshold}. Changing it to {@code >} sends the tie to
+     * the good side and fails here; the flip itself is pinned by
+     * {@link #loadScreenIsTheNegationOfTheShippedGoodHead}, which needs 0.5 to
+     * be indistinguishable from its own negation to pass.
+     */
+    @Test
+    void gateFiresOnAnExactTie() {
+        String json = """
+                {
+                  "featureNames": ["a", "b"],
+                  "scaler": {
+                    "winsorizeLower": [-1e308, -1e308],
+                    "winsorizeUpper": [1e308, 1e308],
+                    "means": [0, 0],
+                    "stds": [1, 1]
+                  },
+                  "heads": [{"class": "good", "bias": 0.0, "weights": [1.0, -1.0]}],
+                  "screen": {"rule": "good iff pGood >= threshold", "threshold": 0.5}
+                }
+                """;
+        QualityModel screen = QualityModel.loadScreen(
+                new ByteArrayInputStream(json.getBytes(StandardCharsets.UTF_8)));
+
+        double[] zero = {0.0, 0.0};
+        assertEquals(0.5, screen.threshold(), 0.0, "threshold must be 1 - 0.5");
+        assertEquals(0.5, screen.predict(zero), 0.0, "an all-zero z-score is sigmoid(0)");
+        assertTrue(screen.gate(zero), "an exact tie must fall on the skip side");
+    }
+
+    /** The committed screen artifact, straight from the classpath. */
+    private static String rawScreenArtifact() throws IOException {
+        try (InputStream in = QualityModel.class.getResourceAsStream(QualityModel.SCREEN_RESOURCE)) {
+            assertNotNull(in, "screen artifact missing from the classpath -- "
+                    + "run ./gradlew trainQualityScreen");
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    /** The numeric value following {@code "key"} in {@code json} at or after {@code from}. */
+    private static double numberAfter(String json, String key, int from) {
+        int k = json.indexOf("\"" + key + "\"", from);
+        assertTrue(k > 0, "artifact has no key \"" + key + "\"");
+        int colon = json.indexOf(':', k);
+        int start = colon + 1;
+        while (start < json.length() && " \t\r\n+,".indexOf(json.charAt(start)) >= 0) start++;
+        int end = start;
+        while (end < json.length() && "+-0123456789.eE".indexOf(json.charAt(end)) >= 0) end++;
+        assertTrue(end > start, "no number after \"" + key + "\"");
+        return Double.parseDouble(json.substring(start, end));
+    }
+
+    /** The array following {@code "key"} in {@code json} at or after {@code from}. */
+    private static double[] arrayAfter(String json, String key, int from) {
+        int k = json.indexOf("\"" + key + "\"", from);
+        assertTrue(k > 0, "artifact has no key \"" + key + "\"");
+        int open = json.indexOf('[', k);
+        int close = json.indexOf(']', open);
+        assertTrue(open > 0 && close > open, "no array after \"" + key + "\"");
+        String[] parts = json.substring(open + 1, close).split(",");
+        double[] out = new double[parts.length];
+        for (int i = 0; i < parts.length; i++) out[i] = Double.parseDouble(parts[i].trim());
+        return out;
+    }
+
+    /** pGood: winsorize, z-score, then the good head's logistic. Written here, not imported. */
+    private static double pGood(double[] raw, double[] lo, double[] hi, double[] means,
+                                double[] stds, double[] weights, double bias) {
+        double z = bias;
+        for (int i = 0; i < raw.length; i++) {
+            double v = Math.max(lo[i], Math.min(hi[i], raw[i]));
+            double t = (v - means[i]) / (stds[i] > 1e-9 ? stds[i] : 1.0);
+            z += weights[i] * t;
+        }
+        return 1.0 / (1.0 + Math.exp(-z));
     }
 }

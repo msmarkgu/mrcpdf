@@ -1,5 +1,6 @@
 package com.mrcpdf;
 
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
@@ -24,6 +25,7 @@ import javax.imageio.ImageIO;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 
@@ -38,6 +40,7 @@ import com.mrcpdf.model.TextBlock;
 import com.mrcpdf.pipeline.ImageEncoder;
 import com.mrcpdf.pipeline.ImageSegmenter;
 import com.mrcpdf.pipeline.JBIG2Compressor;
+import com.mrcpdf.pipeline.PageOrigin;
 import com.mrcpdf.pipeline.PDFAssembler;
 import com.mrcpdf.pipeline.TextExtractor;
 import com.mrcpdf.quality.TextQualityScore;
@@ -93,6 +96,9 @@ public class MrcPdf implements Callable<Integer> {
     @Option(names = {"--mrc"}, description = "Enable/disable MRC compression (default: on)", negatable = true)
     private Boolean mrcEnabled;
 
+    @Option(names = {"--pass-through"}, description = "Pass digital-native pages through unchanged (default: on)", negatable = true)
+    private Boolean passThroughEnabled;
+
     @Override
     public Integer call() {
         Settings settings = Settings.load();
@@ -112,6 +118,11 @@ public class MrcPdf implements Callable<Integer> {
 
             boolean useMrc = mrcEnabled != null ? mrcEnabled : settings.getBoolean("pipeline.mrc.enabled", true);
             boolean usePdfa = pdfa != null ? pdfa : settings.getBoolean("pdf.pdfa.enabled", false);
+            // Digital-native pass-through runs regardless of --mrc and of the
+            // quality gate: a page already made of vectors gains nothing from
+            // being rendered and re-assembled, so it is carried over as it is.
+            boolean passThrough = passThroughEnabled != null ? passThroughEnabled
+                    : settings.getBoolean("pipeline.origin.passThrough", true);
 
             float resolvedDpi = dpi != null ? dpi
                     : (float) settings.getDouble("rendering.dpi", 300);
@@ -149,6 +160,7 @@ public class MrcPdf implements Callable<Integer> {
             System.out.println("  Output: " + resolvedOutput);
             System.out.println("  DPI:    " + resolvedDpi);
             System.out.println("  MRC:    " + (useMrc ? "on" : "off"));
+            System.out.println("  Pass-through: " + (passThrough ? "on" : "off"));
 
             ImageSegmenter segmenter = new ImageSegmenter(
                     settings.getInt("segmenter.tileSize", 64),
@@ -184,15 +196,18 @@ public class MrcPdf implements Callable<Integer> {
             double qualityGateThreshold = settings.getDouble("pipeline.quality.threshold",
                     TextQualityScorer.DEFAULT_GATE_THRESHOLD);
 
-            // Phase-2 gate model (logistic regression on image features).  When
-            // loaded it supersedes the geometric threshold in the worker's
-            // gate decision; absent, the geometric gate runs unchanged.
+            // Per-page gate model: the 11-feature digital-native-adjacent image
+            // screen trained on the real corpus.  When loaded it decides which
+            // non-native pages are worth compressing; absent, the geometric
+            // gate runs unchanged.
             boolean modelEnabled = settings.getBoolean("pipeline.quality.model.enabled", true);
             QualityModel qualityModel = null;
             if (modelEnabled) {
-                qualityModel = QualityModel.loadDefault();
+                qualityModel = QualityModel.loadScreenDefault();
                 if (qualityModel != null) {
-                    System.out.printf("  Model:  %s gate, %d features, threshold p(degraded)>=%.3f (val AUC %.3f)%n",
+                    // predict() is p(not good) -- the artifact's polarity is
+                    // flipped on load so the gate's meaning is unchanged.
+                    System.out.printf("  Model:  %s gate, %d features, skip when p(not good)>=%.3f (holdout AUC %.3f)%n",
                             qualityModel.variant(), qualityModel.featureNames().size(),
                             qualityModel.threshold(), qualityModel.auc());
                 }
@@ -222,9 +237,9 @@ public class MrcPdf implements Callable<Integer> {
             }
 
             runPipeline(inputFile, resolvedOutput, segmenter, compressor, assembler,
-                    useMrc, usePdfa, resolvedDpi, workerThreads, resolvedFontPath, fgColorEnabled,
-                    resolvedBgScale, resolvedJpegQuality, qualityGateEnabled, qualityGateThreshold,
-                    qualityModel);
+                    useMrc, usePdfa, passThrough, resolvedDpi, workerThreads, resolvedFontPath,
+                    fgColorEnabled, resolvedBgScale, resolvedJpegQuality, qualityGateEnabled,
+                    qualityGateThreshold, qualityModel);
             return 0;
 
         } catch (Exception e) {
@@ -237,7 +252,7 @@ public class MrcPdf implements Callable<Integer> {
     private void runPipeline(File inputFile, File outputFile,
                              ImageSegmenter segmenter,
                              JBIG2Compressor compressor, PDFAssembler assembler,
-                             boolean useMrc, boolean usePdfa, float dpi,
+                             boolean useMrc, boolean usePdfa, boolean passThrough, float dpi,
                              int workerThreads, String fontPath, boolean fgColorEnabled,
                              double resolvedBgScale, float resolvedJpegQuality,
                              boolean qualityGateEnabled, double qualityGateThreshold,
@@ -256,6 +271,20 @@ public class MrcPdf implements Callable<Integer> {
             }
 
             long totalStart = System.nanoTime();
+
+            // ── Origin pass (main thread): which pages are digital native? ──
+            //   Decided before the render loop so native pages are never
+            //   rasterised at all -- the whole point of passing them through.
+            boolean[] nativePage = new boolean[pageCount];
+            int nativeCount = 0;
+            if (passThrough) {
+                for (int i = 0; i < pageCount; i++) {
+                    nativePage[i] = PageOrigin.isDigitalNative(source.getPage(i));
+                    if (nativePage[i]) nativeCount++;
+                }
+                System.out.println("  Pass-through pages: " + nativeCount + " (digital native)");
+            }
+
             System.out.println("  Processing " + pageCount + " pages...");
 
             // ── Pass 1: render + prep ──
@@ -272,6 +301,7 @@ public class MrcPdf implements Callable<Integer> {
                 BufferedImage mask;
                 TextQualityScore qualityScore;
                 boolean gateSkip;
+                boolean passThrough;
             }
             PageData[] pageData = new PageData[pageCount];
             AtomicInteger threadCounter = new AtomicInteger(1);
@@ -295,24 +325,33 @@ public class MrcPdf implements Callable<Integer> {
                         throw new IOException("Pipeline interrupted", e);
                     }
 
-                    BufferedImage page = renderer.renderImageWithDPI(i, dpi);
-
                     final int pageIdx = i;
+                    // Digital-native pages are never rasterised at all.
+                    final BufferedImage page = nativePage[i] ? null
+                            : renderer.renderImageWithDPI(i, dpi);
+
                     futures.add(executor.submit(() -> {
                         long localStart = System.nanoTime();
                         try {
                             PageData pd = new PageData();
                             pageData[pageIdx] = pd;
-                            pd.imgW = page.getWidth();
-                            pd.imgH = page.getHeight();
+                            pd.passThrough = nativePage[pageIdx];
+                            if (pd.passThrough) {
+                                pd.imgW = rasterWidth(source.getPage(pageIdx), dpi);
+                                pd.imgH = rasterHeight(source.getPage(pageIdx), dpi);
+                            } else {
+                                pd.imgW = page.getWidth();
+                                pd.imgH = page.getHeight();
+                            }
 
-// Per-page text-quality gate: score the rendered page
+                            boolean screenGood = true;
+                            // Per-page text-quality gate: score the rendered page
                             // and, when quality is low, keep the fidelity path
                             // (full-res page, no MRC segmentation).  Scoring uses
                             // whole-page metrics: the PDFBox-derived text layer
                             // pins confidence to exactly 100.0, so text-layer
                             // glyph scoring is not engaged by this pipeline.
-                            if (useMrc && qualityGateEnabled) {
+                            if (!pd.passThrough && useMrc && qualityGateEnabled) {
                                 TextQualityScore score = scorer.compute(page, null);
                                 // Model gate when a decision is available; the
                                 // geometric threshold is the fallback (no model
@@ -321,8 +360,9 @@ public class MrcPdf implements Callable<Integer> {
                                         || (score.getModelProbability() < 0
                                             && score.isBelow(qualityGateThreshold));
                                 pd.qualityScore = score;
+                                screenGood = !pd.gateSkip;
                                 if (pd.gateSkip) {
-                                    System.out.printf("    [quality] page %d: composite %.2f, p(degraded)=%s — MRC skipped (fidelity path)%n",
+                                    System.out.printf("    [quality] page %d: composite %.2f, p(not good)=%s — MRC skipped (fidelity path)%n",
                                             pageIdx + 1, score.getComposite(),
                                             score.getModelProbability() >= 0
                                                     ? String.format("%.2f", score.getModelProbability())
@@ -330,7 +370,15 @@ public class MrcPdf implements Callable<Integer> {
                                 }
                             }
 
-                            if (useMrc && !pd.gateSkip) {
+                            if (pd.passThrough) {
+                                // Nothing to segment or encode.  The JBIG2 batch
+                                // runs over the whole document, so this page still
+                                // needs a mask slot to keep the indices aligned.
+                                if (useMrc) {
+                                    writeWhiteMask(tempDir, pageIdx, pd.imgW, pd.imgH);
+                                }
+                            } else if (runMrc(pd.passThrough, useMrc, qualityGateEnabled,
+                                    screenGood)) {
                                 SegmentedImage seg = segmenter.segment(page);
                                 pd.mask = seg.getForegroundMask();
                                 // Write mask as PNG for jbig2enc (lossless, compact)
@@ -344,17 +392,9 @@ public class MrcPdf implements Callable<Integer> {
                                             assembler.getFgJpegQuality(), assembler.getFgScale());
                                 }
                             } else if (useMrc) {
-                                // Gate-skipped: no segmentation; write an empty
-                                // white mask so the JBIG2 batch stays index-aligned.
-                                BufferedImage emptyMask = new BufferedImage(
-                                        page.getWidth(), page.getHeight(),
-                                        BufferedImage.TYPE_BYTE_BINARY);
-                                emptyMask.getGraphics().setColor(java.awt.Color.WHITE);
-                                emptyMask.getGraphics().fillRect(0, 0,
-                                        page.getWidth(), page.getHeight());
-                                emptyMask.getGraphics().dispose();
-                                ImageIO.write(emptyMask, "png",
-                                        new File(tempDir.toFile(), "mask-" + pageIdx + ".png"));
+                                // Gate-skipped: no segmentation; an empty white
+                                // mask keeps the JBIG2 batch index-aligned.
+                                writeWhiteMask(tempDir, pageIdx, pd.imgW, pd.imgH);
                             } else {
                                 pd.bgJpeg = ImageEncoder.encodeBackground(page,
                                         resolvedJpegQuality, false, 1.0, 0f);
@@ -396,10 +436,15 @@ public class MrcPdf implements Callable<Integer> {
                 List<PageResult> results = new ArrayList<>(pageCount);
                 for (int i = 0; i < pageCount; i++) {
                     PageData pd = pageData[i];
+                    // Extracted for every page, pass-through included: the
+                    // blocks are what the final word count and the CJK font
+                    // check read. A pass-through page never has a layer
+                    // written for it -- it keeps its own -- but its words are
+                    // still in the output and are still counted.
                     TextExtractor.extractTextBlocks(source, i, dpi, pd.imgW, pd.imgH, textBlocksOut);
                     results.add(new PageResult(i, pd.imgW, pd.imgH, textBlocksOut[0],
                             pd.bgJpeg, pd.fgColorJpeg, pd.mask,
-                            pd.qualityScore, pd.gateSkip));
+                            pd.qualityScore, pd.gateSkip, pd.passThrough));
                 }
 
                 // ── Font resolution for the invisible text layer ──
@@ -443,7 +488,10 @@ public class MrcPdf implements Callable<Integer> {
                     for (int i = 0; i < pageCount; i++) {
                         PageResult pr = results.get(i);
                         PDPage outPage;
-                        if (pr.isMrcSkip()) {
+                        if (pr.isPassThrough()) {
+                            // Digital native: the source page, untouched.
+                            outPage = assembler.importOriginalPage(output, source, i);
+                        } else if (pr.isMrcSkip()) {
                             // Quality gate: original page as the only visual layer.
                             BufferedImage bg = renderer.renderImageWithDPI(i, dpi);
                             outPage = assembler.addPageFidelity(output, source, i, bg, pr);
@@ -567,6 +615,56 @@ public class MrcPdf implements Callable<Integer> {
             }
         }
         return false;
+    }
+
+    /**
+     * The conjunction this pipeline is built on: a page is MRC-compressed only
+     * when it is not digital native and the screen calls it worth compressing.
+     * A native page passes through whatever the screen says; with MRC off every
+     * page takes the plain raster path; with the gate disabled every
+     * non-native page is compressed.
+     *
+     * <p>Package-private so all four combinations of the first and last
+     * arguments are directly testable rather than inferred through the
+     * worker's branch structure.
+     */
+    static boolean runMrc(boolean digitalNative, boolean useMrc, boolean qualityGateEnabled,
+                          boolean screenGood) {
+        if (digitalNative || !useMrc) return false;
+        return !qualityGateEnabled || screenGood;
+    }
+
+    /** Rendered pixel width of a source page at {@code dpi}, rotation applied. */
+    private static int rasterWidth(PDPage page, float dpi) {
+        PDRectangle box = page.getCropBox();
+        return rasterDimension(page.getRotation() % 180 != 0 ? box.getHeight() : box.getWidth(),
+                dpi);
+    }
+
+    /** Rendered pixel height of a source page at {@code dpi}, rotation applied. */
+    private static int rasterHeight(PDPage page, float dpi) {
+        PDRectangle box = page.getCropBox();
+        return rasterDimension(page.getRotation() % 180 != 0 ? box.getWidth() : box.getHeight(),
+                dpi);
+    }
+
+    private static int rasterDimension(float points, float dpi) {
+        return Math.max(1, (int) Math.ceil(points * dpi / 72.0));
+    }
+
+    /**
+     * Writes an all-white mask for a page that produced no foreground. The
+     * JBIG2 batch compresses masks by document index, so every page needs a
+     * file even when nothing was segmented.
+     */
+    private static void writeWhiteMask(Path tempDir, int pageIndex, int width, int height)
+            throws IOException {
+        BufferedImage mask = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_BINARY);
+        Graphics2D g = mask.createGraphics();
+        g.setColor(java.awt.Color.WHITE);
+        g.fillRect(0, 0, width, height);
+        g.dispose();
+        ImageIO.write(mask, "png", new File(tempDir.toFile(), "mask-" + pageIndex + ".png"));
     }
 
     private static String formatSize(long bytes) {

@@ -26,6 +26,8 @@ import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecification;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile;
 import org.apache.pdfbox.pdmodel.font.PDType0Font;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.apache.pdfbox.pdmodel.graphics.image.JPEGFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.graphics.state.RenderingMode;
@@ -75,6 +77,8 @@ public class TestPdfGenerator implements Callable<Integer> {
             makeNoisyScan();
             makeScannedText();
             makeAllInOne();
+            makeBornDigital();
+            makeMixedOrigin();
 
             System.out.println("\nDone. Files in " + OUT_DIR + "/");
             return 0;
@@ -783,6 +787,111 @@ public class TestPdfGenerator implements Callable<Integer> {
             doc.save(path.toFile());
         }
         System.out.println("  all-features.pdf");
+    }
+
+    // ── 10. born-digital.pdf / mixed-origin.pdf ─────────────────────────
+
+    /** Pages drawn as vector text with no raster behind them. */
+    private static final String[] VECTOR_LINES = {
+        "This paragraph is real text: it is written into the content stream with a",
+        "font and a show operator, not painted into an image and then embedded as a",
+        "bitmap. Search, copy and selection all work because the glyphs are glyphs.",
+        "A rasterisation of this page would still be legible, but it would be a",
+        "picture of text rather than text, and it would grow at every zoom level.",
+        "That is the case for leaving pages of this kind exactly as they are.",
+        "The remaining lines exist so the page is not suspiciously short.",
+        "Mixed raster content has nothing to add to a page like this one.",
+        "End of the vector paragraph.",
+    };
+
+    /**
+     * Two purely vector pages, the shape no other fixture has: every one of them
+     * is built by {@link #saveImagePdf} and is therefore a raster page with, at
+     * most, an invisible text layer on top. Page 2 also carries a half-page
+     * figure -- an image, but drawn well under the coverage that would make the
+     * page a scan.
+     */
+    private void makeBornDigital() throws IOException {
+        Path path = OUT_DIR.resolve("born-digital.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDType1Font font = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+            vectorTextPage(doc, font, "Born-digital page 1", false);
+            vectorTextPage(doc, font, "Born-digital page 2", true);
+            doc.save(path.toFile());
+        }
+        System.out.println("  born-digital.pdf");
+    }
+
+    /**
+     * Page 1 is vector, page 2 is a full-page raster with no text layer -- the
+     * two origins side by side, so a test can assert that a single document gets
+     * both treatments without the two decisions bleeding into each other.
+     */
+    private void makeMixedOrigin() throws IOException {
+        Path path = OUT_DIR.resolve("mixed-origin.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDType1Font font = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+            vectorTextPage(doc, font, "Mixed origin page 1: vector", false);
+
+            BufferedImage img = newPage();
+            Graphics2D g = createGraphics(img);
+            g.setFont(font14);
+            int y = MARGIN + 30;
+            g.drawString("Mixed origin page 2: a scan.", MARGIN, y);
+            y += LINE_HEIGHT * 2;
+            for (String line : VECTOR_LINES) {
+                g.drawString(line, MARGIN, y);
+                y += LINE_HEIGHT;
+            }
+            g.dispose();
+            PDImageXObject pdImg = JPEGFactory.createFromImage(doc, img, 0.95f);
+            PDPage scanPage = new PDPage(new PDRectangle(W, H));
+            doc.addPage(scanPage);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, scanPage)) {
+                cs.drawImage(pdImg, 0, 0, W, H);
+            }
+            doc.save(path.toFile());
+        }
+        System.out.println("  mixed-origin.pdf");
+    }
+
+    private void vectorTextPage(PDDocument doc, PDType1Font font, String title,
+                                boolean withFigure) throws IOException {
+        PDPage page = new PDPage(new PDRectangle(W, H));
+        doc.addPage(page);
+        try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+            cs.beginText();
+            cs.setFont(font, 20);
+            cs.newLineAtOffset(MARGIN, H - MARGIN);
+            cs.showText(title);
+            cs.endText();
+
+            float y = H - MARGIN - LINE_HEIGHT;
+            for (String line : VECTOR_LINES) {
+                cs.beginText();
+                cs.setFont(font, 12);
+                cs.newLineAtOffset(MARGIN, y);
+                cs.showText(line);
+                cs.endText();
+                y -= 24;
+            }
+
+            if (withFigure) {
+                BufferedImage fig = new BufferedImage(320, 320, BufferedImage.TYPE_INT_RGB);
+                Graphics2D fg = fig.createGraphics();
+                fg.setColor(Color.WHITE);
+                fg.fillRect(0, 0, 320, 320);
+                fg.setColor(new Color(70, 120, 180));
+                for (int i = 0; i < 320; i += 8) {
+                    fg.drawLine(i, 0, 0, i);
+                }
+                fg.dispose();
+                PDImageXObject figImg = JPEGFactory.createFromImage(doc, fig, 0.9f);
+                // 320 x 320 on a 612 x 792 page: 21% coverage, far below the
+                // page-fill threshold, so the page stays digital native.
+                cs.drawImage(figImg, MARGIN, MARGIN, 320, 320);
+            }
+        }
     }
 
     public static void main(String[] args) {

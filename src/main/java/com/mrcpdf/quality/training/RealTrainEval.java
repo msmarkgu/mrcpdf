@@ -262,8 +262,14 @@ public final class RealTrainEval {
         return new int[][]{toInt(tr), toInt(te)};
     }
 
-    /** Holds out whole base pages, so all 4 variants of a page land on one side. */
-    private static int[][] splitGrouped(String[] docs, double testFrac, long seed) {
+    /**
+     * Holds out whole base pages, so all 4 variants of a page land on one side.
+     *
+     * <p>Package-private so {@link RealTrainImageModel} splits identically: its
+     * artifact is meant to be comparable with this one's, which only holds if
+     * both were fitted on the same 400 rows.
+     */
+    static int[][] splitGrouped(String[] docs, double testFrac, long seed) {
         List<String> uniq = new ArrayList<>(new LinkedHashSet<>(Arrays.asList(docs)));
         uniq.sort(Comparator.naturalOrder());
         Collections.shuffle(uniq, new Random(seed));
