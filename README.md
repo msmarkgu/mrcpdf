@@ -3,7 +3,7 @@
 MRC PDF compression — a self-contained CLI that shrinks any PDF while keeping it **visually lossless** and fully functional. Output preserves the original text (as a searchable invisible layer), bookmarks, comments, links, and embedded attachments.
 
 **Input**: Any PDF<br>
-**Output**: MRC-compressed PDF ([Mixed Raster Content (MRC) compression](docs/mrc-compression-explained.md)) — typically 3–10× smaller on scanned documents
+**Output**: MRC-compressed PDF ([Mixed Raster Content (MRC) compression](docs/mrc-compression-explained.md)) — typically 3–10× smaller on scanned documents, with already-digital (vector) pages passed through unchanged
 
 ### Quick Start
 ```bash
@@ -20,6 +20,7 @@ cd mrcpdf
 A pure-MRC PDF compressor split out of the [TrulyFreeOCR](https://github.com/msmarkgu/TrulyFreeOCR) project (OCR removed — no Tesseract, no PaddleOCR, no GPU, no cloud):
 
 - **Visually lossless** — MRC splits each page into a background JPEG (downsampled + smoothed) and a razor-sharp JBIG2/CCITT foreground mask, so text stays pixel-crisp while the background compresses heavily.
+- **Per-page judgement** — a trained gate scores each page's image features before any compression. Pages MRC would degrade keep a full-resolution fidelity path instead of a lossy rebuild, and pages with no page-filling raster are **digital-native** and pass through *completely unchanged* — original fonts, layout, and vector content intact.
 - **No OCR, no recognition errors** — searchable text is re-used from the source PDF and re-embedded, unlike OCR-based MRC pipelines (e.g. Internet Archive's `archive-pdf-tools`) that run Tesseract and layer in an OCR'd text layer.
 - **Preserves content** — existing text is re-embedded as an invisible searchable layer; bookmarks, annotations, and embedded attachments are deep-copied into the output.
 - **Business-friendly license** — Apache 2.0, no disclosure obligations. All runtime dependencies are permissively licensed.
@@ -84,6 +85,8 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--jpeg-quality <0.1-1.0>` | Background JPEG quality (default 0.50 with MRC on, 0.85 with MRC off). |
 | `--pdfa` | Enable PDF/A-2b output (XMP metadata, sRGB OutputIntent). |
 | `--fg-color` | Re-render the foreground in the source's true text colors via a soft-mask color layer. Off by default; not compatible with `--pdfa`. |
+| `--mrc / --no-mrc` | Enable/disable MRC compression (default on). With MRC off, rebuilt pages are a single high-quality JPEG + invisible text layer (no mask) — faster, for downstream pipelines that don't need MRC layers. |
+| `--pass-through / --no-pass-through` | Pass **digital-native** pages (no page-filling raster) through unchanged (default on). Applies with MRC on or off, and under `--pdfa`. Disable to force every page through render/re-encode. |
 | `--threads <n>` | Worker threads for page prep (default: available processors). |
 | `--settings <file>` | Path to `settings.jsonc` (default `./settings.jsonc`). |
 
@@ -114,9 +117,11 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 | Embedded attachments | ✅ Preserved (deep copy) |
 | XMP metadata | ✅ Preserved |
 | Page size / orientation | ✅ Preserved (per crop box) |
+| Digital-native pages (no page-filling raster) | ✅ Passed through unchanged — original fonts, layout, and vector content intact |
 
 ### Known limitations
-- The invisible text layer is re-rendered with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family and size styling are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected. Text color is preserved in the visual layer when `--fg-color` is enabled.
+- Rebuilt pages re-render the invisible text layer with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family and size styling are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected, and digital-native pages passed through unchanged keep their source fonts entirely. Text color is preserved in the visual layer when `--fg-color` is enabled.
+- Passed-through pages under `--pdfa` are carried over without validation — their embedded fonts are not re-checked for PDF/A conformance.
 - Annotation destinations and named destinations are kept but not remapped to the new document; page-number-based links (bookmarks pointing to pages in order) generally still work.
 
 ---
@@ -132,6 +137,7 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 - Source: `src/main/java/com/mrcpdf/`
 - Tests: `src/test/java/com/mrcpdf/` (JUnit 5; requires Java 21)
 - How MRC compression works, and when not to use it: [`docs/mrc-compression-explained.md`](docs/mrc-compression-explained.md), [`docs/when-not-to-mrc.md`](docs/when-not-to-mrc.md)
+- Quality-gate training / synthetic-corpus labeling: [`docs/synthetic-labels.md`](docs/synthetic-labels.md); dev-only corpus tooling lives in [`src/main/java/com/mrcpdf/tools/`](src/main/java/com/mrcpdf/tools/README.md)
 - Performance/compression analysis: [`docs/MRC-compression-effect.md`](docs/MRC-compression-effect.md), [`docs/report-mrc.md`](docs/report-mrc.md)
 - Design notes: [`docs/mrc-only-plan.md`](docs/mrc-only-plan.md), [`docs/bookmarks-hyperlinks-attachments.md`](docs/bookmarks-hyperlinks-attachments.md)
 - Test runs (sample CLI output, compression results): [`docs/test-runs.md`](docs/test-runs.md)
