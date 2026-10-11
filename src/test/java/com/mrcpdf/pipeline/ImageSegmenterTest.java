@@ -173,6 +173,55 @@ class ImageSegmenterTest {
                 "oversized dark region should be dropped from the foreground mask");
     }
 
+    /**
+     * A thin full-width rule (an underline) exceeds the dimension cutoff but has
+     * a tiny area.  It must stay in the foreground mask: line-work is a real
+     * document element, not a picture, so it must not be softened by falling
+     * into the downsampled background.
+     */
+    @Test
+    void thinWideRule_survivesDimDrop() {
+        // 200x200 page, dimensions round to maxDimPx=60 and maxAreaPx=4000 at
+        // (0.10, 0.30): the 190x3 bar has area 570 < 4000 but width 190 > 60.
+        int w = 200, h = 200;
+        BufferedImage page = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = page.createGraphics();
+        g.setColor(java.awt.Color.LIGHT_GRAY);
+        g.fillRect(0, 0, w, h);
+        g.setColor(java.awt.Color.BLACK);
+        g.fillRect(5, 95, 190, 3);         // full-width underline
+        g.dispose();
+
+        ImageSegmenter segmenter = new ImageSegmenter(64, 0.95, 0, "sauvola", 15, 0.20, 128, 0.10, 0.30);
+        BufferedImage mask = segmenter.segment(page).getForegroundMask();
+
+        assertEquals(0x00000000, mask.getRGB(100, 96) & 0xFFFFFF,
+                "thin full-width rule must stay in the foreground mask");
+    }
+
+    /**
+     * A hollow box (a table border) is a sparse component: tiny area relative to
+     * its bbox, so it is perimeter line-work, not a filled picture.  It must be
+     * kept, not dropped into the downsampled background.
+     */
+    @Test
+    void hollowBoxOutline_survivesDimDrop() {
+        int w = 200, h = 200;
+        BufferedImage page = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = page.createGraphics();
+        g.setColor(java.awt.Color.LIGHT_GRAY);
+        g.fillRect(0, 0, w, h);
+        g.setColor(java.awt.Color.BLACK);
+        g.drawRect(25, 25, 150, 150);      // hollow table border
+        g.dispose();
+
+        ImageSegmenter segmenter = new ImageSegmenter(64, 0.95, 0, "sauvola", 15, 0.20, 128, 0.10, 0.30);
+        BufferedImage mask = segmenter.segment(page).getForegroundMask();
+
+        assertEquals(0x00000000, mask.getRGB(25, 25) & 0xFFFFFF,
+                "hollow box outline must stay in the foreground mask");
+    }
+
     @Test
     void infiniteInpaint_noWhiteBlobBehindThickStroke() {
         // Gray background with a 10px-wide black vertical bar. The bar's center is
