@@ -152,9 +152,9 @@ The 1-bit mask is burst into JBIG2 by the bundled `jbig2enc`. JBIG2's trick is a
 - **Adaptive arithmetic coding** — the symbol IDs, offsets, and refinement bits
   are entropy-coded with a context-adaptive arithmetic coder that learns local
   probability models, squeezing near the theoretical limit.
-- **Lossiness** — near-identical symbols are treated as identical, so the output
-  is *visually* lossless but not bit-identical: slightly different instantiations
-  of a glyph may be swapped for one canonical shape.
+- **Lossiness** — near-identical symbols are treated as identical, so within the
+  1-bit mask the text is *visually* lossless but not bit-identical: slightly
+  different instantiations of a glyph may be swapped for one canonical shape.
 
 mrcpdf goes further: one `jbig2enc` invocation over **all pages** (`-p -s` in
 `jbig2enc.flags`) builds a single **global symbol dictionary shared across every

@@ -1,6 +1,6 @@
 # mrcpdf
 
-MRC PDF compression — a self-contained CLI that shrinks any PDF while keeping it **visually comparable** to the original and fully functional. Output preserves the original text (as a searchable invisible layer), bookmarks, comments, links, and embedded attachments.
+MRC PDF compression — a self-contained CLI that shrinks scanned PDFs while keeping text sharp at full resolution, and fully functional. Output preserves the original text (as a searchable invisible layer), bookmarks, comments, links, and embedded attachments.
 
 **Input**: Any PDF<br>
 **Output**: MRC-compressed PDF ([Mixed Raster Content (MRC) compression](docs/mrc-compression-explained.md)) — typically 3–10× smaller on scanned documents, with already-digital (vector) pages passed through unchanged. Measure your own files with `./scripts/benchmark_mrc.sh`.
@@ -19,7 +19,7 @@ cd mrcpdf
 
 A pure-MRC PDF compressor split out of the [TrulyFreeOCR](https://github.com/msmarkgu/TrulyFreeOCR) project (OCR removed — no Tesseract, no PaddleOCR, no GPU, no cloud):
 
-- **Visually comparable** — MRC splits each page into a downsampled + smoothed background JPEG and a razor-sharp JBIG2/CCITT foreground mask, so text stays pixel-crisp (the background is deliberately softened) while the page compresses heavily.
+- **Text stays sharp** — MRC splits each page into a downsampled + smoothed background JPEG and a full-resolution JBIG2/CCITT foreground mask, so text keeps its sharp, full-resolution edges (the background is deliberately softened) while the page compresses heavily.
 - **Per-page judgement** — a trained gate scores each page's image features before any compression. Pages MRC would degrade keep a full-resolution fidelity path instead of a lossy rebuild, and pages with no page-filling raster are **digital-native** and pass through *completely unchanged* — original fonts, layout, and vector content intact.
 - **No OCR, no recognition errors** — searchable text is re-used from the source PDF and re-embedded, unlike OCR-based MRC pipelines (e.g. Internet Archive's `archive-pdf-tools`) that run Tesseract and layer in an OCR'd text layer.
 - **Preserves content** — existing text is re-embedded as an invisible searchable layer; bookmarks, annotations, and embedded attachments are deep-copied into the output.
@@ -122,6 +122,7 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 ### Known limitations
 - Rebuilt pages re-render the invisible text layer with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family and size styling are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected, and digital-native pages passed through unchanged keep their source fonts entirely. Text color is preserved in the visual layer when `--fg-color` is enabled.
 - Passed-through pages under `--pdfa` are carried over without validation — their embedded fonts are not re-checked for PDF/A conformance.
+- Large connected elements — a component wider or taller than `segmenter.maxComponentDim` (default 10% of the page's long side) or larger than `segmenter.maxComponentArea` (default 0.5% of page area) is dropped from the foreground mask and softened with the background. Text merged with such an element — an underlined heading, a bordered table cell, display type — is therefore rebuilt from the downsampled background, not the full-resolution mask.
 - Named destinations (the `/Names/Dests` tree) are copied but not re-mapped, so a bookmark or link that resolves through a named destination may reference a missing page. Bookmarks and annotation links that address a page directly are re-mapped to the rebuilt pages, and their geometry is transformed through the page's rotation and crop-box offset.
 
 ---
