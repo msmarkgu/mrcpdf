@@ -389,10 +389,16 @@ public class MrcPdf implements Callable<Integer> {
                             } else if (runMrc(pd.passThrough, useMrc, qualityGateEnabled,
                                     screenGood)) {
                                 SegmentedImage seg = segmenter.segment(page);
-                                pd.mask = seg.getForegroundMask();
-                                // Write mask as PNG for jbig2enc (lossless, compact)
+                                // Write the mask as PNG for jbig2enc (lossless,
+                                // compact), then drop the in-memory copy: it is a
+                                // full-resolution binary per page and the only
+                                // later consumer is the CCITT fallback, which
+                                // re-reads the PNG from disk at assembly time.
+                                // Retaining it here pinned every page's mask in
+                                // the heap for the whole pipeline run.
                                 ImageIO.write(seg.getForegroundMask(), "png",
                                         new File(tempDir.toFile(), "mask-" + pageIdx + ".png"));
+                                pd.mask = null;
                                 pd.bgJpeg = ImageEncoder.encodeBackground(seg.getCleanedBackground(),
                                         assembler.getBgJpegQuality(), true,
                                         assembler.getBackgroundScale(), assembler.getBgSmoothSigma());
@@ -519,9 +525,18 @@ public class MrcPdf implements Callable<Integer> {
                                     jbig2Page.getWidth(), jbig2Page.getHeight(),
                                     pr);
                         } else if (useMrc) {
+                            // jbig2enc unavailable: CCITT fallback.  The worker's
+                            // mask was spilled to disk to keep the heap flat, so
+                            // re-read it here (a page masked white for the
+                            // gate keeps its file, so the image is non-null).
+                            BufferedImage mask = null;
+                            File maskFile = new File(tempDir.toFile(), "mask-" + i + ".png");
+                            if (maskFile.isFile()) {
+                                mask = ImageIO.read(maskFile);
+                            }
                             outPage = assembler.addPage(output, source, i,
                                     pr.getBgJpeg(), pr.getFgColorJpeg(),
-                                    pr.getMask(), pr);
+                                    mask, pr);
                         } else {
                             outPage = assembler.addPage(output, source, i,
                                     pr.getBgJpeg(), null, null, pr);
