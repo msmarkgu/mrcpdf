@@ -129,8 +129,9 @@
     // True MRC foreground color plane: the binary mask becomes a soft mask
     // (SMask) over a downsampled copy of the original page, so text pixels keep
     // their original color instead of flat black.
-    //   false = black stencil (default, smaller, PDF/A compatible)
-    //   true  = color text (soft masks are NOT allowed in PDF/A-2b)
+    //   false = black stencil (default, smaller)
+    //   true  = color text (PDF/A-2b permits soft masks; conformance of the
+    //           resulting file is not independently verified)
     // Override via --fg-color CLI flag.
     "pipeline.mrc.foregroundColor": false,
 

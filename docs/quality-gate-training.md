@@ -228,6 +228,38 @@ your file into the committed location.
   trains straight from OCR-measured readability labels (AUC ≈ 1 by construction). It
   is a sanity/CI artifact, not a substitute for the steps above.
 
+## Known issues — deferred, documented
+
+Two defects in `FeatureExtractor` affect the shipped screen's features but were
+**deliberately not fixed** for the released artifact — fixing them changes the
+feature population any existing screen was fitted on, so it belongs to a
+*retrain* (re-download + re-render + re-OCR of the corpus), not to a patch. The
+risk is bounded: a blank page that slips through the gate still compresses to
+blank.
+
+1. **Blank pages get maximal feature values.** When a page has no foreground,
+   `FeatureExtractor` falls `fgMean` back to `0`, so a blank white page yields
+   `amplitude = 255`, `snr ≈ 31.8` (the maximum the transform can produce),
+   `michelson = 1.0` and `blurSigmaPx = 0` (`FeatureExtractor.java:85–89,
+   147`). That is the *best* page in the feature space. A blank-stub page can
+   therefore read "compress me" — harmless in practice (it compresses to
+   nothing), but any threshold, diagnostic, or future retrain inherits the
+   inversion. Correct semantics would be zero foreground → `amplitude = 0,
+   michelson = 0, snr = 0`.
+2. **`blurSigmaPx` calibration is not portable.** The comment claims
+   `median * 2.0` maps sharp text to ~0.3–1.0 px (`FeatureExtractor.java:135–136`);
+   on this project's rendering it measured 2.67 px on razor-sharp 300-DPI
+   synthetic text. The constant was calibrated against a different rendering, so
+   any threshold reasoned from that comment is ~3× too tight. Do not quote the
+   comment's numbers when setting your own cuts — compute them from your own
+   `features.csv` (1.1) and CV report (1.4).
+
+The remaining defects the review flagged lived in `TextQualityScorer` (the
+legacy geometric scorer, not the shipped model's features) and are already
+fixed: `strokeWidthEstimate` seeds on the background again, `CRISPNESS_REF` was
+re-pointed away from the saturation plateau, and a test now pins the
+`bgUniformity` polarity.
+
 ## Gotchas — the checklist
 
 - **Wrong artifact.** `TrainModel` → `quality-model.json` is research-only; the gate

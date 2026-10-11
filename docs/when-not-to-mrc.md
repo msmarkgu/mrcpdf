@@ -76,8 +76,7 @@ wrongly clipping or ignoring the mask. A single-JPEG-per-page PDF is maximally
 compatible:
 
 - one image per page, no mask object,
-- no soft masks (`/SMask`), which also sidesteps the PDF/A soft-mask
-  restriction,
+- no soft masks (`/SMask`) — the page is a plain image with no masking layer,
 - simplest possible output to feed into other tools or to merge/extract pages.
 
 ### 2.4 Quality-critical or hard-to-segment scans

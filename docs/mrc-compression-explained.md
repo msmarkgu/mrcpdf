@@ -166,11 +166,12 @@ If `jbig2enc` isn't available or fails, we fall back to **CCITT G4** (fax): same
 
 ### Foreground color (opt-in `--fg-color`)
 
-By default the mask is drawn as a *black* stencil (small, PDF/A-safe). With
+By default the mask is drawn as a *black* stencil (small). With
 `--fg-color`, the mask instead becomes a **soft mask (SMask)** over a
 downsampled, low-quality JPEG copy of the original page, so the text pixels keep
-their **original color** and edges stay sharp. Note: soft masks are **not
-allowed in PDF/A-2b**, so this is disabled when `--pdfa` is set.
+their **original color** and edges stay sharp. PDF/A-2b permits soft masks, so
+`--fg-color` also works under `--pdfa`; conformance of the resulting file is not
+independently verified.
 
 ### Text layer
 
@@ -229,8 +230,9 @@ loss and fully selectable text.
 - If there's **no mask** (MRC off), the background JPEG must be higher quality
   (`~0.85` instead of `0.50`), because it has to carry the text itself.
 - **No OCR**: searchable text comes only from the source PDF.
-- `--fg-color` and `--pdfa` are mutually exclusive (PDF/A forbids soft masks);
-  `--pdfa` silently disables the color layer.
+- `--fg-color` is compatible with `--pdfa`: PDF/A-2b permits soft masks, and the
+  color layer is no longer force-disabled under `--pdfa`. Conformance of the
+  output is not independently verified.
 - **Memory**: high DPI means big working arrays in segmentation (`W × H` for
   each of ~10 intermediate planes). See README "High DPI & memory" — 600 DPI
   needs a bigger `-Xmx` and/or fewer `--threads`.
