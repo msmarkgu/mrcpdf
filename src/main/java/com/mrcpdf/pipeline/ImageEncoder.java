@@ -13,7 +13,6 @@ import javax.imageio.ImageWriter;
 import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.stream.MemoryCacheImageOutputStream;
 import org.w3c.dom.Element;
-import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 public final class ImageEncoder {
@@ -38,8 +37,15 @@ public final class ImageEncoder {
     }
 
     if (hasMask && bgSmoothSigma > 0f) {
-      float effectiveSigma = bgSmoothSigma / (float) bgScale;
-      toEncode = PDFAssembler.gaussianBlur(toEncode, effectiveSigma);
+      // Sigma is configured in original-resolution pixels, but the blur runs on
+      // the downscaled image: one source pixel covers 1/bgScale destination
+      // pixels, so rescale by multiplying.  Dividing (the previous code) scaled
+      // sigma by ~1/bgScale^2 — a ~9x over-blur at the default 0.33 scale — so
+      // the "mild smoothing" knob was applying a heavy soften.  Only rescale
+      // when the downscale actually happened; without one the sigma is already
+      // in the target domain.
+      float sigma = bgScale < 1.0 ? bgSmoothSigma * (float) bgScale : bgSmoothSigma;
+      toEncode = PDFAssembler.gaussianBlur(toEncode, sigma);
     }
 
     return encodeJpeg(toEncode, quality, 2, 2);
@@ -89,26 +95,16 @@ public final class ImageEncoder {
             NodeList sofList = markerSeq.getElementsByTagName("sof");
             if (sofList.getLength() > 0) {
               Element sof = (Element) sofList.item(0);
-              int numComponents;
-              try {
-                numComponents = Integer.parseInt(sof.getAttribute("numFrameComponents"));
-              } catch (NumberFormatException e) {
-                numComponents = 4;
-              }
-              Element marker = (Element) sof.getParentNode();
-              NodeList childNodes = marker.getChildNodes();
-              for (int ci = 0; ci < childNodes.getLength(); ci++) {
-                Node child = childNodes.item(ci);
-                if (child.getNodeType() != Node.ELEMENT_NODE) continue;
-                Element comp = (Element) child;
-                int compId;
-                try {
-                  compId = Integer.parseInt(comp.getAttribute("componentId"));
-                } catch (NumberFormatException e) {
-                  continue;
-                }
-                if (compId < 0 || compId >= numComponents) continue;
-                if (compId == 0) {
+              // The SOF element lists one <componentSpec> per JPEG component,
+              // positionally (index 0 = luma).  Re-traversal by position rather
+              // than by a "componentId" attribute: the old code iterated the
+              // marker sequence's children (dqt/dht/sof/sos), every iteration
+              // threw on the missing attribute and was swallowed, so the
+              // requested subsampling was never actually applied.
+              NodeList comps = sof.getElementsByTagName("componentSpec");
+              for (int ci = 0; ci < comps.getLength(); ci++) {
+                Element comp = (Element) comps.item(ci);
+                if (ci == 0) {
                   comp.setAttribute("HsamplingFactor", Integer.toString(hSample));
                   comp.setAttribute("VsamplingFactor", Integer.toString(vSample));
                 } else {
