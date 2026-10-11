@@ -52,8 +52,14 @@ public class TextQualityScorer {
     /** Reference for the exponential high-frequency-energy transform. */
     static final double HF_ENERGY_REF = 8.0;
 
-    /** Reference mapping for the Laplacian-over-gradient crispness ratio. */
-    static final double CRISPNESS_REF = 3.0;
+    /**
+     * Reference mapping for the Laplacian-over-gradient crispness ratio.
+     * 2.2 keeps the clean synthetic fixture (median ratio ~0.43) at ~0.94 rather
+     * than clamping at 1.0, so clean pages and mildly blurred pages stay
+     * distinguishable; a page at the previous 3.0 reference would have hit the
+     * clamp wherever the ratio exceeded 1/3.
+     */
+    static final double CRISPNESS_REF = 2.2;
 
     /** Background tile side, in pixels, for the uniformity surface. */
     static final int BG_TILE = 64;
@@ -466,14 +472,24 @@ public class TextQualityScorer {
     record PerGlyph(List<Double> fragmentation, double strokeWidthUniformity) {
     }
 
-    /** Chamfer (3-4) Euclidean distance transform; returns p80-based stroke width. */
-    private static double strokeWidthEstimate(boolean[] fg, int bw, int bh) {
+    /**
+ * Chamfer (3-4) Euclidean distance transform; returns the p80 ink-pixel
+ * distance doubled (a stroke-width estimate).
+ *
+ * <p>Seed on the BACKGROUND and read the result back at the FOREGROUND: each
+ * ink pixel's distance to the nearest background pixel is its local
+ * half-stroke.  Seeding and reading the same set instead (the previous code)
+ * made every sampled distance 0, so the width was always 0 and
+ * {@code strokeWidthUniformity} silently fell back to its neutral value --
+ * the same seeding defect noted in {@code FeatureExtractor}.
+ */
+static double strokeWidthEstimate(boolean[] fg, int bw, int bh) {
         int n = bw * bh;
         int INF = 1 << 29;
         int[] d = new int[n];
         Arrays.fill(d, INF);
         for (int i = 0; i < n; i++) {
-            if (fg[i]) d[i] = 0;
+            if (!fg[i]) d[i] = 0;
         }
         // Pass 1: top-left -> bottom-right
         for (int y = 0; y < bh; y++) {

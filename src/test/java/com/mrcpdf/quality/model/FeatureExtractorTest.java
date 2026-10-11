@@ -13,12 +13,14 @@ import java.awt.image.ConvolveOp;
 import java.awt.image.Kernel;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 
 import com.mrcpdf.model.TextBlock;
 import com.mrcpdf.util.ImageOps;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 
 /**
  * Phase-2 tests for {@link FeatureExtractor}.
@@ -70,6 +72,21 @@ class FeatureExtractorTest {
         for (int i = 0; i < kernel.length; i++) kernel[i] /= sum;
         BufferedImage out = new BufferedImage(W, H, BufferedImage.TYPE_INT_RGB);
         new ConvolveOp(new Kernel(size, size, kernel), ConvolveOp.EDGE_NO_OP, null).filter(src, out);
+        return out;
+    }
+
+    private static BufferedImage noisyImage(BufferedImage src, int magnitude) {
+        int w = src.getWidth(), h = src.getHeight();
+        Random rnd = new Random(42);
+        int[] rgb = new int[w * h];
+        src.getRGB(0, 0, w, h, rgb, 0, w);
+        for (int i = 0; i < rgb.length; i++) {
+            int v = (rgb[i] & 0xFF) + (rnd.nextInt(2 * magnitude + 1) - magnitude);
+            v = Math.max(0, Math.min(255, v));
+            rgb[i] = 0xFF000000 | (v << 16) | (v << 8) | v;
+        }
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        out.setRGB(0, 0, w, h, rgb, 0, w);
         return out;
     }
 
@@ -157,6 +174,50 @@ class FeatureExtractorTest {
      * the boxes off the ink must push it up.  This also proves the boxes are
      * really being used.
      */
+    /**
+     * The bg-uniformity feature must move in the physical direction it is named
+     * for: sensor noise raises the median-filter residual and so must raise
+     * {@code bgUniformity} (and {@code noiseSigma}) while lowering {@code snr}.
+     * Re-bonding these to the wrong polarity would silently invert the gate.
+     */
+    @Test
+    void bgUniformity_risesWithBackgroundNoise() {
+        double[] clean = imageFeatures(cleanImage());
+        double[] noisy = imageFeatures(noisyImage(cleanImage(), 6));
+
+        assertTrue(noisy[7] > clean[7],
+                "noise must raise bgUniformity (clean=" + clean[7] + ", noisy=" + noisy[7] + ")");
+        assertTrue(noisy[8] > clean[8],
+                "noise must raise noiseSigma (clean=" + clean[8] + ", noisy=" + noisy[8] + ")");
+        assertTrue(noisy[9] < clean[9],
+                "noise must lower snr (clean=" + clean[9] + ", noisy=" + noisy[9] + ")");
+    }
+
+    /**
+     * Polarity guard for the shipped screen artifact ({@code loadScreenDefault}):
+     * {code loadScreen} negates the good-head weights, so the loaded weights must
+     * carry the skip-side meaning -- a dirtier background, lower high-frequency
+     * energy and a denser ink coverage all strengthen the "skip MRC" decision.
+     * Re-trained screens that flipped these signs would reverse the gate.
+     * (noiseSigma and snr are deliberately not asserted: the multivariate fit
+     * uses them as collinear suppressors, exactly as the legacy-model test notes.)
+     */
+    @Test
+    void shippedScreen_bgUniformityPolarityPullsTowardSkip() {
+        QualityModel screen = QualityModel.loadScreenDefault();
+        Assumptions.assumeTrue(screen != null, "quality-image-screen.json absent");
+
+        assertTrue(screen.featureWeight("bgUniformity") > 0,
+                "bgUniformity (dirtier = higher) must push the skip side up, got "
+                        + screen.featureWeight("bgUniformity"));
+        assertTrue(screen.featureWeight("hiFreqEnergy") < 0,
+                "less high-frequency energy must push the skip side up, got "
+                        + screen.featureWeight("hiFreqEnergy"));
+        assertTrue(screen.featureWeight("inkCoverage") > 0,
+                "denser ink coverage must push the skip side up, got "
+                        + screen.featureWeight("inkCoverage"));
+    }
+
     @Test
     void edgeAlignRisesWhenGlyphBoxesAreMisaligned() {
         BufferedImage img = cleanImage();

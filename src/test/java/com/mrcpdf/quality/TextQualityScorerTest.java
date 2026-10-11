@@ -267,6 +267,47 @@ class TextQualityScorerTest {
                 "blank page should be routed to the fidelity path");
     }
 
+    /**
+     * Regression for the same seeding defect noted in {@code FeatureExtractor}:
+     * {@code strokeWidthEstimate} used to seed its chamfer transform on the
+     * foreground and read distances back at the foreground, so every sampled
+     * distance was 0 and the width was always 0.  A 4px bar should read back
+     * as ~4.
+     */
+    @Test
+    void strokeWidthEstimate_returnsBarWidthWhenSeededOnBackground() {
+        int bw = 6, bh = 8;
+        boolean[] fg = new boolean[bw * bh];
+        for (int y = 0; y < bh; y++) {
+            for (int x = 1; x <= 4; x++) fg[y * bw + x] = true;
+        }
+        double width = TextQualityScorer.strokeWidthEstimate(fg, bw, bh);
+        assertEquals(4.0, width, 0.51, "p80 half-width*2 of a 4px bar should be ~4, got " + width);
+    }
+
+    /**
+     * Regression for the crispness saturation: with {@code CRISPNESS_REF = 3.0}
+     * the clean fixture's median edge ratio (0.43) clamps crisp at 1.0, so a
+     * clean page and a mildly blurred page are indistinguishable.  A lower
+     * reference must leave the clean page short of the clamp while mild blur
+     * still costs a real margin.
+     */
+    @Test
+    void crispness_separatesCleanFromMildBlurWithoutSaturating() {
+        BufferedImage clean = cleanImage();
+        BufferedImage mild = blurredImage(clean, 1.0f);
+
+        // getBlurSigma() is the legacy getter for the crispness value (the raw
+        // Laplacian-division-into-gradient measure), not a blur estimate.
+        double crispClean = scorer.compute(clean, null).getBlurSigma();
+        double crispMild = scorer.compute(mild, null).getBlurSigma();
+
+        assertTrue(crispClean < 1.0, "clean crispness must not clamp at 1.0, got " + crispClean);
+        assertTrue(crispClean - crispMild > 0.05,
+                "mild blur must still cost real crispness (clean=" + crispClean
+                        + ", mild=" + crispMild + ")");
+    }
+
     @Test
     void bothModes_shareTheSameOrdering() {
         BufferedImage clean = cleanImage();
