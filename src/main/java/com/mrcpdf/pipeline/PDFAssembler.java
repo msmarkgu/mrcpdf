@@ -154,6 +154,7 @@ public class PDFAssembler {
     public double getBackgroundScale() { return backgroundScale; }
     public float getBgSmoothSigma() { return bgSmoothSigma; }
     public float getBgJpegQuality() { return bgJpegQuality; }
+    public float getFidelityJpegQuality() { return fidelityJpegQuality; }
     public boolean isForegroundColorEnabled() { return foregroundColorEnabled; }
     public double getFgScale() { return fgScale; }
     public float getFgJpegQuality() { return fgJpegQuality; }
@@ -520,6 +521,17 @@ PDFont pageFont = resolveFont(output);
      */
     public PDPage addPageFidelity(PDDocument output, PDDocument source, int pageIndex,
                                   BufferedImage background, PageResult ocr) throws IOException {
+        return addPageFidelity(output, source, pageIndex,
+                ImageEncoder.encodeBackground(background, fidelityJpegQuality, false, 1.0, 0f), ocr);
+    }
+
+    /**
+     * Fidelity page assembled from a pre-encoded full-resolution JPEG.  Prevents
+     * a second full-page render at assembly time: the pipeline worker that
+     * decides the gate has already rendered and encoded the page.
+     */
+    public PDPage addPageFidelity(PDDocument output, PDDocument source, int pageIndex,
+                                  byte[] bgJpegBytes, PageResult ocr) throws IOException {
         PDPage sourcePage = source.getPage(pageIndex);
         PDRectangle cropBox = sourcePage.getCropBox();
         float pageW = cropBox.getWidth();
@@ -534,10 +546,7 @@ PDFont pageFont = resolveFont(output);
         output.addPage(outPage);
 
         try (PDPageContentStream cs = new PDPageContentStream(output, outPage)) {
-            // No foreground mask: hasMask=false keeps the full-resolution
-            // background without downsampling/smoothing, encoded at the higher
-            // fidelity JPEG quality.
-            PDImageXObject bgXObject = encodeBackgroundJpeg(output, background, fidelityJpegQuality, false);
+            PDImageXObject bgXObject = PDImageXObject.createFromByteArray(output, bgJpegBytes, "background");
             cs.drawImage(bgXObject, 0, 0, pageW, pageH);
 
             PDFont pageFont = resolveFont(output);

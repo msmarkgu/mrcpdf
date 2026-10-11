@@ -188,7 +188,12 @@ public class MrcPdf implements Callable<Integer> {
             assembler.setFgJpegQuality((float) settings.getDouble("pipeline.mrc.foregroundJpegQuality", 0.7));
             // Fidelity-path background JPEG quality (no mask -> background is the
             // only visual layer), defaults to the non-MRC pipeline.jpegQuality.
-            assembler.setFidelityJpegQuality((float) settings.getDouble("pipeline.jpegQuality", 0.85));
+            // --jpeg-quality overrides this path as well: an explicit CLI quality
+            // is a statement about the page, not about the mode it passes through.
+            float resolvedFidelityQuality = jpegQuality != null
+                    ? resolvedJpegQuality
+                    : (float) settings.getDouble("pipeline.jpegQuality", 0.85);
+            assembler.setFidelityJpegQuality(resolvedFidelityQuality);
 
             // Per-page text-quality gate: pages scoring below the threshold keep
             // their full-res fidelity path instead of MRC compression.
@@ -393,7 +398,11 @@ public class MrcPdf implements Callable<Integer> {
                                 }
                             } else if (useMrc) {
                                 // Gate-skipped: no segmentation; an empty white
-                                // mask keeps the JBIG2 batch index-aligned.
+                                // mask keeps the JBIG2 batch index-aligned.  The
+                                // full-resolution page is encoded here in the
+                                // worker (once) so assembly never re-renders it.
+                                pd.bgJpeg = ImageEncoder.encodeBackground(page,
+                                        assembler.getFidelityJpegQuality(), false, 1.0, 0f);
                                 writeWhiteMask(tempDir, pageIdx, pd.imgW, pd.imgH);
                             } else {
                                 pd.bgJpeg = ImageEncoder.encodeBackground(page,
@@ -492,9 +501,11 @@ public class MrcPdf implements Callable<Integer> {
                             // Digital native: the source page, untouched.
                             outPage = assembler.importOriginalPage(output, source, i);
                         } else if (pr.isMrcSkip()) {
-                            // Quality gate: original page as the only visual layer.
-                            BufferedImage bg = renderer.renderImageWithDPI(i, dpi);
-                            outPage = assembler.addPageFidelity(output, source, i, bg, pr);
+                            // Quality gate: original page as the only visual
+                            // layer.  The worker already rendered it and encoded
+                            // the full-res JPEG, so there is no second render.
+                            outPage = assembler.addPageFidelity(output, source, i,
+                                    pr.getBgJpeg(), pr);
                             fidelityPages++;
                         } else if (jbig2Batch != null && jbig2Batch.getGlobalSym().length > 0) {
                             JBIG2Compressor.CompressionResult jbig2Page = jbig2Batch.getPages().get(i);
