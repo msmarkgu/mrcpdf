@@ -135,7 +135,8 @@ public class PDFAssembler {
      * Enables the true MRC foreground color plane: the binary mask is used as a
      * soft mask (SMask) over a (downsampled, lossy) copy of the original page,
      * so text pixels render at their original color instead of flat black.
-     * Disabled by default (plain black stencil). Not PDF/A-2b compatible.
+     * Disabled by default (plain black stencil). PDF/A-2b permits soft masks, so
+     * this stays usable under --pdfa; conformance is not verified.
      */
     public void setForegroundColorEnabled(boolean enabled) {
         this.foregroundColorEnabled = enabled;
@@ -737,6 +738,7 @@ PDFont pageFont = resolveFont(output);
                                int fgWidth, int fgHeight,
                                BufferedImage foregroundColor,
                                PageResult ocr) throws IOException {
+        requireNonEmptyJbig2(jbig2PageData, jbig2GlobalSym);
         PDPage sourcePage = source.getPage(pageIndex);
         PDRectangle cropBox = sourcePage.getCropBox();
         float pageW = cropBox.getWidth();
@@ -811,6 +813,7 @@ PDFont pageFont = resolveFont(output);
                                byte[] jbig2PageData, byte[] jbig2GlobalSym,
                                int fgWidth, int fgHeight,
                                PageResult ocr) throws IOException {
+        requireNonEmptyJbig2(jbig2PageData, jbig2GlobalSym);
         PDPage sourcePage = source.getPage(pageIndex);
         PDRectangle cropBox = sourcePage.getCropBox();
         float pageW = cropBox.getWidth();
@@ -867,6 +870,21 @@ PDFont pageFont = resolveFont(output);
     }
 
     /**
+     * An empty JBIG2 page stream (or an empty shared symbol dictionary) produces
+     * a corrupt PDF image object: viewers have nothing to decode.  Reject it up
+     * front instead of writing the corruption into the output.  A missing layer
+     * is handled by the plain {@link #addPage} CCITT path, never by a JBIG2 call.
+     */
+    private static void requireNonEmptyJbig2(byte[] jbig2PageData, byte[] jbig2GlobalSym) {
+        if (jbig2PageData == null || jbig2PageData.length == 0) {
+            throw new IllegalArgumentException("JBIG2 page data must be non-empty");
+        }
+        if (jbig2GlobalSym == null || jbig2GlobalSym.length == 0) {
+            throw new IllegalArgumentException("JBIG2 global symbol dictionary must be non-empty");
+        }
+    }
+
+    /**
      * Draws the invisible, searchable text layer for a page.
      *
      * Each word is stretched horizontally to fill its detected bounding box, so
@@ -910,7 +928,11 @@ PDFont pageFont = resolveFont(output);
             }
             float targetWidth = tb.getBbox().width * scaleX;
             float sx = naturalWidth > 0 ? targetWidth / naturalWidth : 1.0f;
-            cs.setFont(pageFont, fontSize * sx);
+            // Enforce minFontSize on the *emitted* size, not the pre-stretch
+            // size: the horizontal stretch can shrink below it (sx < 1) and the
+            // earlier placement of the max() left tiny words smaller than the
+            // configured floor on the page.
+            cs.setFont(pageFont, Math.max(fontSize * sx, minFontSize));
             cs.setTextMatrix(Matrix.getTranslateInstance(x, y));
             if (!safeWord.isEmpty()) {
                 try {

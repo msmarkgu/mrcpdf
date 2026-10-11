@@ -1195,4 +1195,35 @@ class PDFAssemblerRegressionTest {
                             + text.trim() + ")");
         }
     }
+
+    /**
+     * A6 regression: an empty JBIG2 page stream (or empty globals) would be
+     * wrapped into a corrupt PDF image object — viewers have nothing to decode.
+     * addPageJbig2 must reject the data up front.
+     */
+    @Test
+    void addPageJbig2_rejectsEmptyPageData() throws IOException {
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(new byte[0], new byte[]{0x01}, "empty page data"));
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(null, new byte[]{0x01}, "null page data"));
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(new byte[]{0x01}, new byte[0], "empty globals"));
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(new byte[]{0x01}, null, "null globals"));
+    }
+
+    private void addPageJbig2WithData(byte[] pageData, byte[] globals, String label)
+            throws IOException {
+        File source = createSourcePdf();
+        BufferedImage bg = new BufferedImage(PAGE_W, PAGE_H, BufferedImage.TYPE_BYTE_GRAY);
+        PageResult ocr = new PageResult(1, PAGE_W, PAGE_H, new ArrayList<>());
+        PDFAssembler assembler = new PDFAssembler();
+        try (PDDocument sourceDoc = Loader.loadPDF(source);
+             PDDocument output = new PDDocument()) {
+            assembler.addPageJbig2(output, sourceDoc, 0,
+                    ImageEncoder.encodeBackground(bg, 0.8f, true, 0.5f, 0f), null,
+                    pageData, globals, PAGE_W / 2, PAGE_H / 2, ocr);
+        }
+    }
 }

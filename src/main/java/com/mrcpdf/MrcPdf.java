@@ -4,6 +4,7 @@ import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -84,7 +85,7 @@ public class MrcPdf implements Callable<Integer> {
     @Option(names = {"--jpeg-quality"}, description = "Background JPEG quality when a foreground mask is present (0.1 - 1.0, default 0.50)")
     private Float jpegQuality;
 
-    @Option(names = {"--fg-color"}, description = "Enable the true MRC foreground color plane (text keeps its original color via a soft mask); not compatible with --pdfa")
+    @Option(names = {"--fg-color"}, description = "Enable the true MRC foreground color plane (text keeps its original color via a soft mask); allowed under --pdfa (PDF/A-2b permits soft masks, though conformance is not verified)")
     private Boolean fgColor;
 
     @Option(names = {"--pdfa"}, description = "Enable PDF/A-2b output (XMP metadata, sRGB OutputIntent)")
@@ -142,19 +143,22 @@ public class MrcPdf implements Callable<Integer> {
                 resolvedJpegQuality = (float) settings.getDouble("pipeline.jpegQuality", 0.85);
             }
 
-            // True MRC foreground color plane: soft masks are not allowed in
-            // PDF/A-2b, so force the setting off and warn when both are requested.
+            // True MRC foreground color plane.  PDF/A-2b permits a soft mask
+            // (SMask) over an image, so the color layer is left enabled under
+            // --pdfa; conformance is not verified, only shaping is attempted —
+            // see the PDF/A notes in the README.
             boolean fgColorEnabled = fgColor != null ? fgColor
                     : settings.getBoolean("pipeline.mrc.foregroundColor", false);
-            if (usePdfa && fgColorEnabled) {
-                System.out.println("  Note: foreground color layer disabled under PDF/A (soft masks not allowed)");
-                fgColorEnabled = false;
-            }
 
             // Font for the invisible text layer (supports CJK when a TTF/OTF is set)
             String resolvedFontPath = settings.getString("pdf.fontPath", "");
             if (resolvedFontPath.isEmpty() && usePdfa) {
                 resolvedFontPath = settings.getString("pdf.pdfa.fontPath", "");
+            }
+            if (usePdfa && resolvedFontPath.isEmpty()) {
+                System.out.println("  Note: PDF/A requested but no font path set — the invisible"
+                        + " text layer falls back to the base font and no font embedding is done;"
+                        + " the output is PDF/A-shaped but not verified conformant.");
             }
 
             System.out.println("  Output: " + resolvedOutput);
@@ -315,7 +319,7 @@ public class MrcPdf implements Callable<Integer> {
             try {
                 List<Future<Void>> futures = new ArrayList<>(pageCount);
                 long pipelineStart = System.nanoTime();
-                String perPageFmt = "    [prep-%d] page %d: %4.1fs%n";
+                String perPageFmt = "    [prep-%d] page %d: %4.1fs (cum %5.1fs)%n";
 
                 // Thread-safe (stateless) page-quality scorer for the gate.
                 TextQualityScorer scorer = new TextQualityScorer(dpi, qualityModel);
@@ -542,8 +546,16 @@ public class MrcPdf implements Callable<Integer> {
                     File tempOutput = File.createTempFile("mrcpdf-", ".pdf", outputFile.getParentFile());
                     try {
                         output.save(tempOutput);
-                        Files.move(tempOutput.toPath(), outputFile.toPath(),
-                                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                        try {
+                            Files.move(tempOutput.toPath(), outputFile.toPath(),
+                                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                        } catch (AtomicMoveNotSupportedException e) {
+                            // The filesystem/volume does not support atomic renames.
+                            // A finished document should not be thrown away over a
+                            // rename nicety: fall back to a plain replace.
+                            Files.move(tempOutput.toPath(), outputFile.toPath(),
+                                    StandardCopyOption.REPLACE_EXISTING);
+                        }
                     } catch (Exception e) {
                         tempOutput.delete();
                         throw e;
@@ -660,7 +672,11 @@ public class MrcPdf implements Callable<Integer> {
     }
 
     private static int rasterDimension(float points, float dpi) {
-        return Math.max(1, (int) Math.ceil(points * dpi / 72.0));
+        // PDFBox renders a rotated page to exactly floor(points * dpi / 72)
+        // pixels; rounding up here produced a size the renderer never emitted
+        // and the mask/geometry were written at a dimension the render never
+        // matched (A8).
+        return Math.max(1, (int) Math.floor(points * dpi / 72.0));
     }
 
     /**
