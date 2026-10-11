@@ -18,6 +18,7 @@ import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
@@ -230,5 +231,86 @@ class MetadataPreserverTest {
             assertEquals(0, result.annotations());
             assertEquals(0, result.embeddedFiles());
         }
+    }
+
+    /**
+     * A11: annotations are copied with their source /Rect, which is specified in
+     * the source page's default user space BEFORE rotation and relative to the
+     * crop box lower-left.  The output page is the rendered (rotated) page in a
+     * fresh, un-rotated, zero-origin user space, so the rect must be transformed
+     * through the same mapping PDFBox applies to the page content — otherwise
+     * link targets and highlights land on the wrong part of the page.
+     */
+    @Test
+    void preserve_remapsAnnotationGeometryForRotatedCropbox() throws IOException {
+        // Crop box offset from the page origin (llx=40, lly=60) and 90-degree
+        // rotation, so a wrongly-flipped transform fails loudly.
+        PDDocument source = new PDDocument();
+        PDPage srcPage = new PDPage(new PDRectangle(0, 0, 612, 792));
+        srcPage.setCropBox(new PDRectangle(40, 60, 300, 500));
+        srcPage.setRotation(90);
+        PDAnnotationLink link = new PDAnnotationLink();
+        link.setRectangle(new PDRectangle(100, 120, 50, 30)); // x0=100,y0=120,x1=150,y1=150 (page space)
+        srcPage.getAnnotations().add(link);
+        source.addPage(srcPage);
+
+        try (source; PDDocument output = outputFor(source)) {
+            preserver.preserve(source, output, allPages(output));
+
+            PDRectangle out = output.getPage(0).getAnnotations().get(0).getRectangle();
+            // R=90: out_x = (lly + H) - y, out_y = (llx + W) - x, on a page
+            // (W=300, H=500).
+            // (100,120) -> (60+500-120, 40+300-100) = (440, 240)
+            // (150,150) -> (60+500-150, 40+300-150) = (410, 190)
+            assertEquals(410f, out.getLowerLeftX(), 0.5f, "R=90 rect x0 — swapped axis");
+            assertEquals(190f, out.getLowerLeftY(), 0.5f, "R=90 rect y0");
+            assertEquals(440f, out.getUpperRightX(), 0.5f, "R=90 rect x1");
+            assertEquals(240f, out.getUpperRightY(), 0.5f, "R=90 rect y1");
+        }
+    }
+
+    /**
+     * A11, un-rotated page with an offset crop box: only the origin translation
+     * and the device y-flip apply (out_y = (lly + H) - y).
+     */
+    @Test
+    void preserve_remapsAnnotationGeometryForOffsetCropbox() throws IOException {
+        PDDocument source = new PDDocument();
+        PDPage srcPage = new PDPage(new PDRectangle(0, 0, 612, 792));
+        srcPage.setCropBox(new PDRectangle(40, 60, 300, 500));
+        PDAnnotationLink link = new PDAnnotationLink();
+        link.setRectangle(new PDRectangle(100, 120, 50, 30));
+        srcPage.getAnnotations().add(link);
+        source.addPage(srcPage);
+
+        try (source; PDDocument output = outputFor(source)) {
+            preserver.preserve(source, output, allPages(output));
+
+            PDRectangle out = output.getPage(0).getAnnotations().get(0).getRectangle();
+            // R=0: out_x = x - llx = 100-40 = 60; out_y = (lly+H) - y.
+            // (100,120) -> (60, 560-120) = (60,440); (150,150) -> (110, 410).
+            assertEquals(60f, out.getLowerLeftX(), 0.5f, "R=0 rect x0 — cropbox origin");
+            assertEquals(410f, out.getLowerLeftY(), 0.5f, "R=0 rect y0 — y-flip");
+            assertEquals(110f, out.getUpperRightX(), 0.5f, "R=0 rect x1");
+            assertEquals(440f, out.getUpperRightY(), 0.5f, "R=0 rect y1");
+        }
+    }
+
+    /**
+     * Output document whose pages mirror the pipeline's: crop-box dimensions,
+     * width/height swapped for 90/270 rotations, un-rotated.
+     */
+    private static PDDocument outputFor(PDDocument source) {
+        PDDocument output = new PDDocument();
+        for (int i = 0; i < source.getNumberOfPages(); i++) {
+            PDPage src = source.getPage(i);
+            PDRectangle cb = src.getCropBox();
+            if (src.getRotation() % 180 != 0) {
+                output.addPage(new PDPage(new PDRectangle(cb.getHeight(), cb.getWidth())));
+            } else {
+                output.addPage(new PDPage(new PDRectangle(cb.getWidth(), cb.getHeight())));
+            }
+        }
+        return output;
     }
 }

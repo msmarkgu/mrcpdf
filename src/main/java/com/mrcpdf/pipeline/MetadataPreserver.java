@@ -9,7 +9,9 @@ import java.util.List;
 import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSBase;
 import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSFloat;
 import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.cos.COSNumber;
 import org.apache.pdfbox.cos.COSObject;
 import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -18,6 +20,7 @@ import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDMetadata;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitWidthDestination;
@@ -165,6 +168,7 @@ public class MetadataPreserver {
                 // carry a reference back to the source page.
                 cloned.removeItem(COSName.P);
                 remapAnnotationDest(cloned, source, outputPages);
+                remapAnnotationGeometry(cloned, srcPage);
                 dstAnnots.add(cloned);
             }
             dstPage.getCOSObject().setItem(COSName.ANNOTS, dstAnnots);
@@ -210,6 +214,116 @@ public class MetadataPreserver {
             }
         }
         return value;
+    }
+
+    /**
+     * Remaps annotation geometry from the source page's default user space to
+     * the output page's fresh, un-rotated, zero-origin user space.
+     *
+     * <p>The /Rect (and /QuadPoints, /Vertices, /InkList, /L, /CL) of a source
+     * annotation lives in source default user space: pre-/{@code Rotate}, and
+     * relative to the page origin rather than the crop box.  The pipeline's
+     * output page is the page as PDFBox renders it — crop box shifted to the
+     * origin, rotation applied, axes swapped for 90/270 — drawn into a brand-new
+     * page whose user space starts at (0,0).  The annotation must move through
+     * the same mapping or its region lands on the wrong part of the page.
+     *
+     * <p>Transformation of source point (x, y) (y-up, page space) to output
+     * point (mx, my) (y-up, output page, dims swapped for 90/270):
+     * <pre>
+     *   R=0:   (x − llx,        (lly + H) − y)
+     *   R=90:  ((lly + H) − y,  (llx + W) − x)
+     *   R=180: ((llx + W) − x,  y − lly)
+     *   R=270: (y − lly,        x − llx)
+     * </pre>
+     */
+    private void remapAnnotationGeometry(COSDictionary annot, PDPage srcPage) {
+        PDRectangle crop = srcPage.getCropBox();
+        float llx = crop.getLowerLeftX();
+        float lly = crop.getLowerLeftY();
+        float w = crop.getWidth();
+        float h = crop.getHeight();
+        int rotation = srcPage.getRotation() % 360;
+        if (rotation < 0) rotation += 360;
+
+        remapRect(annot, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.QUADPOINTS, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.VERTICES, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.L, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.getPDFName("CL"), rotation, llx, lly, w, h);
+        COSBase ink = annot.getDictionaryObject(COSName.getPDFName("InkList"));
+        if (ink instanceof COSArray inkList) {
+            for (COSBase sub : inkList) {
+                COSBase subVal = sub;
+                if (subVal instanceof COSObject cosObj) subVal = cosObj.getObject();
+                if (subVal instanceof COSArray stroke) {
+                    remapPointArray(stroke, rotation, llx, lly, w, h);
+                }
+            }
+        }
+    }
+
+    private static float mapX(float x, float y, int rotation, float llx, float lly,
+                              float w, float h) {
+        switch (rotation) {
+            case 90: return (lly + h) - y;
+            case 180: return (llx + w) - x;
+            case 270: return y - lly;
+            default: return x - llx;
+        }
+    }
+
+    private static float mapY(float x, float y, int rotation, float llx, float lly,
+                              float w, float h) {
+        switch (rotation) {
+            case 90: return (llx + w) - x;
+            case 180: return y - lly;
+            case 270: return x - llx;
+            default: return (lly + h) - y;
+        }
+    }
+
+    private void remapRect(COSDictionary annot, int rotation, float llx, float lly,
+                           float w, float h) {
+        COSBase rectVal = annot.getDictionaryObject(COSName.RECT);
+        if (!(rectVal instanceof COSArray rect) || rect.size() != 4) return;
+        float x0 = cosFloat(rect, 0), y0 = cosFloat(rect, 1);
+        float x1 = cosFloat(rect, 2), y1 = cosFloat(rect, 3);
+        float mx0 = mapX(x0, y0, rotation, llx, lly, w, h);
+        float my0 = mapY(x0, y0, rotation, llx, lly, w, h);
+        float mx1 = mapX(x1, y1, rotation, llx, lly, w, h);
+        float my1 = mapY(x1, y1, rotation, llx, lly, w, h);
+        rect.set(0, new COSFloat(Math.min(mx0, mx1)));
+        rect.set(1, new COSFloat(Math.min(my0, my1)));
+        rect.set(2, new COSFloat(Math.max(mx0, mx1)));
+        rect.set(3, new COSFloat(Math.max(my0, my1)));
+    }
+
+    /** Transforms each (x, y) pair in a flat number array (QuadPoints, Vertices, L, CL). */
+    private void remapPointPairs(COSDictionary annot, COSName key, int rotation,
+                                 float llx, float lly, float w, float h) {
+        COSBase value = annot.getDictionaryObject(key);
+        if (value instanceof COSArray arr) {
+            remapPointArray(arr, rotation, llx, lly, w, h);
+        }
+    }
+
+    private void remapPointArray(COSArray arr, int rotation, float llx, float lly,
+                                 float w, float h) {
+        for (int i = 0; i + 1 < arr.size(); i += 2) {
+            float x = cosFloat(arr, i);
+            float y = cosFloat(arr, i + 1);
+            arr.set(i, new COSFloat(mapX(x, y, rotation, llx, lly, w, h)));
+            arr.set(i + 1, new COSFloat(mapY(x, y, rotation, llx, lly, w, h)));
+        }
+    }
+
+    private static float cosFloat(COSArray arr, int index) {
+        COSBase base = arr.get(index);
+        if (base instanceof COSNumber num) {
+            return num.floatValue();
+        }
+        return 0f;
     }
 
     private int copyEmbeddedFiles(PDDocument source, PDDocument output) throws IOException {
