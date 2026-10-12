@@ -3,6 +3,7 @@ package com.mrcpdf.pipeline;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.awt.image.WritableRaster;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import javax.imageio.IIOImage;
@@ -16,6 +17,13 @@ import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
 public final class ImageEncoder {
+
+  /**
+   * How far the red, green and blue channels of one pixel may drift apart and
+   * still count as neutral. A scan's white point leaves a channel or two of
+   * noise behind; a real tint is far wider than this.
+   */
+  private static final int GRAY_TOLERANCE = 8;
 
   private ImageEncoder() {}
 
@@ -48,7 +56,45 @@ public final class ImageEncoder {
       toEncode = PDFAssembler.gaussianBlur(toEncode, sigma);
     }
 
+    // A grayscale page -- a black-and-white scan rendered to RGB, the common
+    // case -- costs a third of the bytes as a 1-component JPEG, and the two
+    // dropped chroma planes carry no information.  Detect on the image that is
+    // actually encoded, after any downscale and blur.
+    BufferedImage gray = toGrayscaleOrNull(toEncode);
+    if (gray != null) {
+      return encodeJpeg(gray, quality, 1, 1);
+    }
     return encodeJpeg(toEncode, quality, 2, 2);
+  }
+
+  /**
+   * A 1-band copy of {@code image} when every pixel is neutral, else null.
+   *
+   * <p>Detection and conversion run in one pass, and a single colored pixel
+   * abandons the copy immediately, so a color page pays almost nothing and a
+   * gray page is touched once.  The sample written is the channel average (the
+   * channels already agree within {@link #GRAY_TOLERANCE}), which is what a
+   * viewer displays for a DeviceGray image -- converting through Java2D's
+   * linear-gray color model would instead store a gamma-shifted value.
+   */
+  static BufferedImage toGrayscaleOrNull(BufferedImage image) {
+    int w = image.getWidth();
+    int h = image.getHeight();
+    BufferedImage gray = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY);
+    WritableRaster raster = gray.getRaster();
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        int rgb = image.getRGB(x, y);
+        int r = (rgb >> 16) & 0xFF;
+        int g = (rgb >> 8) & 0xFF;
+        int b = rgb & 0xFF;
+        if (Math.abs(r - g) > GRAY_TOLERANCE || Math.abs(g - b) > GRAY_TOLERANCE) {
+          return null;
+        }
+        raster.setSample(x, y, 0, (r + g + b) / 3);
+      }
+    }
+    return gray;
   }
 
   public static byte[] encodeForegroundColor(BufferedImage image, float quality, double fgScale)
@@ -104,7 +150,10 @@ public final class ImageEncoder {
               NodeList comps = sof.getElementsByTagName("componentSpec");
               for (int ci = 0; ci < comps.getLength(); ci++) {
                 Element comp = (Element) comps.item(ci);
-                if (ci == 0) {
+                // A single-component (grayscale) JPEG has no chroma to
+                // subsample against, so its lone luma plane is always 1x1;
+                // writing 2x2 there produces a stream readers disagree on.
+                if (ci == 0 && comps.getLength() >= 2) {
                   comp.setAttribute("HsamplingFactor", Integer.toString(hSample));
                   comp.setAttribute("VsamplingFactor", Integer.toString(vSample));
                 } else {

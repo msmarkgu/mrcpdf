@@ -1,5 +1,7 @@
 package com.mrcpdf.pipeline;
 
+import java.awt.Color;
+import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.io.File;
@@ -755,7 +757,14 @@ class PDFAssemblerRegressionTest {
         List<TextBlock> blocks = Collections.singletonList(
             new TextBlock("Test", new Rectangle(10, 10, 100, 40), 0.95));
         PageResult ocr = new PageResult(1, imgW, imgH, blocks);
+        // A colored background: this test is about the chroma sampling of the
+        // 3-component path, so the source must not be neutral (a neutral
+        // background is now encoded as a 1-component JPEG).
         BufferedImage bg = new BufferedImage(imgW, imgH, BufferedImage.TYPE_3BYTE_BGR);
+        Graphics2D bgG = bg.createGraphics();
+        bgG.setColor(new Color(180, 150, 120));
+        bgG.fillRect(0, 0, imgW, imgH);
+        bgG.dispose();
         BufferedImage fgMask = new BufferedImage(imgW, imgH, BufferedImage.TYPE_BYTE_BINARY);
         List<BufferedImage> masks = Collections.singletonList(fgMask);
 

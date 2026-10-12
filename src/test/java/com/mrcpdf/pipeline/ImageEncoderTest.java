@@ -10,8 +10,6 @@ import java.util.Iterator;
 
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReader;
-import javax.imageio.ImageTypeSpecifier;
-import javax.imageio.ImageWriteParam;
 import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.stream.ImageInputStream;
 
@@ -45,20 +43,24 @@ class ImageEncoderTest {
     }
 
     private static int[] samplingFactors(byte[] jpeg) throws Exception {
+        int[] factors = allSamplingFactors(jpeg);
+        assertTrue(factors.length >= 6,
+                "expected at least 3 JPEG components, got " + factors.length / 2);
+        return factors;
+    }
+
+    private static int[] allSamplingFactors(byte[] jpeg) throws Exception {
         try (ImageInputStream in = ImageIO.createImageInputStream(new ByteArrayInputStream(jpeg))) {
             Iterator<ImageReader> readers = ImageIO.getImageReaders(in);
             assertTrue(readers.hasNext(), "jpeg should be readable");
             ImageReader reader = readers.next();
             try {
                 reader.setInput(in);
-                ImageWriteParam param = new javax.imageio.plugins.jpeg.JPEGImageWriteParam(null);
-                ImageTypeSpecifier type = ImageTypeSpecifier.createFromRenderedImage(colorfulImage());
                 IIOMetadata meta = reader.getImageMetadata(0);
                 Element tree = (Element) meta.getAsTree("javax_imageio_jpeg_image_1.0");
                 Element markerSeq = (Element) tree.getElementsByTagName("markerSequence").item(0);
                 Element sof = (Element) markerSeq.getElementsByTagName("sof").item(0);
                 NodeList comps = sof.getElementsByTagName("componentSpec");
-                assertTrue(comps.getLength() >= 3, "expected at least 3 JPEG components, got " + comps.getLength());
                 int[] factors = new int[comps.getLength() * 2];
                 for (int i = 0; i < comps.getLength(); i++) {
                     Element comp = (Element) comps.item(i);
@@ -70,6 +72,24 @@ class ImageEncoderTest {
                 reader.dispose();
             }
         }
+    }
+
+    private static BufferedImage grayscaleImage() {
+        BufferedImage img = new BufferedImage(200, 160, BufferedImage.TYPE_3BYTE_BGR);
+        Graphics2D g = img.createGraphics();
+        g.setColor(new Color(180, 180, 180));
+        g.fillRect(0, 0, 200, 160);
+        g.setColor(new Color(90, 90, 90));
+        g.fillRect(0, 0, 100, 160);
+        g.dispose();
+        return img;
+    }
+
+    private static int graySample(BufferedImage img, int x, int y) {
+        // Read the stored gray sample directly: a PDF viewer shows DeviceGray
+        // samples as-is, whereas getRGB would re-apply the linear-gray color
+        // model and report a value the file does not contain.
+        return img.getRaster().getSample(x, y, 0);
     }
 
     @Test
@@ -93,6 +113,50 @@ class ImageEncoderTest {
     }
 
     /**
+     * A grayscale page -- the common case for a black-and-white scan rendered to
+     * RGB -- must not be carried as a 3-component JPEG. The channels are
+     * identical, so the two chroma components are pure waste; a 1-component
+     * background JPEG is roughly a third smaller for the same luma.
+     */
+    @Test
+    void background_grayscaleSource_encodesAsSingleComponentJpeg() throws Exception {
+        BufferedImage gray = grayscaleImage();
+        byte[] jpeg = ImageEncoder.encodeBackground(gray, 0.9f, true, 0.5f, 0f);
+
+        int[] factors = allSamplingFactors(jpeg);
+        assertEquals(2, factors.length,
+                "a grayscale background must be a 1-component JPEG, factors="
+                        + java.util.Arrays.toString(factors));
+        assertEquals(1, factors[0], "the single gray component must not be subsampled");
+        assertEquals(1, factors[1]);
+
+        BufferedImage decoded = decode(jpeg);
+        assertEquals(1, decoded.getColorModel().getNumComponents(),
+                "the decoded JPEG must report one component");
+        assertEquals(180, graySample(decoded, 75, 20), 12,
+                "light background must survive the gray conversion");
+        assertEquals(90, graySample(decoded, 25, 40), 12,
+                "dark region must survive the gray conversion");
+    }
+
+    /**
+     * The counterpart: a genuinely colored background must keep its color. The
+     * channel scan that detects grayscale must be conservative -- any pixel that
+     * differs across channels keeps the full 3-component path.
+     */
+    @Test
+    void background_colorSource_staysThreeComponentJpeg() throws Exception {
+        byte[] jpeg = ImageEncoder.encodeBackground(colorfulImage(), 0.9f, true, 0.5f, 0f);
+
+        int[] factors = allSamplingFactors(jpeg);
+        assertEquals(6, factors.length,
+                "a color background keeps all 3 components, factors="
+                        + java.util.Arrays.toString(factors));
+        assertEquals(2, factors[0], "luma keeps its 4:2:0 subsampling");
+        assertEquals(2, factors[1]);
+    }
+
+    /**
      * A2 regression: encodeBackground scales the smoothing sigma the wrong way.
      * The blur runs on the downscaled image, so a sigma meant to be measured at
      * full resolution must be multiplied by bgScale, not divided by it; dividing
@@ -103,9 +167,13 @@ class ImageEncoderTest {
     void backgroundSigma_isRescaledByScaleNotDivided() throws Exception {
         BufferedImage bars = new BufferedImage(300, 200, BufferedImage.TYPE_3BYTE_BGR);
         Graphics2D g = bars.createGraphics();
-        g.setColor(Color.WHITE);
+        // Tinted, but with the SAME tint on the bars and the background: the
+        // image is non-neutral (so it stays on the 3-component path this RGB
+        // comparison is calibrated against) yet has no chroma detail, so 4:2:0
+        // subsampling adds no error the sigma check could be blamed for.
+        g.setColor(new Color(235, 235, 255));
         g.fillRect(0, 0, 300, 200);
-        g.setColor(Color.BLACK);
+        g.setColor(new Color(5, 5, 25));
         for (int x = 0; x < 300; x += 8) g.fillRect(x, 0, 4, 200); // 4px bars
         g.dispose();
 
