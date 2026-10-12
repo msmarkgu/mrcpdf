@@ -53,4 +53,31 @@ class MrcPdfTest {
         assertTrue(MrcPdf.runMrc(false, true, false, false),
                 "with the gate off a not-good page is compressed anyway");
     }
+
+    // ── per-page effective render DPI ──────────────────────────────────
+
+    @Test
+    void effectiveRenderDpi_neverExceedsConfigured() {
+        assertEquals(300f, MrcPdf.effectiveRenderDpi(300f, 600.0), 1e-4,
+                "a source richer than the configured target is still rendered at the target");
+        assertEquals(300f, MrcPdf.effectiveRenderDpi(300f, 300.0), 1e-4);
+    }
+
+    @Test
+    void effectiveRenderDpi_dropsToNativeWhenLower() {
+        assertEquals(72f, MrcPdf.effectiveRenderDpi(300f, 72.0), 1e-4,
+                "a low-resolution source renders at its own resolution, not the configured one");
+    }
+
+    @Test
+    void effectiveRenderDpi_defaultsToConfiguredWhenUnknown() {
+        assertEquals(300f, MrcPdf.effectiveRenderDpi(300f, 0.0), 1e-4,
+                "an unmeasured page keeps the configured resolution");
+    }
+
+    @Test
+    void effectiveRenderDpi_isFlooredToAvoidDegenerateRenders() {
+        assertEquals(MrcPdf.MIN_RENDER_DPI, MrcPdf.effectiveRenderDpi(300f, 5.0), 1e-4,
+                "an implausibly small measurement is clamped up to the floor");
+    }
 }

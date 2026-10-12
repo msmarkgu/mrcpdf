@@ -286,14 +286,26 @@ public class MrcPdf implements Callable<Integer> {
             // ── Origin pass (main thread): which pages are digital native? ──
             //   Decided before the render loop so native pages are never
             //   rasterised at all -- the whole point of passing them through.
+            //   The same pass measures each page's source resolution so a
+            //   low-resolution scan is not re-rendered at the configured DPI.
             boolean[] nativePage = new boolean[pageCount];
+            float[] pageDpi = new float[pageCount];
             int nativeCount = 0;
+            int nativeDpiCount = 0;
+            for (int i = 0; i < pageCount; i++) {
+                PageOrigin.Probe p = PageOrigin.probe(source.getPage(i));
+                nativePage[i] = passThrough
+                        && p.getCoverage() < PageOrigin.PAGE_FILL_COVERAGE;
+                pageDpi[i] = effectiveRenderDpi(dpi, p.getNativeDpi());
+                if (nativePage[i]) nativeCount++;
+                if (pageDpi[i] < dpi) nativeDpiCount++;
+            }
             if (passThrough) {
-                for (int i = 0; i < pageCount; i++) {
-                    nativePage[i] = PageOrigin.isDigitalNative(source.getPage(i));
-                    if (nativePage[i]) nativeCount++;
-                }
                 System.out.println("  Pass-through pages: " + nativeCount + " (digital native)");
+            }
+            if (nativeDpiCount > 0) {
+                System.out.println("  Native-resolution pages: " + nativeDpiCount
+                        + " (rendered below " + (int) dpi + " dpi)");
             }
 
             System.out.println("  Processing " + pageCount + " pages...");
@@ -323,9 +335,6 @@ public class MrcPdf implements Callable<Integer> {
                 long pipelineStart = System.nanoTime();
                 String perPageFmt = "    [prep-%d] page %d: %4.1fs (cum %5.1fs)%n";
 
-                // Thread-safe (stateless) page-quality scorer for the gate.
-                TextQualityScorer scorer = new TextQualityScorer(dpi, qualityModel);
-
                 Semaphore semaphore = new Semaphore(workerThreads + 2);
 
                 for (int i = 0; i < pageCount; i++) {
@@ -339,7 +348,7 @@ public class MrcPdf implements Callable<Integer> {
                     final int pageIdx = i;
                     // Digital-native pages are never rasterised at all.
                     final BufferedImage page = nativePage[i] ? null
-                            : renderer.renderImageWithDPI(i, dpi);
+                            : renderer.renderImageWithDPI(i, pageDpi[i]);
 
                     futures.add(executor.submit(() -> {
                         long localStart = System.nanoTime();
@@ -348,8 +357,8 @@ public class MrcPdf implements Callable<Integer> {
                             pageData[pageIdx] = pd;
                             pd.passThrough = nativePage[pageIdx];
                             if (pd.passThrough) {
-                                pd.imgW = rasterWidth(source.getPage(pageIdx), dpi);
-                                pd.imgH = rasterHeight(source.getPage(pageIdx), dpi);
+                                pd.imgW = rasterWidth(source.getPage(pageIdx), pageDpi[pageIdx]);
+                                pd.imgH = rasterHeight(source.getPage(pageIdx), pageDpi[pageIdx]);
                             } else {
                                 pd.imgW = page.getWidth();
                                 pd.imgH = page.getHeight();
@@ -363,6 +372,11 @@ public class MrcPdf implements Callable<Integer> {
                             // pins confidence to exactly 100.0, so text-layer
                             // glyph scoring is not engaged by this pipeline.
                             if (!pd.passThrough && useMrc && qualityGateEnabled) {
+                                // The scorer normalises pixel-length features by
+                                // DPI, so it must see the DPI this page was
+                                // actually rendered at, not the configured target.
+                                TextQualityScorer scorer =
+                                        new TextQualityScorer(pageDpi[pageIdx], qualityModel);
                                 TextQualityScore score = scorer.compute(page, null);
                                 // Model gate when a decision is available; the
                                 // geometric threshold is the fallback (no model
@@ -462,7 +476,7 @@ public class MrcPdf implements Callable<Integer> {
                     // check read. A pass-through page never has a layer
                     // written for it -- it keeps its own -- but its words are
                     // still in the output and are still counted.
-                    TextExtractor.extractTextBlocks(source, i, dpi, pd.imgW, pd.imgH, textBlocksOut);
+                    TextExtractor.extractTextBlocks(source, i, pageDpi[i], pd.imgW, pd.imgH, textBlocksOut);
                     results.add(new PageResult(i, pd.imgW, pd.imgH, textBlocksOut[0],
                             pd.bgJpeg, pd.fgColorJpeg, pd.mask,
                             pd.qualityScore, pd.gateSkip, pd.passThrough));
@@ -674,6 +688,28 @@ public class MrcPdf implements Callable<Integer> {
                           boolean screenGood) {
         if (digitalNative || !useMrc) return false;
         return !qualityGateEnabled || screenGood;
+    }
+
+    /**
+     * Floor for the per-page render DPI derived from a source raster. A measured
+     * resolution is a compression hint, not a contract: below this it stops
+     * looking like a real page resolution (a tiny logo drawn large) and
+     * re-rendering there would cost fidelity for no meaningful size win.
+     */
+    static final float MIN_RENDER_DPI = 36f;
+
+    /**
+     * The DPI to render one page at: the configured DPI, lowered to the source
+     * raster's native resolution when that is lower. Never raised -- a source
+     * richer than the target is still rendered at the target -- and never below
+     * {@link #MIN_RENDER_DPI}.
+     *
+     * @param configured the DPI from settings / the CLI
+     * @param nativeDpi  the source raster's resolution, or 0 when unknown
+     */
+    static float effectiveRenderDpi(float configured, double nativeDpi) {
+        if (nativeDpi <= 0) return configured;
+        return Math.max(MIN_RENDER_DPI, (float) Math.min(configured, nativeDpi));
     }
 
     /** Rendered pixel width of a source page at {@code dpi}, rotation applied. */

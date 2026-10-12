@@ -242,6 +242,95 @@ class PageOriginTest {
         }
     }
 
+    // ── native-resolution probe ────────────────────────────────────────
+
+    @Test
+    void nativeRasterDpi_reflectsPixelsPerDrawnPoint() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage at72 = new PDPage(new PDRectangle(W, H));
+            doc.addPage(at72);
+            drawImage(doc, at72, imageOfSize(doc, 72, 72), 0, 0, 72, 72);
+
+            PDPage at144 = new PDPage(new PDRectangle(W, H));
+            doc.addPage(at144);
+            drawImage(doc, at144, imageOfSize(doc, 144, 144), 0, 0, 72, 72);
+
+            assertEquals(72.0, PageOrigin.probe(at72).getNativeDpi(), 1.0,
+                    "a 72px raster drawn over 72pt is 72 ppi");
+            assertEquals(144.0, PageOrigin.probe(at144).getNativeDpi(), 1.0,
+                    "a 144px raster drawn over 72pt is 144 ppi");
+            assertTrue(PageOrigin.probe(at144).hasNativeDpi());
+        }
+    }
+
+    @Test
+    void nativeRasterDpi_usesTheSmallerAxis() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(W, H));
+            doc.addPage(page);
+            // 100x400 px into 100x100 pt: 72 ppi horizontally, 288 ppi vertically.
+            // The smaller axis is the one a re-render can actually satisfy.
+            drawImage(doc, page, imageOfSize(doc, 100, 400), 0, 0, 100, 100);
+
+            assertEquals(72.0, PageOrigin.probe(page).getNativeDpi(), 1.0,
+                    "the limiting axis sets the measured resolution");
+        }
+    }
+
+    @Test
+    void nativeRasterDpi_isUnknownWithoutARaster() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(W, H));
+            doc.addPage(page);
+
+            PageOrigin.Probe probe = PageOrigin.probe(page);
+            assertEquals(0.0, probe.getNativeDpi(), 1e-9,
+                    "a vector page has no measured resolution");
+            assertFalse(probe.hasNativeDpi());
+        }
+    }
+
+    @Test
+    void nativeRasterDpi_isUnknownForInlineImages() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(W, H));
+            doc.addPage(page);
+
+            COSDictionary d = new COSDictionary();
+            d.setInt(COSName.WIDTH, 4);
+            d.setInt(COSName.HEIGHT, 4);
+            d.setInt(COSName.BITS_PER_COMPONENT, 8);
+            d.setItem(COSName.COLORSPACE, COSName.DEVICERGB);
+            byte[] rgb = new byte[4 * 4 * 3];
+            for (int i = 0; i < rgb.length; i += 3) {
+                rgb[i] = (byte) 200;
+                rgb[i + 1] = (byte) 100;
+                rgb[i + 2] = (byte) 50;
+            }
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.drawImage(new PDInlineImage(d, rgb, null), 0, 0, W, H);
+            }
+
+            assertFalse(PageOrigin.probe(page).hasNativeDpi(),
+                    "an inline image exposes no resolvable pixel dimensions");
+        }
+    }
+
+    @Test
+    void nativeRasterDpi_followsTheBestCoveringRaster() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(72, 72));
+            doc.addPage(page);
+            // A dense little logo that fills almost none of the page, then the
+            // page-filling scan. The scan's resolution is the page's resolution.
+            drawImage(doc, page, imageOfSize(doc, 600, 600), 10, 10, 2, 2);
+            drawImage(doc, page, imageOfSize(doc, 144, 144), 0, 0, 72, 72);
+
+            assertEquals(144.0, PageOrigin.probe(page).getNativeDpi(), 1.0,
+                    "the page-filling raster sets the measured resolution");
+        }
+    }
+
     // ── helpers ────────────────────────────────────────────────────────
 
     private static PDDocument open(String path) throws Exception {
@@ -261,10 +350,25 @@ class PageOriginTest {
         return JPEGFactory.createFromImage(doc, img, 0.9f);
     }
 
+    private static PDImageXObject imageOfSize(PDDocument doc, int w, int h)
+            throws Exception {
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = img.createGraphics();
+        g.setColor(Color.DARK_GRAY);
+        g.fillRect(0, 0, w, h);
+        g.dispose();
+        return JPEGFactory.createFromImage(doc, img, 0.9f);
+    }
+
     private static void drawImage(PDDocument doc, PDPage page,
                                   float x, float y, float w, float h)
             throws Exception {
-        PDImageXObject img = solidImage(doc, Color.DARK_GRAY);
+        drawImage(doc, page, solidImage(doc, Color.DARK_GRAY), x, y, w, h);
+    }
+
+    private static void drawImage(PDDocument doc, PDPage page, PDImageXObject img,
+                                  float x, float y, float w, float h)
+            throws Exception {
         // Append: a second call must add to the page, not replace it, or the
         // page under test is not the page the test describes.
         try (PDPageContentStream cs = new PDPageContentStream(doc, page,

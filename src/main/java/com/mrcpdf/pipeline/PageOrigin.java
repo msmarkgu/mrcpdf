@@ -16,6 +16,7 @@ import org.apache.pdfbox.contentstream.operator.state.Save;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.util.Matrix;
 
 /**
@@ -75,7 +76,7 @@ public final class PageOrigin {
      * @throws IOException if the page's content stream cannot be read
      */
     public static boolean isDigitalNative(PDPage page) throws IOException {
-        return coverageOf(page) < PAGE_FILL_COVERAGE;
+        return probe(page).getCoverage() < PAGE_FILL_COVERAGE;
     }
 
     /**
@@ -84,9 +85,49 @@ public final class PageOrigin {
      * measurement rather than only the verdict that falls out of it.
      */
     static double coverageOf(PDPage page) throws IOException {
+        return probe(page).getCoverage();
+    }
+
+    /**
+     * What one content-stream pass learns about a page: how much raster it
+     * carries, and -- for the raster that carries the most -- the resolution the
+     * source pixels imply.
+     *
+     * @param page the source page to measure
+     * @throws IOException if the page's content stream cannot be read
+     */
+    public static Probe probe(PDPage page) throws IOException {
         RasterCoverage probe = new RasterCoverage(page.getCropBox());
         probe.processPage(page);
-        return probe.bestCoverage;
+        return new Probe(probe.bestCoverage, probe.bestNativeDpi);
+    }
+
+    /**
+     * The result of {@link #probe(PDPage)}.
+     *
+     * <p>{@code nativeDpi} is the resolution of the page's dominant raster: its
+     * pixel dimensions divided by the points the raster is drawn over, taking the
+     * more restrictive axis. It is 0 when no such resolution can be established
+     * -- no raster at all, an inline image (which exposes no separate pixel
+     * dimensions through the content stream), or an image object whose
+     * dimensions cannot be read. Callers treat 0 as "keep the configured DPI".
+     */
+    public static final class Probe {
+        private final double coverage;
+        private final double nativeDpi;
+
+        Probe(double coverage, double nativeDpi) {
+            this.coverage = coverage;
+            // Normalise the unknown sentinel: no raster can imply a resolution
+            // at or below zero, so every non-positive measurement is "unknown".
+            this.nativeDpi = nativeDpi > 0 ? nativeDpi : 0;
+        }
+
+        public double getCoverage() { return coverage; }
+
+        public double getNativeDpi() { return nativeDpi; }
+
+        public boolean hasNativeDpi() { return nativeDpi > 0; }
     }
 
     /**
@@ -98,6 +139,7 @@ public final class PageOrigin {
 
         private final PDRectangle box;
         private double bestCoverage;
+        private double bestNativeDpi;
 
         RasterCoverage(PDRectangle box) {
             this.box = box;
@@ -121,16 +163,30 @@ public final class PageOrigin {
                 if (!operands.isEmpty() && operands.get(0) instanceof COSName ref) {
                     PDResources resources = getResources();
                     if (resources != null && resources.isImageXObject(ref)) {
-                        recordCoverage();
+                        recordCoverage(imageOrNull(resources, ref));
                     }
                 }
             } else if (OperatorName.BEGIN_INLINE_IMAGE.equals(name)) {
-                // No resource to look up; the CTM alone says how much page it fills.
-                recordCoverage();
+                // No resource to look up; the CTM alone says how much page it
+                // fills, and no resolvable pixel dimensions are available.
+                recordCoverage(null);
             }
             // super dispatches to the registered processors, including DrawObject,
             // which is what descends into Form XObjects.
             super.processOperator(operator, operands);
+        }
+
+        /**
+         * Resolves the image behind a {@code Do}, for its pixel dimensions only.
+         * A resource whose object cannot be read yields null: coverage is still
+         * measured, the resolution simply stays unknown.
+         */
+        private static PDImageXObject imageOrNull(PDResources resources, COSName ref) {
+            try {
+                return resources.getXObject(ref) instanceof PDImageXObject img ? img : null;
+            } catch (IOException e) {
+                return null;
+            }
         }
 
         /**
@@ -142,7 +198,7 @@ public final class PageOrigin {
          * slightly generous under skew -- generous in the direction that marks a
          * page as a scan, which is the side that keeps MRC available.
          */
-        private void recordCoverage() {
+        private void recordCoverage(PDImageXObject img) {
             Matrix ctm = getGraphicsState().getCurrentTransformationMatrix();
             float minX = Float.POSITIVE_INFINITY;
             float minY = Float.POSITIVE_INFINITY;
@@ -161,7 +217,25 @@ public final class PageOrigin {
                     - Math.max(minY, box.getLowerLeftY()));
             double area = box.getWidth() * box.getHeight();
             if (area <= 0) return;
-            bestCoverage = Math.max(bestCoverage, (ix * iy) / area);
+            double coverage = (ix * iy) / area;
+            if (coverage <= bestCoverage) return;
+            bestCoverage = coverage;
+            bestNativeDpi = nativeDpiOf(img, maxX - minX, maxY - minY);
+        }
+
+        /**
+         * The source resolution implied by a raster's pixels and the points it is
+         * drawn over. The smaller of the two axis ratios is taken: rendering above
+         * it upsamples one axis, so the restrictive axis is the one a faithful
+         * re-render has to respect. Zero when the dimensions are unavailable.
+         */
+        private static double nativeDpiOf(PDImageXObject img,
+                                          double drawnW, double drawnH) {
+            if (img == null || drawnW <= 0 || drawnH <= 0) return 0;
+            int pxW = img.getWidth();
+            int pxH = img.getHeight();
+            if (pxW <= 0 || pxH <= 0) return 0;
+            return Math.min(pxW * 72.0 / drawnW, pxH * 72.0 / drawnH);
         }
     }
 }
