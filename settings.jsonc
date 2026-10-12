@@ -151,6 +151,12 @@
     //   -s = refine smearing
     "jbig2enc.flags": "-p -s",
 
+    // Wall-clock limit for one jbig2enc run, in milliseconds.
+    // A pathological document must not be able to hang the batch forever; when
+    // the limit trips, the page falls back to CCITT G4.
+    //   300000 = 5 minutes (default)
+    "jbig2enc.timeoutMs": 300000,
+
     // ===== PDF/A =====
     // Enable PDF/A-2b output (adds XMP metadata, sRGB OutputIntent).
     // Override via --pdfa CLI flag.

@@ -30,14 +30,38 @@ import com.mrcpdf.util.SubprocessRunner;
  */
 public class JBIG2Compressor {
 
+    /**
+     * Wall-clock limit for one jbig2enc invocation when neither the caller nor
+     * settings says otherwise. A batch that hangs is worse than one that falls
+     * back, so even the default is a bound rather than no limit.
+     */
+    private static final int DEFAULT_TIMEOUT_MS = 300_000;
+
     private final String nativeDir;
+
+    /**
+     * Explicit timeout in milliseconds, or &le;0 to read
+     * {@code jbig2enc.timeoutMs} from settings (falling back to
+     * {@link #DEFAULT_TIMEOUT_MS}).
+     */
+    private final long timeoutMs;
 
     public JBIG2Compressor() {
         this("deps/jbig2enc");
     }
 
     public JBIG2Compressor(String nativeDir) {
+        this(nativeDir, 0L);
+    }
+
+    public JBIG2Compressor(String nativeDir, long timeoutMs) {
         this.nativeDir = nativeDir;
+        this.timeoutMs = timeoutMs;
+    }
+
+    private long resolveTimeoutMs() {
+        if (timeoutMs > 0) return timeoutMs;
+        return Settings.getInstance().getInt("jbig2enc.timeoutMs", DEFAULT_TIMEOUT_MS);
     }
 
     /**
@@ -121,15 +145,33 @@ public class JBIG2Compressor {
         args.add(basename);
         args.addAll(imagePaths);
 
-        SubprocessRunner.Result result = SubprocessRunner.run(jbig2enc, args, -1);
-        if (result.getExitCode() != 0) return null;
+        SubprocessRunner.Result result;
+        try {
+            result = SubprocessRunner.run(jbig2enc, args, resolveTimeoutMs());
+        } catch (IOException e) {
+            // The binary could not even be started (missing interpreter, wrong
+            // architecture, exec permission, timeout). Surface it and let the
+            // caller use CCITT G4 rather than aborting the whole document.
+            System.err.println("  Warning: jbig2enc could not run (" + e.getMessage()
+                    + ") — using CCITT G4 fallback.");
+            return null;
+        }
+        if (result.getExitCode() != 0) {
+            System.err.println("  Warning: jbig2enc exited " + result.getExitCode()
+                    + formatStderr(result) + " — using CCITT G4 fallback.");
+            return null;
+        }
 
         // Read output files, then delete them immediately
         try {
             // Read shared global symbol dictionary
             File symFile = new File(basename + ".sym");
             byte[] globalSym = symFile.exists() ? Files.readAllBytes(symFile.toPath()) : new byte[0];
-            if (globalSym.length == 0) return null;
+            if (globalSym.length == 0) {
+                System.err.println("  Warning: jbig2enc produced no symbol dictionary"
+                        + " — using CCITT G4 fallback.");
+                return null;
+            }
 
             // Read per-page data (jbig2enc -p writes <basename>.0000, .0001, ...)
             List<CompressionResult> pages = new ArrayList<>(pageCount);
@@ -161,9 +203,23 @@ public class JBIG2Compressor {
                 return compressWithJbig2enc(jbig2enc, foregroundMask);
             } catch (IOException e) {
                 // jbig2enc failed → fall through to fallback
+                System.err.println("  Warning: jbig2enc failed (" + e.getMessage()
+                        + ") — using CCITT G4 fallback.");
             }
         }
         return compressWithFallback(foregroundMask);
+    }
+
+    /**
+     * Formats a failed run's stderr for a one-line warning: empty when there was
+     * none, otherwise the first line (a jbig2enc failure can be verbose).
+     */
+    private static String formatStderr(SubprocessRunner.Result result) {
+        String err = result.getStderrString().trim();
+        if (err.isEmpty()) return "";
+        int nl = err.indexOf('\n');
+        if (nl >= 0) err = err.substring(0, nl) + " ...";
+        return ": " + err;
     }
 
     /**
@@ -240,7 +296,7 @@ public class JBIG2Compressor {
             args.add(prefix);
             args.add(tempBmp.getAbsolutePath());
 
-            SubprocessRunner.Result result = SubprocessRunner.run(jbig2enc, args, -1);
+            SubprocessRunner.Result result = SubprocessRunner.run(jbig2enc, args, resolveTimeoutMs());
             if (result.getExitCode() != 0) {
                 throw new IOException("jbig2enc failed: " + result.getStderrString());
             }
