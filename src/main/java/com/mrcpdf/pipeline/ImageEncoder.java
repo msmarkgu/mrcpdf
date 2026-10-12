@@ -1,7 +1,5 @@
 package com.mrcpdf.pipeline;
 
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.awt.image.WritableRaster;
 import java.io.ByteArrayOutputStream;
@@ -35,13 +33,7 @@ public final class ImageEncoder {
     if (hasMask && bgScale < 1.0) {
       int newW = Math.max(1, (int) Math.round(image.getWidth() * bgScale));
       int newH = Math.max(1, (int) Math.round(image.getHeight() * bgScale));
-      BufferedImage scaled = new BufferedImage(newW, newH, BufferedImage.TYPE_3BYTE_BGR);
-      Graphics2D g = scaled.createGraphics();
-      g.setRenderingHint(
-          RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-      g.drawImage(image, 0, 0, newW, newH, null);
-      g.dispose();
-      toEncode = scaled;
+      toEncode = downscaleAreaAverage(image, newW, newH);
     }
 
     if (hasMask && bgSmoothSigma > 0f) {
@@ -103,13 +95,7 @@ public final class ImageEncoder {
     if (fgScale < 1.0) {
       int newW = Math.max(1, (int) Math.round(image.getWidth() * fgScale));
       int newH = Math.max(1, (int) Math.round(image.getHeight() * fgScale));
-      BufferedImage scaled = new BufferedImage(newW, newH, BufferedImage.TYPE_3BYTE_BGR);
-      Graphics2D g = scaled.createGraphics();
-      g.setRenderingHint(
-          RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-      g.drawImage(image, 0, 0, newW, newH, null);
-      g.dispose();
-      toEncode = scaled;
+      toEncode = downscaleAreaAverage(image, newW, newH);
     }
     return encodeJpeg(toEncode, quality, 1, 1);
   }
@@ -118,6 +104,72 @@ public final class ImageEncoder {
     ByteArrayOutputStream baos = new ByteArrayOutputStream(8192);
     ImageIO.write(image, "png", baos);
     return baos.toByteArray();
+  }
+
+  /**
+   * Downscales by averaging every source pixel that falls in each destination
+   * cell (a box filter).
+   *
+   * <p>Bilinear interpolation -- the previous path -- samples a 2x2
+   * neighbourhood, so a noisy scan keeps its high-frequency energy and aliases
+   * it down into the background.  A box filter averages the whole cell, which is
+   * what downsampling a photograph means and what both the eye and the JPEG
+   * encoder prefer.  Each source row is read once and its pixels distributed
+   * across the destination columns whose cells contain them, so the whole
+   * resample is a single pass over the source.
+   */
+  static BufferedImage downscaleAreaAverage(BufferedImage src, int newW, int newH) {
+    int srcW = src.getWidth();
+    int srcH = src.getHeight();
+    BufferedImage dst = new BufferedImage(newW, newH, BufferedImage.TYPE_3BYTE_BGR);
+
+    // Destination cell boundaries as integer source ranges. Consecutive ranges
+    // share endpoints, so every source pixel lands in exactly one cell.
+    int[] xEdge = new int[newW + 1];
+    int[] yEdge = new int[newH + 1];
+    for (int x = 0; x <= newW; x++) xEdge[x] = (int) ((long) x * srcW / newW);
+    for (int y = 0; y <= newH; y++) yEdge[y] = (int) ((long) y * srcH / newH);
+
+    long[] accR = new long[newW];
+    long[] accG = new long[newW];
+    long[] accB = new long[newW];
+    int[] count = new int[newW];
+    int[] row = new int[srcW];
+    int[] out = new int[newW];
+
+    for (int y = 0; y < newH; y++) {
+      java.util.Arrays.fill(accR, 0L);
+      java.util.Arrays.fill(accG, 0L);
+      java.util.Arrays.fill(accB, 0L);
+      java.util.Arrays.fill(count, 0);
+
+      int sy0 = yEdge[y];
+      int sy1 = Math.max(sy0 + 1, yEdge[y + 1]);
+      for (int sy = sy0; sy < sy1; sy++) {
+        src.getRGB(0, sy, srcW, 1, row, 0, srcW);
+        for (int x = 0; x < newW; x++) {
+          int sx0 = xEdge[x];
+          int sx1 = Math.max(sx0 + 1, xEdge[x + 1]);
+          for (int sx = sx0; sx < sx1; sx++) {
+            int px = row[sx];
+            accR[x] += (px >> 16) & 0xFF;
+            accG[x] += (px >> 8) & 0xFF;
+            accB[x] += px & 0xFF;
+            count[x]++;
+          }
+        }
+      }
+
+      for (int x = 0; x < newW; x++) {
+        int n = count[x];
+        out[x] = 0xFF000000
+            | ((int) (accR[x] / n) << 16)
+            | ((int) (accG[x] / n) << 8)
+            | (int) (accB[x] / n);
+      }
+      dst.setRGB(0, y, newW, 1, out, 0, newW);
+    }
+    return dst;
   }
 
   static byte[] encodeJpeg(BufferedImage image, float quality, int hSample, int vSample)

@@ -157,6 +157,52 @@ class ImageEncoderTest {
     }
 
     /**
+     * The background downscale must average each destination cell, not sample a
+     * 2x2 neighbourhood from it.
+     *
+     * <p>On 50% black/white noise the distinction is stark: a 3x3 box average
+     * reduces the standard deviation from ~128 to ~128/3 = 43, whereas bilinear
+     * interpolation (the previous path) keeps the high-frequency energy and
+     * aliases it down into the background.
+     */
+    @Test
+    void downscale_averagesTheSourceCell() {
+        int n = 600;
+        java.util.Random rng = new java.util.Random(1234567L);
+        BufferedImage noise = new BufferedImage(n, n, BufferedImage.TYPE_3BYTE_BGR);
+        for (int y = 0; y < n; y++) {
+            for (int x = 0; x < n; x++) {
+                int v = rng.nextBoolean() ? 0 : 255;
+                noise.setRGB(x, y, (v << 16) | (v << 8) | v);
+            }
+        }
+        assertEquals(127.5, stdGray(noise), 6.0,
+                "sanity: the input must be high-variance noise");
+
+        BufferedImage scaled = ImageEncoder.downscaleAreaAverage(noise, 200, 200);
+        assertEquals(200, scaled.getWidth());
+        assertEquals(200, scaled.getHeight());
+        assertTrue(stdGray(scaled) < 55.0,
+                "a box filter must average the whole 3x3 cell, got std="
+                        + stdGray(scaled));
+    }
+
+    private static double stdGray(BufferedImage img) {
+        long sum = 0, sumSq = 0;
+        int n = 0;
+        for (int y = 0; y < img.getHeight(); y++) {
+            for (int x = 0; x < img.getWidth(); x++) {
+                int v = img.getRGB(x, y) & 0xFF;
+                sum += v;
+                sumSq += (long) v * v;
+                n++;
+            }
+        }
+        double mean = (double) sum / n;
+        return Math.sqrt((double) sumSq / n - mean * mean);
+    }
+
+    /**
      * A2 regression: encodeBackground scales the smoothing sigma the wrong way.
      * The blur runs on the downscaled image, so a sigma meant to be measured at
      * full resolution must be multiplied by bgScale, not divided by it; dividing
