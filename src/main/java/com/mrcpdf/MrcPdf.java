@@ -12,7 +12,9 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -502,6 +504,7 @@ public class MrcPdf implements Callable<Integer> {
                 System.out.println("  Assembling PDF...");
                 try (PDDocument output = new PDDocument()) {
                     List<PDPage> outPages = new ArrayList<>(pageCount);
+                    Set<PDPage> passThroughPages = new HashSet<>();
                     int fidelityPages = 0;
 
                     for (int i = 0; i < pageCount; i++) {
@@ -510,6 +513,7 @@ public class MrcPdf implements Callable<Integer> {
                         if (pr.isPassThrough()) {
                             // Digital native: the source page, untouched.
                             outPage = assembler.importOriginalPage(output, source, i);
+                            passThroughPages.add(outPage);
                         } else if (pr.isMrcSkip()) {
                             // Quality gate: original page as the only visual
                             // layer.  The worker already rendered it and encoded
@@ -551,7 +555,7 @@ public class MrcPdf implements Callable<Integer> {
 
                     // Finalize: copy metadata, add PDF/A if needed
                     System.out.println("  Finalizing document...");
-                    var preserved = assembler.finishAssembly(output, source, outPages, usePdfa);
+                    var preserved = assembler.finishAssembly(output, source, outPages, usePdfa, passThroughPages);
                     if (preserved.outlines() > 0)
                         System.out.println("  Bookmarks:  " + preserved.outlines() + " (preserved)");
                     if (preserved.annotations() > 0)

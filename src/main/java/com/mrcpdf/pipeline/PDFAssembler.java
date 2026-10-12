@@ -6,10 +6,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.cos.COSDictionary;
@@ -607,7 +609,22 @@ PDFont pageFont = resolveFont(output);
      */
     public MetadataPreserver.PreserveResult finishAssembly(PDDocument output, PDDocument source,
                                List<PDPage> outPages, boolean usePdfa) throws IOException {
-        MetadataPreserver.PreserveResult preserved = preserver.preserve(source, output, outPages);
+        return finishAssembly(output, source, outPages, usePdfa, Collections.emptySet());
+    }
+
+    /**
+     * Copies metadata from the source and optionally adds PDF/A-2b info.
+     * Must be called after all {@link #addPage} calls are complete.
+     *
+     * @param passThroughPages Output pages imported verbatim from the source
+     *                         ({@link #importOriginalPage}); their annotation
+     *                         geometry must not be remapped.
+     * @return Counts of copied metadata elements, or null if no source was provided.
+     */
+    public MetadataPreserver.PreserveResult finishAssembly(PDDocument output, PDDocument source,
+                               List<PDPage> outPages, boolean usePdfa,
+                               Set<PDPage> passThroughPages) throws IOException {
+        MetadataPreserver.PreserveResult preserved = preserver.preserve(source, output, outPages, passThroughPages);
         if (usePdfa) {
             PdfaWriter.addPdfaMetadata(output);
         }

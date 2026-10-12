@@ -3,8 +3,10 @@ package com.mrcpdf.pipeline;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSBase;
@@ -57,9 +59,26 @@ public class MetadataPreserver {
      * @return Counts of copied elements.
      */
     public PreserveResult preserve(PDDocument source, PDDocument output, List<PDPage> outputPages) throws IOException {
+        return preserve(source, output, outputPages, Collections.emptySet());
+    }
+
+    /**
+     * Preserves metadata from the source document into the assembled output.
+     *
+     * @param source          The source document.
+     * @param output          The newly assembled PDF.
+     * @param outputPages     Output pages indexed to match source pages.
+     * @param passThroughPages Output pages that are the source pages imported
+     *                         verbatim ({@code output.importPage}); their user
+     *                         space is unchanged, so annotation geometry must
+     *                         not be remapped.
+     * @return Counts of copied elements.
+     */
+    public PreserveResult preserve(PDDocument source, PDDocument output, List<PDPage> outputPages,
+                                   Set<PDPage> passThroughPages) throws IOException {
         copyDocumentInfo(source, output);
         int outlines = copyOutline(source, output, outputPages);
-        int annotations = copyAnnotations(source, outputPages);
+        int annotations = copyAnnotations(source, outputPages, passThroughPages);
         int embeddedFiles = copyEmbeddedFiles(source, output);
         copyXmlMetadata(source, output);
         return new PreserveResult(outlines, annotations, embeddedFiles);
@@ -151,7 +170,8 @@ public class MetadataPreserver {
         }
     }
 
-    private int copyAnnotations(PDDocument source, List<PDPage> outputPages) throws IOException {
+    private int copyAnnotations(PDDocument source, List<PDPage> outputPages,
+                                Set<PDPage> passThroughPages) throws IOException {
         int totalAnnotations = 0;
         int pageCount = Math.min(source.getNumberOfPages(), outputPages.size());
         for (int i = 0; i < pageCount; i++) {
@@ -168,7 +188,12 @@ public class MetadataPreserver {
                 // carry a reference back to the source page.
                 cloned.removeItem(COSName.P);
                 remapAnnotationDest(cloned, source, outputPages);
-                remapAnnotationGeometry(cloned, srcPage);
+                if (!passThroughPages.contains(dstPage)) {
+                    // Pass-through pages keep the source page's geometry verbatim
+                    // (importPage copies MediaBox/CropBox origin and /Rotate), so a
+                    // /Rect in source user space is already correct in the output.
+                    remapAnnotationGeometry(cloned, srcPage);
+                }
                 dstAnnots.add(cloned);
             }
             dstPage.getCOSObject().setItem(COSName.ANNOTS, dstAnnots);

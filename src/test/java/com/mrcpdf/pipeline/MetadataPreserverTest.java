@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.zip.InflaterInputStream;
 import java.util.stream.StreamSupport;
 
@@ -293,6 +294,41 @@ class MetadataPreserverTest {
             assertEquals(410f, out.getLowerLeftY(), 0.5f, "R=0 rect y0 — y-flip");
             assertEquals(110f, out.getUpperRightX(), 0.5f, "R=0 rect x1");
             assertEquals(440f, out.getUpperRightY(), 0.5f, "R=0 rect y1");
+        }
+    }
+
+    /**
+     * P0 regression: pass-through pages (imported verbatim from the source)
+     * keep the source page's geometry — MediaBox/CropBox origin and /Rotate are
+     * copied by {@code output.importPage}, so an annotation /Rect written in the
+     * source's user space is already correct in the output.  The A11 geometry
+     * remap applies the page-to-output transform a second time and was corrupting
+     * these pages.  Pass-through pages must keep the /Rect (and quads) untouched.
+     */
+    @Test
+    void preserve_keepsAnnotationGeometryOnPassThroughPages() throws IOException {
+        PDDocument source = new PDDocument();
+        PDPage srcPage = new PDPage(new PDRectangle(0, 0, 612, 792));
+        srcPage.setCropBox(new PDRectangle(40, 60, 300, 500));
+        srcPage.setRotation(90);
+        PDAnnotationLink link = new PDAnnotationLink();
+        link.setRectangle(new PDRectangle(100, 120, 50, 30));
+        srcPage.getAnnotations().add(link);
+        source.addPage(srcPage);
+
+        try (source; PDDocument output = new PDDocument()) {
+            // ImportOriginalPage's mechanism: the output page is the source page
+            // shallow-copied, so its user space is unchanged.
+            PDPage imported = output.importPage(srcPage);
+            preserver.preserve(source, output, List.of(imported), Set.of(imported));
+
+            PDRectangle out = output.getPage(0).getAnnotations().get(0).getRectangle();
+            // Pass-through: geometry must be preserved verbatim, NOT remapped
+            // to (410,190,440,240) like a rebuilt page would be.
+            assertEquals(100f, out.getLowerLeftX(), 0.5f, "pass-through rect x0 — untouched");
+            assertEquals(120f, out.getLowerLeftY(), 0.5f, "pass-through rect y0");
+            assertEquals(150f, out.getUpperRightX(), 0.5f, "pass-through rect x1");
+            assertEquals(150f, out.getUpperRightY(), 0.5f, "pass-through rect y1");
         }
     }
 
