@@ -102,6 +102,9 @@ public class MrcPdf implements Callable<Integer> {
     @Option(names = {"--pass-through"}, description = "Pass digital-native pages through unchanged (default: on)", negatable = true)
     private Boolean passThroughEnabled;
 
+    @Option(names = {"--keep-smaller-only"}, description = "If MRC would make the output larger than the input (e.g. an already-optimized bilevel scan), write the original bytes instead of a larger file (default: off)")
+    private Boolean keepSmallerOnly;
+
     @Override
     public Integer call() {
         Settings settings = Settings.load();
@@ -126,6 +129,8 @@ public class MrcPdf implements Callable<Integer> {
             // being rendered and re-assembled, so it is carried over as it is.
             boolean passThrough = passThroughEnabled != null ? passThroughEnabled
                     : settings.getBoolean("pipeline.origin.passThrough", true);
+            boolean keepSmaller = keepSmallerOnly != null ? keepSmallerOnly
+                    : settings.getBoolean("pipeline.keepSmallerOnly", false);
 
             float resolvedDpi = dpi != null ? dpi
                     : (float) settings.getDouble("rendering.dpi", 300);
@@ -250,7 +255,7 @@ public class MrcPdf implements Callable<Integer> {
             runPipeline(inputFile, resolvedOutput, segmenter, compressor, assembler,
                     useMrc, usePdfa, passThrough, resolvedDpi, workerThreads, resolvedFontPath,
                     fgColorEnabled, resolvedBgScale, resolvedJpegQuality, qualityGateEnabled,
-                    qualityGateThreshold, qualityModel);
+                    qualityGateThreshold, qualityModel, keepSmaller);
             return 0;
 
         } catch (Exception e) {
@@ -267,7 +272,7 @@ public class MrcPdf implements Callable<Integer> {
                              int workerThreads, String fontPath, boolean fgColorEnabled,
                              double resolvedBgScale, float resolvedJpegQuality,
                              boolean qualityGateEnabled, double qualityGateThreshold,
-                             QualityModel qualityModel) throws IOException {
+                             QualityModel qualityModel, boolean keepSmallerOnly) throws IOException {
         Path tempDir = createTempDir(inputFile.getName().replaceAll("\\.[^.]+$", ""));
 
         try (PDDocument source = Loader.loadPDF(inputFile)) {
@@ -578,7 +583,11 @@ public class MrcPdf implements Callable<Integer> {
                         System.out.println("  Links:      " + preserved.annotations() + " (preserved)");
                     if (preserved.embeddedFiles() > 0)
                         System.out.println("  Attachments: " + preserved.embeddedFiles() + " (preserved)");
-                    File tempOutput = File.createTempFile("mrcpdf-", ".pdf", outputFile.getParentFile());
+                    // Resolve the parent to an absolute path: a bare "out.pdf" has a null
+                    // parent, which would silently redirect the temp file to the
+                    // system temp dir and defeat the atomic move below.
+                    File outParent = outputFile.getAbsoluteFile().getParentFile();
+                    File tempOutput = File.createTempFile("mrcpdf-", ".pdf", outParent);
                     try {
                         output.save(tempOutput);
                         try {
@@ -594,6 +603,27 @@ public class MrcPdf implements Callable<Integer> {
                     } catch (Exception e) {
                         tempOutput.delete();
                         throw e;
+                    }
+
+                    // ── Expansion guard ──────────────────────────────────────
+                    // MRC adds a background layer per page, so on an input that
+                    // is already tightly optimized (a bilevel CCITT scan, say)
+                    // the "compressed" output can be larger than what it
+                    // replaced.  Default is to keep the MRC result and say so;
+                    // silently discarding it would be worse, and silently
+                    // handing back a larger file is what we are fixing.
+                    long inSize = inputFile.length();
+                    long outSize = outputFile.length();
+                    String expansion = expansionNotice(inSize, outSize, keepSmallerOnly);
+                    if (expansion != null) {
+                        System.err.println(expansion);
+                        if (keepSmallerOnly) {
+                            Files.copy(inputFile.toPath(), outputFile.toPath(),
+                                    StandardCopyOption.REPLACE_EXISTING);
+                            System.out.println("  Output: " + outputFile.getName()
+                                    + " (" + formatSize(outputFile.length())
+                                    + ", original kept -- smaller than the MRC result)");
+                        }
                     }
 
                     long totalElapsed = (System.nanoTime() - totalStart) / 1_000_000_000L;
@@ -778,6 +808,34 @@ public class MrcPdf implements Callable<Integer> {
             + "\n           To get a searchable PDF, add a text layer first"
             + " (e.g. ocrmypdf input.pdf output.pdf) and then run mrcpdf on the"
             + " result; mrcpdf will re-use that layer and keep it sharp.";
+    }
+
+    /**
+     * Decides whether the MRC result is a net loss for this document, and words
+     * the warning if so.
+     *
+     * <p>MRC is not a guaranteed win. A page that is already a well-compressed
+     * 1-bit mask gets a background JPEG bolted on top, and the background is
+     * roughly 84% of the output — so against an already-tight input the
+     * "compressed" file can come out larger.
+     *
+     * <p>Default behaviour keeps the MRC result and warns: the tool was asked to
+     * compress, and quietly handing back the input instead would hide what
+     * happened. {@code --keep-smaller-only} opts into never enlarging a file.
+     *
+     * @return the warning to print to stderr, or {@code null} when the output
+     *         did not expand
+     */
+    static String expansionNotice(long inBytes, long outBytes, boolean keepSmallerOnly) {
+        if (outBytes <= inBytes) return null;
+        String pct = inBytes <= 0 ? "unknown"
+                : String.format("%.1f%%", (outBytes - inBytes) * 100.0 / inBytes);
+        return "  Warning: MRC made the output larger -- input "
+            + formatSize(inBytes) + ", output " + formatSize(outBytes) + " (+" + pct + ")."
+            + (keepSmallerOnly
+                ? " --keep-smaller-only is set, so the original bytes were kept instead."
+                : " The source is probably already well compressed (e.g. a bilevel"
+                  + " CCITT scan). Pass --keep-smaller-only to never enlarge a file.");
     }
 
     private static int countWords(PDDocument doc) throws IOException {

@@ -87,6 +87,7 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--fg-color` | Re-render the foreground in the source's true text colors via a soft-mask color layer. Off by default; also works under `--pdfa` (PDF/A-2b permits soft masks, though conformance is not independently verified). |
 | `--mrc / --no-mrc` | Enable/disable MRC compression (default on). With MRC off, rebuilt pages are a single high-quality JPEG + invisible text layer (no mask) — faster, for downstream pipelines that don't need MRC layers. |
 | `--pass-through / --no-pass-through` | Pass **digital-native** pages (no page-filling raster) through unchanged (default on). Applies with MRC on or off, and under `--pdfa`. Disable to force every page through render/re-encode. |
+| `--keep-smaller-only` | If MRC would make the output larger than the input, keep the original bytes instead. MRC adds a background layer per page, so an already-tight bilevel scan can come out bigger; without this flag the run warns and keeps the (larger) MRC result. |
 | `--threads <n>` | Worker threads for page prep (default: available processors). |
 | `--settings <file>` | Path to `settings.jsonc` (default `./settings.jsonc`). |
 
