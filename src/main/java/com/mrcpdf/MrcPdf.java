@@ -279,6 +279,8 @@ public class MrcPdf implements Callable<Integer> {
                 System.out.println("  Words:  " + srcWords + " (source text)");
             } else {
                 System.out.println("  Words:  0 — no text in source; pages will have no text layer");
+                String advisory = textLayerAdvisory(pageCount);
+                if (advisory != null) System.err.println(advisory);
             }
 
             long totalStart = System.nanoTime();
@@ -753,6 +755,29 @@ public class MrcPdf implements Callable<Integer> {
         if (bytes < 1024) return bytes + " B";
         if (bytes < 1024 * 1024) return String.format("%.0f KB", bytes / 1024.0);
         return String.format("%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+
+    /**
+     * Advisory for a source whose text layer is empty.
+     *
+     * <p>This tool never runs OCR by design, so an image-only scan keeps no
+     * searchable text: the output is a smaller picture, not a searchable
+     * document. That is a fine outcome, but it is silent unless we say so, and
+     * it is the single most common way a user is surprised -- "no recognition
+     * errors" reads as "no missing text". So say it plainly, once per document,
+     * with the remedy.
+     *
+     * @return the warning to print to stderr, or {@code null} if there is
+     *         nothing to warn about.
+     */
+    static String textLayerAdvisory(int pageCount) {
+        if (pageCount <= 0) return null;
+        return "  Warning: no text layer found in any of the " + pageCount
+            + " source page" + (pageCount == 1 ? "" : "s")
+            + ". mrcpdf does not run OCR, so the output will not be searchable."
+            + "\n           To get a searchable PDF, add a text layer first"
+            + " (e.g. ocrmypdf input.pdf output.pdf) and then run mrcpdf on the"
+            + " result; mrcpdf will re-use that layer and keep it sharp.";
     }
 
     private static int countWords(PDDocument doc) throws IOException {
