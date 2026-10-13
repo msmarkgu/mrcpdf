@@ -583,6 +583,11 @@ public class MrcPdf implements Callable<Integer> {
                         System.out.println("  Links:      " + preserved.annotations() + " (preserved)");
                     if (preserved.embeddedFiles() > 0)
                         System.out.println("  Attachments: " + preserved.embeddedFiles() + " (preserved)");
+                    if (preserved.droppedNamedDests() > 0)
+                        System.err.println("  Warning: dropped " + preserved.droppedNamedDests()
+                            + " named destination(s) from the /Names/Dests tree; a bookmark"
+                            + " or link that resolves through one will not work in the"
+                            + " output.");
                     // Resolve the parent to an absolute path: a bare "out.pdf" has a null
                     // parent, which would silently redirect the temp file to the
                     // system temp dir and defeat the atomic move below.

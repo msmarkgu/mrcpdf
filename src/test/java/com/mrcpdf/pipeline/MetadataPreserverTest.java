@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.zip.InflaterInputStream;
 import java.util.stream.StreamSupport;
@@ -17,10 +18,12 @@ import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
+import org.apache.pdfbox.pdmodel.PDDestinationNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode;
@@ -231,6 +234,55 @@ class MetadataPreserverTest {
             assertEquals(0, result.outlines());
             assertEquals(0, result.annotations());
             assertEquals(0, result.embeddedFiles());
+            assertEquals(0, result.droppedNamedDests(),
+                "a document with no name tree drops nothing");
+        }
+    }
+
+    /**
+     * Named destinations are not carried over. Copying the tree verbatim would
+     * be worse than dropping it -- the page references stop resolving once pages
+     * are rebuilt -- so the loss is counted and reported rather than silent.
+     */
+    @Test
+    void preserve_countsDroppedNamedDests() throws IOException {
+        try (PDDocument source = new PDDocument()) {
+            source.addPage(new PDPage());
+            PDDocumentNameDictionary names = new PDDocumentNameDictionary(source.getDocumentCatalog());
+            source.getDocumentCatalog().setNames(names);
+            PDDestinationNameTreeNode dests = new PDDestinationNameTreeNode();
+            dests.setNames(Map.of(
+                "chapter1", new PDPageFitDestination(),
+                "chapter2", new PDPageFitDestination()));
+            names.setDests(dests);
+
+            try (PDDocument output = blankOutputFor(source)) {
+                var result = preserver.preserve(source, output, allPages(output));
+                assertEquals(2, result.droppedNamedDests(),
+                    "both named destinations should be counted as dropped");
+            }
+        }
+    }
+
+    @Test
+    void preserve_namedDestsAreNotCopiedIntoOutput() throws IOException {
+        try (PDDocument source = new PDDocument()) {
+            source.addPage(new PDPage());
+            PDDocumentNameDictionary names = new PDDocumentNameDictionary(source.getDocumentCatalog());
+            source.getDocumentCatalog().setNames(names);
+            PDDestinationNameTreeNode dests = new PDDestinationNameTreeNode();
+            dests.setNames(Map.of("chapter1", new PDPageFitDestination()));
+            names.setDests(dests);
+
+            try (PDDocument output = blankOutputFor(source)) {
+                preserver.preserve(source, output, allPages(output));
+                PDDocumentNameDictionary outNames = output.getDocumentCatalog().getNames();
+                // Either no name dictionary at all, or one without a Dests tree.
+                // An unresolved /Names/Dests is worse than none: the link fails
+                // at click time with nothing to indicate why.
+                assertTrue(outNames == null || outNames.getDests() == null,
+                    "/Names/Dests must not be carried over unresolved");
+            }
         }
     }
 

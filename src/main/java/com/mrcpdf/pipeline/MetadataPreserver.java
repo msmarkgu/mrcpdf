@@ -19,6 +19,7 @@ import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
+import org.apache.pdfbox.pdmodel.PDDestinationNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDMetadata;
@@ -48,7 +49,8 @@ public class MetadataPreserver {
     /**
      * Counts of metadata elements copied from source to output.
      */
-    public record PreserveResult(int outlines, int annotations, int embeddedFiles) {}
+    public record PreserveResult(int outlines, int annotations, int embeddedFiles,
+            int droppedNamedDests) {}
 
     /**
      * Copies all metadata from source to output.
@@ -80,8 +82,9 @@ public class MetadataPreserver {
         int outlines = copyOutline(source, output, outputPages);
         int annotations = copyAnnotations(source, outputPages, passThroughPages);
         int embeddedFiles = copyEmbeddedFiles(source, output);
+        int droppedNamedDests = countNamedDests(source);
         copyXmlMetadata(source, output);
-        return new PreserveResult(outlines, annotations, embeddedFiles);
+        return new PreserveResult(outlines, annotations, embeddedFiles, droppedNamedDests);
     }
 
     private void copyDocumentInfo(PDDocument source, PDDocument output) {
@@ -349,6 +352,29 @@ public class MetadataPreserver {
             return num.floatValue();
         }
         return 0f;
+    }
+
+    /**
+     * Counts the source's named destinations, which are <em>not</em> carried
+     * over.
+     *
+     * <p>Carrying the {@code /Names/Dests} tree across verbatim would be worse
+     * than dropping it: the destinations point at page references that no
+     * longer resolve once pages are rebuilt, so a link through one would fail
+     * at click time with nothing to indicate why. Carrying them across
+     * <em>correctly</em> needs the same page-reference remapping the outline
+     * code already performs, which is a larger change than its apparent size.
+     *
+     * <p>So they are dropped, and counted here so the caller can report the
+     * loss instead of letting it pass unnoticed.
+     */
+private int countNamedDests(PDDocument source) throws IOException {
+        PDDocumentNameDictionary srcNames = source.getDocumentCatalog().getNames();
+        if (srcNames == null) return 0;
+        PDDestinationNameTreeNode srcDests = srcNames.getDests();
+        if (srcDests == null) return 0;
+        var names = srcDests.getNames();
+        return names != null ? names.size() : 0;
     }
 
     private int copyEmbeddedFiles(PDDocument source, PDDocument output) throws IOException {
