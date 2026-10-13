@@ -656,20 +656,33 @@ public class MrcPdf implements Callable<Integer> {
         return Files.createTempDirectory(prefix + "-");
     }
 
-    private static void deleteDir(Path dir) throws IOException {
+    /**
+     * Best-effort recursive delete. Deliberately swallows its own failures: this
+     * runs from a {@code finally} block, where throwing would mask whatever
+     * exception actually ended the run and report a cleanup problem as if it
+     * were the real fault.
+     */
+    private static void deleteDir(Path dir) {
         if (!Files.exists(dir)) return;
-        Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
+        try {
+            Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
             @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                Files.delete(file);
-                return FileVisitResult.CONTINUE;
-            }
-            @Override
-            public FileVisitResult postVisitDirectory(Path d, IOException exc) throws IOException {
-                Files.delete(d);
-                return FileVisitResult.CONTINUE;
-            }
-        });
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    Files.delete(file);
+                    return FileVisitResult.CONTINUE;
+                }
+                @Override
+                public FileVisitResult postVisitDirectory(Path d, IOException exc) throws IOException {
+                    Files.delete(d);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            // A leftover temp directory is untidy, not fatal, and must never
+            // replace the real failure this is masking.
+            System.err.println("  Warning: could not fully remove temp dir " + dir
+                    + " (" + e.getMessage() + ").");
+        }
     }
 
     /**

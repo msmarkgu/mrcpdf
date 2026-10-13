@@ -24,9 +24,13 @@ import com.mrcpdf.util.SubprocessRunner;
  * falling back to CCITT Group 4 fax encoding via PDFBox when
  * the native binary is unavailable.
  *
- * jbig2enc flags:
- *   -p  — Produce a global symbol dictionary (shared across pages).
- *   -s  — Refine smearing to improve symbol matching.
+ * jbig2enc flags (as reported by the bundled binary's --help):
+ *   -p  — Produce PDF-ready data (this is what writes the shared global
+ *        symbol dictionary the PDF JBIG2Decode stream requires).
+ *   -s  — Use text region, not generic coder (symbol-mode matching).
+ *   -r  — Refine; requires -s and is lossless. NOT passed, so symbol
+ *        matching runs at the lossy default threshold -- hence the
+ *        "visually lossless, not bit-identical" wording in the docs.
  */
 public class JBIG2Compressor {
 
@@ -121,6 +125,41 @@ public class JBIG2Compressor {
      * @return BatchResult with shared global sym and per-page data, or null if
      *         jbig2enc is unavailable or fails (caller should use CCITT fallback).
      */
+    /**
+     * Page count beyond which the mask paths will not fit on a Windows command
+     * line, leaving headroom for the flags and the executable path.
+     *
+     * <p>Windows {@code CreateProcess} caps a command line at 32 767
+     * characters. Every mask path is passed as one argument, so a long document
+     * eventually cannot be started at all.
+     */
+    static final int WINDOWS_CMDLINE_LIMIT = 32767;
+
+    /**
+     * Warns when this batch's command line is at risk of exceeding the Windows
+     * limit, rather than letting {@code ProcessBuilder} fail obscurely.
+     *
+     * <p>Chunking the batch is not a safe drop-in fix: each chunk would emit its
+     * own {@code .sym}, and a PDF {@code JBIG2Decode} stream carries exactly one
+     * globals stream, so per-page data across chunks would reference symbols
+     * that are not in the stream they are paired with. That needs real JBIG2
+     * assembly work, not a loop. Until then the failure is surfaced rather than
+     * left to look like an ordinary CCITT downgrade.
+     *
+     * @return the warning, or {@code null} when the command line fits
+     */
+    static String commandLengthWarning(File exe, List<String> args, int pageCount) {
+        long len = exe.length();
+        for (String a : args) len += a.length() + 1;
+        if (len <= WINDOWS_CMDLINE_LIMIT) return null;
+        return "  Warning: " + pageCount + " mask paths need about " + len
+            + " command-line characters, over the " + WINDOWS_CMDLINE_LIMIT
+            + "-character limit on Windows — this run will fall back to CCITT G4"
+            + " for the whole document and lose the shared symbol dictionary."
+            + " Split the document into parts of under ~600 pages to stay under"
+            + " the limit.";
+    }
+
     public BatchResult compressAllFromDir(File maskDir, int pageCount, int[] imgWidths, int[] imgHeights) throws IOException {
         File jbig2enc = findJbig2enc();
         if (jbig2enc == null) return null;
@@ -144,6 +183,9 @@ public class JBIG2Compressor {
         args.add("-b");
         args.add(basename);
         args.addAll(imagePaths);
+
+        String tooLong = commandLengthWarning(jbig2enc, args, pageCount);
+        if (tooLong != null) System.err.println(tooLong);
 
         SubprocessRunner.Result result;
         try {

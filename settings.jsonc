@@ -147,8 +147,11 @@
 
     // ===== JBIG2 Compression =====
     // Flags passed to the jbig2enc binary.
-    //   -p = global symbol dictionary
-    //   -s = refine smearing
+    //   -p = produce PDF-ready data (writes the shared global symbol dictionary)
+    //   -s = use text region, not generic coder (symbol-mode matching)
+    // Refinement (-r, lossless, requires -s) is deliberately not passed: the
+    // docs claim "visually lossless, not bit-identical", which is what the
+    // lossy default threshold produces.
     "jbig2enc.flags": "-p -s",
 
     // Wall-clock limit for one jbig2enc run, in milliseconds.
