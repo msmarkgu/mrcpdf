@@ -10,15 +10,23 @@ import java.nio.file.Path;
 
 import javax.imageio.ImageIO;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
  * Tests for JBIG2Compressor with synthetic binary images.
  *
- * Since jbig2enc is not available in this environment, all tests exercise
- * the CCITT G4 fallback path.  Verifies non-null outputs, dimension preservation,
- * and correct behaviour for blank, all-white, and mixed foreground images.
+ * Covers both paths: the CCITT G4 fallback, and -- when the bundled jbig2enc
+ * binary is discoverable -- the batch shared-symbol-dictionary path.
+ *
+ * The batch tests previously wrote probe masks as {@code mask-N.bmp} while
+ * production reads {@code mask-N.png}, so the probe always failed and the
+ * availability check {@code return}ed early.  The result was that the batch
+ * symbol-dictionary path had no executing test anywhere: the assertions below
+ * were never reached and the tests reported as passing.  Masks are now written
+ * as PNG, and an unavailable binary is now an explicit assumption failure
+ * (reported as *skipped*) rather than a silent pass.
  */
 class JBIG2CompressorTest {
 
@@ -109,23 +117,7 @@ class JBIG2CompressorTest {
     @Test
     void compressAllFromDir_returnsBatchResultWhenJbig2encAvailable() throws IOException {
         JBIG2Compressor realCompressor = new JBIG2Compressor();
-
-        // Probe availability by running on a single mask
-        Files.createDirectories(Path.of("temp"));
-        File probeDir = new File("temp", "mrcpdf-jbig2-probe-"
-            + System.nanoTime());
-        probeDir.mkdirs();
-        BufferedImage probe = new BufferedImage(50, 50, BufferedImage.TYPE_BYTE_BINARY);
-        probe.setRGB(25, 25, 0xFF000000);
-        ImageIO.write(probe, "bmp", new File(probeDir, "mask-0.bmp"));
-        JBIG2Compressor.BatchResult probeResult = realCompressor.compressAllFromDir(probeDir, 1,
-            new int[]{50}, new int[]{50});
-        for (File f : probeDir.listFiles()) f.delete();
-        probeDir.delete();
-
-        if (probeResult == null) {
-            return; // jbig2enc not available — skip
-        }
+        assumeJbig2encAvailable(realCompressor);
 
         // Create two masks with different text patterns
         File maskDir = new File("temp", "mrcpdf-jbig2-test-"
@@ -137,7 +129,7 @@ class JBIG2CompressorTest {
                 for (int x = 10; x < 90; x++) {
                     mask.setRGB(x, 50 + i * 20, 0xFF000000);
                 }
-                ImageIO.write(mask, "bmp", new File(maskDir, "mask-" + i + ".bmp"));
+                ImageIO.write(mask, "png", new File(maskDir, "mask-" + i + ".png"));
             }
 
             JBIG2Compressor.BatchResult result = realCompressor.compressAllFromDir(maskDir, 2,
@@ -171,23 +163,7 @@ class JBIG2CompressorTest {
     @Test
     void compressAllFromDir_preservesPerPageDimensions() throws IOException {
         JBIG2Compressor realCompressor = new JBIG2Compressor();
-
-        // Probe availability
-        Files.createDirectories(Path.of("temp"));
-        File probeDir = new File("temp", "mrcpdf-jbig2-probe-"
-            + System.nanoTime());
-        probeDir.mkdirs();
-        BufferedImage probe = new BufferedImage(50, 50, BufferedImage.TYPE_BYTE_BINARY);
-        probe.setRGB(25, 25, 0xFF000000);
-        ImageIO.write(probe, "bmp", new File(probeDir, "mask-0.bmp"));
-        JBIG2Compressor.BatchResult probeResult = realCompressor.compressAllFromDir(probeDir, 1,
-            new int[]{50}, new int[]{50});
-        for (File f : probeDir.listFiles()) f.delete();
-        probeDir.delete();
-
-        if (probeResult == null) {
-            return; // jbig2enc not available — skip
-        }
+        assumeJbig2encAvailable(realCompressor);
 
         // Different page sizes: page 0 = 100x200, page 1 = 150x250
         File maskDir = new File("temp", "mrcpdf-jbig2-mixed-"
@@ -201,7 +177,7 @@ class JBIG2CompressorTest {
                 for (int x = 10; x < w - 10; x++) {
                     mask.setRGB(x, h / 2, 0xFF000000);
                 }
-                ImageIO.write(mask, "bmp", new File(maskDir, "mask-" + i + ".bmp"));
+                ImageIO.write(mask, "png", new File(maskDir, "mask-" + i + ".png"));
             }
 
             JBIG2Compressor.BatchResult result = realCompressor.compressAllFromDir(maskDir, 2,
@@ -284,6 +260,33 @@ class JBIG2CompressorTest {
             deleteTree(maskDir);
             Files.deleteIfExists(slow);
         }
+    }
+
+    /**
+     * Skips the calling test unless jbig2enc actually works on this machine.
+     *
+     * This probes the real batch entry point with a single mask named exactly as
+     * production names them ({@code mask-0.png}).  The old probe wrote
+     * {@code mask-0.bmp}, which production never looks for, so the probe always
+     * failed and the caller {@code return}ed early -- reporting a pass without
+     * ever running an assertion.  An unavailable binary is now an explicit
+     * assumption failure: JUnit reports the test as *skipped*, which is visible
+     * in the build output and cannot be mistaken for coverage.
+     */
+    private static void assumeJbig2encAvailable(JBIG2Compressor compressor) throws IOException {
+        Files.createDirectories(Path.of("temp"));
+        BufferedImage probe = new BufferedImage(50, 50, BufferedImage.TYPE_BYTE_BINARY);
+        probe.setRGB(25, 25, 0xFF000000);
+        // Deliberately the single-image path, NOT compressAllFromDir. If the probe
+        // used the batch entry point, a break in the shared-dictionary handling
+        // would make the probe return null and downgrade this test to *skipped* --
+        // turning a red test green again, which is the exact defect being fixed
+        // here. The single-image path shares only binary discovery with the batch
+        // path, so it reports honestly on whether jbig2enc works at all.
+        JBIG2Compressor.CompressionResult result = compressor.compress(probe);
+        Assumptions.assumeTrue(result != null && result.isJbig2(),
+            "jbig2enc unavailable on this machine — batch symbol-dictionary path"
+            + " cannot be exercised (SKIPPED, not passed)");
     }
 
     private static void writePngMask(File dir, int index, int w, int h) throws IOException {
