@@ -583,6 +583,8 @@ public class MrcPdf implements Callable<Integer> {
                         System.out.println("  Links:      " + preserved.annotations() + " (preserved)");
                     if (preserved.embeddedFiles() > 0)
                         System.out.println("  Attachments: " + preserved.embeddedFiles() + " (preserved)");
+                    if (preserved.formFields() > 0)
+                        System.out.println("  Form:     " + preserved.formFields() + " field(s) (preserved)");
                     if (preserved.droppedNamedDests() > 0)
                         System.err.println("  Warning: dropped " + preserved.droppedNamedDests()
                             + " named destination(s) from the /Names/Dests tree; a bookmark"

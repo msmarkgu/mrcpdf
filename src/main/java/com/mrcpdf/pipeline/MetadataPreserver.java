@@ -6,6 +6,7 @@ import java.io.OutputStream;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.apache.pdfbox.cos.COSArray;
@@ -20,6 +21,7 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDDestinationNameTreeNode;
+import org.apache.pdfbox.pdmodel.interactive.form.PDAcroForm;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDMetadata;
@@ -50,7 +52,7 @@ public class MetadataPreserver {
      * Counts of metadata elements copied from source to output.
      */
     public record PreserveResult(int outlines, int annotations, int embeddedFiles,
-            int droppedNamedDests) {}
+            int droppedNamedDests, int formFields) {}
 
     /**
      * Copies all metadata from source to output.
@@ -80,11 +82,13 @@ public class MetadataPreserver {
                                    Set<PDPage> passThroughPages) throws IOException {
         copyDocumentInfo(source, output);
         int outlines = copyOutline(source, output, outputPages);
-        int annotations = copyAnnotations(source, outputPages, passThroughPages);
+        Map<COSBase, COSBase> substitutions = new IdentityHashMap<>();
+        int annotations = copyAnnotations(source, outputPages, passThroughPages, substitutions);
+        int formFields = copyAcroForm(source, output, substitutions);
         int embeddedFiles = copyEmbeddedFiles(source, output);
         int droppedNamedDests = countNamedDests(source);
         copyXmlMetadata(source, output);
-        return new PreserveResult(outlines, annotations, embeddedFiles, droppedNamedDests);
+        return new PreserveResult(outlines, annotations, embeddedFiles, droppedNamedDests, formFields);
     }
 
     private void copyDocumentInfo(PDDocument source, PDDocument output) {
@@ -174,7 +178,8 @@ public class MetadataPreserver {
     }
 
     private int copyAnnotations(PDDocument source, List<PDPage> outputPages,
-                                Set<PDPage> passThroughPages) throws IOException {
+                                Set<PDPage> passThroughPages,
+                                Map<COSBase, COSBase> substitutions) throws IOException {
         int totalAnnotations = 0;
         int pageCount = Math.min(source.getNumberOfPages(), outputPages.size());
         for (int i = 0; i < pageCount; i++) {
@@ -200,6 +205,14 @@ public class MetadataPreserver {
                 dstAnnots.add(cloned);
             }
             dstPage.getCOSObject().setItem(COSName.ANNOTS, dstAnnots);
+            // Record source annotation -> its clone so that the AcroForm field
+            // tree, deep-copied separately, reuses these exact objects instead of
+            // creating a second copy of every widget. Two copies means the field
+            // appears twice and edits land on the wrong one.
+            for (int a = 0; a < annotations.size(); a++) {
+                substitutions.put(annotations.get(a).getCOSObject(),
+                    dstAnnots.get(a) instanceof COSObject o ? o.getObject() : dstAnnots.get(a));
+            }
             totalAnnotations += annotations.size();
         }
         return totalAnnotations;
@@ -352,6 +365,48 @@ public class MetadataPreserver {
             return num.floatValue();
         }
         return 0f;
+    }
+
+    /**
+     * Carries the interactive form across.
+     *
+     * <p>Widget annotations are copied with every other annotation, but on their
+     * own they are inert: without an {@code /AcroForm} root in the output
+     * catalog, viewers treat the widgets as artwork and form-heavy documents
+     * (government, enterprise — a core MRC target) come out unusable.
+     *
+     * <p>The field tree is deep-copied with {@code substitutions} pre-seeded, so
+     * each widget in the tree resolves to the very object already placed on the
+     * output page's {@code /Annots} rather than to a second clone.
+     *
+     * <p>{@code /NeedAppearances} is set. Widget appearance streams reference
+     * font resources from the source {@code /DR}; after a rebuild those are not
+     * guaranteed to resolve, and a field that draws nothing is worse than one
+     * that redraws itself. Asking the viewer to regenerate is the reliable
+     * option, and it is what the flag exists for.
+     *
+     * @return the number of fields in the copied tree, or 0 if there was no form
+     */
+    private int copyAcroForm(PDDocument source, PDDocument output,
+                             Map<COSBase, COSBase> substitutions) throws IOException {
+        PDAcroForm srcForm = source.getDocumentCatalog().getAcroForm();
+        if (srcForm == null) return 0;
+
+        IdentityHashMap<COSBase, COSBase> visited = new IdentityHashMap<>(substitutions);
+        COSDictionary copied = deepCopyCOSDictionary(srcForm.getCOSObject(), visited);
+
+        // Note: /NeedAppearances is deliberately NOT set here. PDAcroForm access
+        // lazily runs PDFBox's AcroFormDefaultFixup, which regenerates the widget
+        // appearance streams itself and resets the flag -- setting it beforehand
+        // only fights that. The regenerated /AP is the better outcome: the field
+        // actually draws.
+
+        PDAcroForm dstForm = new PDAcroForm(output, copied);
+        output.getDocumentCatalog().setAcroForm(dstForm);
+
+        COSBase fieldsBase = copied.getDictionaryObject(COSName.FIELDS);
+        COSArray fields = fieldsBase instanceof COSArray a ? a : null;
+        return fields != null ? fields.size() : 0;
     }
 
     /**
