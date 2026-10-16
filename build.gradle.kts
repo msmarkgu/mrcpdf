@@ -179,7 +179,7 @@ tasks.register("writeGateOffConfig") {
 }
 
 // Downloads the born-digital real-world base corpus listed in
-// corpus/real-bases.csv into build/real-bases/<doc>.pdf.  The manifest (URL +
+// docs/real-bases.csv into build/real-bases/<doc>.pdf.  The manifest (URL +
 // license + source) is committed; the fetched PDFs are not — build/ is
 // gitignored.  Dead or redirected links are reported and skipped instead of
 // failing the build, so one stale URL never blocks the rest of the corpus.
@@ -187,7 +187,7 @@ tasks.register("writeGateOffConfig") {
 // build/real-bases/available.txt (the bases that fetched cleanly), which
 // RealSrcDump consumes via --base-list.  See notes/collect-realworld-pdfs.md.
 tasks.register("fetchRealBases") {
-    val manifest = file("corpus/real-bases.csv")
+    val manifest = file("docs/real-bases.csv")
     val outDir = layout.buildDirectory.dir("real-bases").get().asFile
     inputs.file(manifest)
     outputs.dir(outDir)

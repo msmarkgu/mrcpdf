@@ -204,7 +204,7 @@ pipeline is wired up as gradle tasks (dependencies and times documented in
 `build.gradle.kts` and `notes/collect-realworld-pdfs.md`):
 
 ```text
-fetchRealBases        manifest corpus/real-bases.csv (US public-domain PDFs), network fetch
+fetchRealBases        manifest docs/real-bases.csv (US public-domain PDFs), network fetch
 dumpRealCorpus        degrade every base page down the scanner tiers, ~4 h, needs tesseract
 exportRealBasePages   review PDF of the base pages (fast)
 checkRealCorpus       audit + steering QA, ~1.5-2 h
