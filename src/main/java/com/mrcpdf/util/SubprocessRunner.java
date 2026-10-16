@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -40,12 +41,23 @@ public class SubprocessRunner {
      * @return Result containing exit code, stdout, and stderr.
      */
     public static Result run(File executable, List<String> args, long timeoutMs) throws IOException {
+        return run(executable, args, timeoutMs, Map.of());
+    }
+
+    /**
+     * Executes a command with optional extra environment variables.
+     *
+     * @param env variables added to the inherited environment, not replacing it
+     */
+    public static Result run(File executable, List<String> args, long timeoutMs,
+                             Map<String, String> env) throws IOException {
         List<String> command = new ArrayList<>();
         command.add(executable.getAbsolutePath());
         command.addAll(args);
 
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.redirectErrorStream(false);
+        pb.environment().putAll(env);
 
         Process process = pb.start();
 

@@ -1,0 +1,26 @@
+doc,url,license,source,kind
+fr-nepa-2026,https://www.govinfo.gov/content/pkg/FR-2026-09-25/pdf/2026-19720.pdf,US-PD,Federal Register (GovInfo/GPO),regulatory
+fr-ifr-altitudes-2026,https://www.govinfo.gov/content/pkg/FR-2026-09-25/pdf/2026-19722.pdf,US-PD,Federal Register (GovInfo/GPO),regulatory
+fr-safe-explosives-2026,https://www.govinfo.gov/content/pkg/FR-2026-09-25/pdf/2026-19693.pdf,US-PD,Federal Register (GovInfo/GPO),regulatory
+fr-explosive-materials-2026,https://www.govinfo.gov/content/pkg/FR-2026-09-25/pdf/2026-19694.pdf,US-PD,Federal Register (GovInfo/GPO),regulatory
+fr-applicable-reqs-2026,https://www.govinfo.gov/content/pkg/FR-2026-09-25/pdf/2026-19671.pdf,US-PD,Federal Register (GovInfo/GPO),regulatory
+scotus-bpj,https://www.supremecourt.gov/opinions/25pdf/24-43_2b35.pdf,US-PD,Supreme Court slip opinion,legal
+scotus-nrsc-fec,https://www.supremecourt.gov/opinions/25pdf/24-621_h315.pdf,US-PD,Supreme Court slip opinion,legal
+scotus-barbara,https://www.supremecourt.gov/opinions/25pdf/25-365_new_5if6.pdf,US-PD,Supreme Court slip opinion,legal
+scotus-cook,https://www.supremecourt.gov/opinions/25pdf/609us2r63_e2pg.pdf,US-PD,Supreme Court slip opinion,legal
+scotus-watson,https://www.supremecourt.gov/opinions/25pdf/24-1260_g3cn.pdf,US-PD,Supreme Court slip opinion,legal
+ca6-koeberer,http://www.opn.ca6.uscourts.gov/opinions.pdf/26a0270p-06.pdf,US-PD,Sixth Circuit Court of Appeals,legal
+ca6-welty,http://www.opn.ca6.uscourts.gov/opinions.pdf/26a0271p-06.pdf,US-PD,Sixth Circuit Court of Appeals,legal
+mont-hubber,https://juddocumentservice.mt.gov/getDocByCTrackId?DocId=585024,US-PD,Montana Supreme Court,legal
+mont-lake,https://juddocumentservice.mt.gov/getDocByCTrackId?DocId=584738,US-PD,Montana Supreme Court,legal
+mont-crawford,https://juddocumentservice.mt.gov/getDocByCTrackId?DocId=584739,US-PD,Montana Supreme Court,legal
+txapp-golden,https://search.txcourts.gov/SearchMedia.aspx?MediaVersionID=8fe243d5-4cad-49dd-863d-3870b339a0e2&coa=coa10&DT=Opinion&MediaID=0b51d996-fdbb-4642-9241-fff73190166d,US-PD,Texas Court of Appeals 10th District,legal
+ntrs-fsi-tps-2026,https://ntrs.nasa.gov/api/citations/20260004751/downloads/Outpost_Vehicle_Aerothermo_FSI_Paper_V7.pdf,US-PD,NASA NTRS,technical
+ntrs-mets-panel-2006,https://ntrs.nasa.gov/api/citations/20060022542/downloads/20060022542.pdf,US-PD,NASA NTRS,technical
+ntrs-thermocouple-2016,https://ntrs.nasa.gov/api/citations/20160000315/downloads/20160000315.pdf,US-PD,NASA NTRS,technical
+ntrs-composite-2019,https://ntrs.nasa.gov/api/citations/20190029231/downloads/20190029231.pdf,US-PD,NASA NTRS,technical
+ntrs-wfirst-composite-2018,https://ntrs.nasa.gov/api/citations/20180003974/downloads/20180003974.pdf,US-PD,NASA NTRS,technical
+arxiv-mrc-compression,https://arxiv.org/pdf/2301.08877,arXiv-per-paper,arXiv,journal
+arxiv-easy-reads,https://arxiv.org/pdf/1602.00498,arXiv-per-paper,arXiv,journal
+arxiv-attention,https://arxiv.org/pdf/1706.03762,arXiv-per-paper,arXiv,journal
+arxiv-bert,https://arxiv.org/pdf/1810.04805,arXiv-per-paper,arXiv,journal

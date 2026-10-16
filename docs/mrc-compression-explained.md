@@ -152,9 +152,9 @@ The 1-bit mask is burst into JBIG2 by the bundled `jbig2enc`. JBIG2's trick is a
 - **Adaptive arithmetic coding** — the symbol IDs, offsets, and refinement bits
   are entropy-coded with a context-adaptive arithmetic coder that learns local
   probability models, squeezing near the theoretical limit.
-- **Lossiness** — near-identical symbols are treated as identical, so the output
-  is *visually* lossless but not bit-identical: slightly different instantiations
-  of a glyph may be swapped for one canonical shape.
+- **Lossiness** — near-identical symbols are treated as identical, so within the
+  1-bit mask the text is *visually* lossless but not bit-identical: slightly
+  different instantiations of a glyph may be swapped for one canonical shape.
 
 mrcpdf goes further: one `jbig2enc` invocation over **all pages** (`-p -s` in
 `jbig2enc.flags`) builds a single **global symbol dictionary shared across every
@@ -166,11 +166,12 @@ If `jbig2enc` isn't available or fails, we fall back to **CCITT G4** (fax): same
 
 ### Foreground color (opt-in `--fg-color`)
 
-By default the mask is drawn as a *black* stencil (small, PDF/A-safe). With
+By default the mask is drawn as a *black* stencil (small). With
 `--fg-color`, the mask instead becomes a **soft mask (SMask)** over a
 downsampled, low-quality JPEG copy of the original page, so the text pixels keep
-their **original color** and edges stay sharp. Note: soft masks are **not
-allowed in PDF/A-2b**, so this is disabled when `--pdfa` is set.
+their **original color** and edges stay sharp. PDF/A-2b permits soft masks, so
+`--fg-color` also works under `--pdfa`; conformance of the resulting file is not
+independently verified.
 
 ### Text layer
 
@@ -229,8 +230,9 @@ loss and fully selectable text.
 - If there's **no mask** (MRC off), the background JPEG must be higher quality
   (`~0.85` instead of `0.50`), because it has to carry the text itself.
 - **No OCR**: searchable text comes only from the source PDF.
-- `--fg-color` and `--pdfa` are mutually exclusive (PDF/A forbids soft masks);
-  `--pdfa` silently disables the color layer.
+- `--fg-color` is compatible with `--pdfa`: PDF/A-2b permits soft masks, and the
+  color layer is no longer force-disabled under `--pdfa`. Conformance of the
+  output is not independently verified.
 - **Memory**: high DPI means big working arrays in segmentation (`W × H` for
   each of ~10 intermediate planes). See README "High DPI & memory" — 600 DPI
   needs a bigger `-Xmx` and/or fewer `--threads`.

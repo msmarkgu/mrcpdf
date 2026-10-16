@@ -26,6 +26,11 @@ See `MrcPdf.java` (branch on `useMrc`) and `PDFAssembler.encodeBackgroundJpeg`
 So **off** ≈ "normalize the PDF into full-res, moderate-quality JPEGs + a text
 layer". The output is a real, intact PDF — just *larger* than MRC output.
 
+Separately from all of this, a **digital-native** page — one with no page-filling
+raster on it — is passed through untouched regardless of whether MRC is on or
+off. Its content stream is imported as-is; nothing is rendered or re-encoded.
+`--no-pass-through` (or `"pipeline.origin.passThrough": false`) turns that off.
+
 ---
 
 ## 2. When MRC does not pay off
@@ -43,6 +48,11 @@ mask captures almost nothing:
   file is not meaningfully smaller — and you paid extra CPU for nothing.
 - A photo is *exactly* what a lossy single JPEG handles best; the downscaled,
   blurred MRC background can also wander off quality on fine image detail.
+
+This applies to *raster* pages — photographs and screenshots of pages. A vector
+page carrying a large photo is digital native: as long as the image covers less
+than 85% of the page it is passed through untouched and no segmentation runs on
+it at all.
 
 ### 2.2 Speed-sensitive bulk jobs
 
@@ -66,8 +76,7 @@ wrongly clipping or ignoring the mask. A single-JPEG-per-page PDF is maximally
 compatible:
 
 - one image per page, no mask object,
-- no soft masks (`/SMask`), which also sidesteps the PDF/A soft-mask
-  restriction,
+- no soft masks (`/SMask`) — the page is a plain image with no masking layer,
 - simplest possible output to feed into other tools or to merge/extract pages.
 
 ### 2.4 Quality-critical or hard-to-segment scans
@@ -95,20 +104,36 @@ MRC-friendly and you may just leave it off.
 
 ## 3. How to switch it off today
 
-Edit `settings.jsonc` → set:
+Either on the command line:
+
+```bash
+mrcpdf input.pdf -o out.pdf --no-mrc
+```
+
+or in `settings.jsonc`:
 
 ```jsonc
 "pipeline.mrc.enabled": false
 ```
 
-> ⚠️ Currently there is **no `--no-mrc` CLI flag**. Only `--settings <file>`
-> (a custom settings file) or editing the bundled `settings.jsonc` can disable
-> MRC. Everything else — `--dpi`, `--bg-scale`, `--fg-color`, `--threads`,
-> `--pdfa` — has a CLI override; MRC is the exception.
+Digital-native pass-through is a **separate** switch and stays on in both
+cases. To force every page through the render-and-rebuild path:
+
+```bash
+mrcpdf input.pdf -o out.pdf --no-pass-through
+```
+
+```jsonc
+"pipeline.origin.passThrough": false
+```
 
 ---
 
 ## 4. Quick decision guide
+
+**Pages are digital native → do nothing.**
+- No page-filling raster means the page is carried over untouched; MRC never
+  sees it, whatever `--mrc` and the quality screen say.
 
 **Use MRC *off* if …**
 - pages are mostly photos / graphics / gradients (little 1-bit text),

@@ -1,3 +1,5 @@
+import java.io.ByteArrayOutputStream
+
 plugins {
     application
     id("com.github.johnrengelman.shadow") version "8.1.1"
@@ -35,7 +37,7 @@ tasks.named<Test>("test") {
     outputs.upToDateWhen { false }
     maxParallelForks = 2
     minHeapSize = "512m"
-    maxHeapSize = "2g"
+    maxHeapSize = "3g"
     useJUnitPlatform()
     testLogging {
         events("passed", "skipped", "failed")
@@ -58,6 +60,580 @@ tasks.register<JavaExec>("generateTestPdfs") {
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("com.mrcpdf.TestPdfGenerator")
     args("--force")
+}
+
+// Regenerates the committed Phase-2 quality-gate artifact from the synthetic
+// corpus.  Run after changing FeatureExtractor or the corpus generator.
+// Requires `tesseract` (eng) — the corpus labels are OCR-measured readability.
+tasks.register<JavaExec>("trainQualityModel") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.tools.TrainModel")
+    args("--generate", "build/quality-corpus.csv",
+         "--out", "src/main/resources/quality-model.json",
+         "--variant", "image-only", "--docs", "25", "--seed", "42")
+}
+
+// Standalone extractor for the Tesseract OCR score (S_ocr), independent of the
+// MRC pipeline.  Reads a Tesseract TSV plus the searchable PDF that carries the
+// OCR raster's pixel extent.  Pass CLI arguments via -PtesseractOcrArgs, e.g.
+//   ./gradlew tesseractOcrScore -PtesseractOcrArgs="page.tsv page.pdf"
+//   ./gradlew tesseractOcrScore -PtesseractOcrArgs="--dir pages --out scores.txt"
+tasks.register<JavaExec>("tesseractOcrScore") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.tools.TesseractOcrScore")
+    val extra = providers.gradleProperty("tesseractOcrArgs").orNull
+    if (!extra.isNullOrBlank()) setArgs(extra.trim().split(Regex("\\s+")))
+}
+
+// Emits build/synthetic-pages.pdf: one labeled preview sheet per synthetic doc
+// (all clean/mild/degraded variants) so the training pages can be eyeballed.
+tasks.register<JavaExec>("dumpSyntheticPages") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.SynthPageDump")
+    args("--docs", "25", "--seed", "42", "--out", "build/synthetic-pages.pdf")
+}
+
+// Merges the synthetic corpus with the real clean-page rows into
+// build/quality-corpus-real.csv, the corpus the committed artifact is trained
+// on.  Run after regenerating the synthetic corpus (e.g. after a generator
+// change) before trainQualityModel --corpus.
+tasks.register<JavaExec>("buildMergedCorpus") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.tools.BuildMergedCorpus")
+    args("--synthetic", "build/quality-corpus.csv",
+         "--features", "eval/real-world/features",
+         "--out", "build/quality-corpus-real.csv")
+}
+
+// Dumps the raw 300-DPI corpus variant pages into a plain PDF (one page per
+// variant, same order as synthetic-pages.pdf) plus a page->variant map CSV
+// (page,doc,variant,label,tier,score with measured OCR readability), so a
+// gate-off MRC pass can be labeled and joined back to corpus rows.
+// Requires `tesseract` (eng) — see notes/ocr-readable-score.md.
+tasks.register<JavaExec>("dumpSyntheticSrc") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.SynthSrcDump")
+    args("--docs", "25", "--pages", "20", "--seed", "42",
+         "--out", "build/synthetic-src.pdf",
+         "--map", "build/synthetic-variant-map.csv")
+    outputs.files(
+        layout.buildDirectory.file("synthetic-src.pdf"),
+        layout.buildDirectory.file("synthetic-variant-map.csv"))
+}
+
+// Verifies the generated corpus before labeling: checks the 10-20
+// events-per-feature rule for the minority class, ordering of the mean
+// measured readability score by tier, and Spearman sign of each image feature
+// vs the measured score.
+tasks.register<JavaExec>("checkSyntheticCorpus") {
+    dependsOn("dumpSyntheticSrc")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.ScoreCorrCheck")
+    jvmArgs("-Xmx3g")
+    args("--src", "build/synthetic-src.pdf",
+         "--map", "build/synthetic-variant-map.csv",
+         "--dpi", "300", "--min-events", "165")
+}
+
+// Runs the real MRC pipeline over build/synthetic-src.pdf with the quality
+// gate disabled (build/gate-off.jsonc), so every page is compressed both ways
+// for labeling.  jbig2enc is currently absent -> CCITT G4 fallback (same
+// visuals, larger file).
+tasks.register<JavaExec>("mrcSyntheticSrc") {
+    dependsOn("dumpSyntheticSrc", "writeGateOffConfig")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.MrcPdf")
+    jvmArgs("-Xmx3g")
+    args("--settings", "build/gate-off.jsonc", "--threads", "4",
+         "build/synthetic-src.pdf", "-o", "build/synthetic-mrc.pdf")
+}
+
+// Renders the side-by-side original | MRC labeling doc from the src and MRC
+// PDFs (500 pages; page i corresponds to variant-map row i).
+tasks.register<JavaExec>("buildSyntheticPairs") {
+    dependsOn("mrcSyntheticSrc")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.BuildSyntheticPairs")
+    jvmArgs("-Xmx3g")
+    args("--src", "build/synthetic-src.pdf",
+         "--mrc", "build/synthetic-mrc.pdf",
+         "--map", "build/synthetic-variant-map.csv",
+         "--out", "build/synthetic-pairs.pdf")
+}
+
+// Writes build/gate-off.jsonc: production settings with the per-page quality
+// gate disabled, so a gate-off MRC pass compresses every page both ways for
+// labeling. Generated from settings.jsonc so flag changes stay in one place.
+tasks.register("writeGateOffConfig") {
+    val src = file("settings.jsonc")
+    val out = layout.buildDirectory.file("gate-off.jsonc").get().asFile
+    inputs.file(src)
+    outputs.file(out)
+    doLast {
+        val text = src.readText()
+        val noGate = text.replace("\"pipeline.quality.gateEnabled\": true",
+                "\"pipeline.quality.gateEnabled\": false")
+        out.parentFile.mkdirs()
+        out.writeText(noGate)
+    }
+}
+
+// Downloads the born-digital real-world base corpus listed in
+// corpus/real-bases.csv into build/real-bases/<doc>.pdf.  The manifest (URL +
+// license + source) is committed; the fetched PDFs are not — build/ is
+// gitignored.  Dead or redirected links are reported and skipped instead of
+// failing the build, so one stale URL never blocks the rest of the corpus.
+// Emits build/real-bases/provenance.csv (per-doc reachability audit) and
+// build/real-bases/available.txt (the bases that fetched cleanly), which
+// RealSrcDump consumes via --base-list.  See notes/collect-realworld-pdfs.md.
+tasks.register("fetchRealBases") {
+    val manifest = file("corpus/real-bases.csv")
+    val outDir = layout.buildDirectory.dir("real-bases").get().asFile
+    inputs.file(manifest)
+    outputs.dir(outDir)
+    doLast {
+        if (!manifest.isFile) throw GradleException("missing manifest: ${manifest.path}")
+        outDir.mkdirs()
+        val rows = ArrayList<String>()
+        rows.add("doc,url,license,source,kind,status,bytes,local")
+        var ok = 0
+        var failed = 0
+        manifest.readLines().drop(1).forEach { line ->
+            val t = line.trim()
+            if (t.isEmpty() || t.startsWith("#")) return@forEach
+            val f = t.split(",")
+            if (f.size < 3) return@forEach
+            val doc = f[0].trim()
+            val url = f[1].trim()
+            val license = f[2].trim()
+            val source = f.getOrNull(3)?.trim().orEmpty()
+            val kind = f.getOrNull(4)?.trim().orEmpty()
+            val dest = outDir.resolve("$doc.pdf")
+            if (dest.isFile && dest.length() > 1024L) {
+                rows.add("$doc,$url,$license,$source,$kind,cached,${dest.length()},${dest.name}")
+                ok++
+                return@forEach
+            }
+            val buf = ByteArrayOutputStream()
+            val code = try {
+                exec {
+                    isIgnoreExitValue = true
+                    commandLine("curl", "-sSL", "--max-time", "180",
+                        "-o", dest.absolutePath, "-w", "%{http_code}", url)
+                    standardOutput = buf
+                }
+                buf.toString().trim().ifEmpty { "000" }
+            } catch (e: Exception) {
+                "err"
+            }
+            if (code == "200" && dest.isFile && dest.length() > 1024L) {
+                rows.add("$doc,$url,$license,$source,$kind,ok,${dest.length()},${dest.name}")
+                ok++
+            } else {
+                dest.delete()
+                rows.add("$doc,$url,$license,$source,$kind,failed-$code,0,")
+                failed++
+                logger.lifecycle("  fetchRealBases: SKIP $doc ($code) $url")
+            }
+        }
+        outDir.resolve("provenance.csv").writeText(rows.joinToString("\n") + "\n")
+        val available = outDir.listFiles { f -> f.isFile && f.name.endsWith(".pdf") && f.length() > 1024L }
+            ?.sortedBy { it.name }
+            ?.joinToString("\n") { it.absolutePath }
+            .orEmpty()
+        outDir.resolve("available.txt").writeText(available + "\n")
+        logger.lifecycle("  fetchRealBases: $ok available, $failed skipped")
+    }
+}
+
+// Dumps 300-DPI scan-quality variants of a REAL base document (not the AWT
+// placeholder pages): each base page is rendered, degraded through the same
+// scanner tiers, and embedded into build/real-src.pdf with a page->variant map
+// (page,doc,variant,label,tier,score, measured OCR readability).  Requires
+// `tesseract` (eng) — see notes/ocr-readable-score.md.  With --base-list it
+// sweeps every base fetched by fetchRealBases, one output page per (doc,page).
+tasks.register<JavaExec>("dumpRealSrc") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealSrcDump")
+    jvmArgs("-Xmx3g")
+    args("--base", "notes/MRC-Compression-Explained.pdf", "--pages", "20", "--seed", "42",
+         "--out", "build/real-src.pdf",
+         "--map", "build/real-variant-map.csv")
+    outputs.files(
+        layout.buildDirectory.file("real-src.pdf"),
+        layout.buildDirectory.file("real-variant-map.csv"))
+}
+
+// Cross-document corpus dump: sweeps every base fetched by fetchRealBases and
+// keeps the 5 most prose-dense pages per document (150..3000 text-layer words),
+// so cover/TOC/plate/table-only pages can't pollute the OCR labels.  Every
+// variant of one base document shares a `real<N>` doc id, which keeps
+// Dataset.splitByDoc holding out whole documents.
+//
+// Gradle's --args *replaces* this task's args rather than appending, so extra
+// flags go through -P instead and are appended after the defaults (last
+// occurrence wins in RealSrcDump's parser, so they can override):
+//   ./gradlew dumpRealCorpus -PrealArgs="--pages 6 --page-limit 10"
+// for a cheap sliced validation run.
+tasks.register<JavaExec>("dumpRealCorpus") {
+    dependsOn("fetchRealBases")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealSrcDump")
+    jvmArgs("-Xmx3g")
+    val baseList = "build/real-bases/available.txt"
+    val outPdf = "build/real-corpus-src.pdf"
+    val outMap = "build/real-corpus-variant-map.csv"
+    val defaults = listOf("--base-list", baseList, "--pages-per-doc", "5", "--pages", "20",
+        "--seed", "42", "--out", outPdf, "--map", outMap)
+    setArgs(defaults)
+    doFirst {
+        val extra = providers.gradleProperty("realArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(
+        layout.buildDirectory.file("real-corpus-src.pdf"),
+        layout.buildDirectory.file("real-corpus-variant-map.csv"))
+    inputs.file(baseList)
+    inputs.property("realArgs", providers.gradleProperty("realArgs").orElse(""))
+}
+
+// Gate-off MRC pass over the real-variant source PDF, so every page is
+// compressed both ways for the side-by-side labeling doc.
+tasks.register<JavaExec>("mrcRealSrc") {
+    dependsOn("dumpRealSrc", "writeGateOffConfig")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.MrcPdf")
+    jvmArgs("-Xmx3g")
+    args("--settings", "build/gate-off.jsonc", "--threads", "4",
+         "build/real-src.pdf", "-o", "build/real-mrc.pdf")
+}
+
+// Renders the side-by-side original | MRC labeling doc for the real variants.
+tasks.register<JavaExec>("buildRealPairs") {
+    dependsOn("mrcRealSrc")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.BuildSyntheticPairs")
+    jvmArgs("-Xmx3g")
+    args("--src", "build/real-src.pdf",
+         "--mrc", "build/real-mrc.pdf",
+         "--map", "build/real-variant-map.csv",
+         "--out", "build/real-pairs.pdf")
+}
+
+// Pulls the 125 base pages out of the full dump into one review PDF
+// (build/real-base-pages.pdf) plus an index CSV, so the corpus can be eyeballed
+// without paging through 20 grades per base page.  Pages are copied with
+// PDDocument.importPage, so nothing is re-rendered.  See notes/collect-realworld-pdfs.md.
+//
+// Deliberately does NOT dependOn("dumpRealCorpus"): the dump takes ~4 h, so a
+// dependsOn plus any up-to-date invalidation would silently cost 4 h to produce
+// a 65 MB review PDF.  Instead the dump artifacts are declared as inputs, and
+// ExportRealBasePages fails with a clear message if they are missing.
+tasks.register<JavaExec>("exportRealBasePages") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.ExportRealBasePages")
+    jvmArgs("-Xmx3g")
+    val variantMap = "build/real-corpus-variant-map.csv"
+    val srcPdf = "build/real-corpus-src.pdf"
+    val logFile = "build/corpus-full.log"
+    val availableTxt = "build/real-bases/available.txt"
+    val outPdf = "build/real-base-pages.pdf"
+    val outIndex = "build/real-base-pages.csv"
+    val defaults = listOf("--variant-map", variantMap, "--src", srcPdf,
+        "--log", logFile, "--available", availableTxt, "--out", outPdf, "--index", outIndex)
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(variantMap, srcPdf).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing dump artifacts ${missing.joinToString(", ")} — "
+                + "run ./gradlew dumpRealCorpus first (or -x dumpRealCorpus to skip the dependency)")
+        }
+        val extra = providers.gradleProperty("realBaseArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(
+        layout.buildDirectory.file("real-base-pages.pdf"),
+        layout.buildDirectory.file("real-base-pages.csv"))
+    inputs.file(variantMap)
+    inputs.file(availableTxt)
+    inputs.property("realBaseArgs", providers.gradleProperty("realBaseArgs").orElse(""))
+}
+
+// Measures the raw MrcReadiness quantities over the corpus's own clean scans and
+// over a fixed reference photocopy, then prints the constants for MrcRefs.  Only
+// needed when the corpus or the metric bodies change; the output must be pasted
+// back into MrcRefs and recorded in notes/mrc-calibration.md.
+// Requires `tesseract` (eng) — two OCR passes per page.  Long: ~40 min for 125
+// pages, or pass a page limit as the first argument.
+tasks.register<JavaExec>("calibrateMrc") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.MrcCalibration")
+    jvmArgs("-Xmx3g")
+    val reviewPdf = "build/real-base-pages.pdf"
+    doFirst {
+        if (!file(reviewPdf).isFile) {
+            throw GradleException("missing $reviewPdf — run ./gradlew exportRealBasePages first")
+        }
+    }
+}
+
+// Generates the labeled training set (1 clean + 3 steered scan variants per
+// base page) from the review corpus.  Each variant is labeled by the audited OCR
+// word-multiset F1, bucketed good/middle/bad.  That label is measured against the
+// page's ground-truth words, not against the same features the model consumes,
+// which would be circular.  R_mrc (MrcReadiness) is recorded alongside as
+// rMrcProxy for validation, but does NOT define the label: over the steered
+// corpus its agreement with the audit fell to +0.47, from +0.90 before steering.
+// Long: ~1.5-2 h with --workers 3.
+// Re-runs the steering histogram QA against a map that already exists, so a
+// change to the check itself can be validated without paying for a regeneration.
+tasks.register<JavaExec>("checkRealCorpus") {
+    dependsOn("classes")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.CorpusQa")
+    // No --fill-lo/--fill-hi: the dump exempts bins the calibration cannot fill,
+    // but that range has to come from the calibration, and hard-coding a stale
+    // copy here would quietly exempt bins this run never intended to. The
+    // marginal is inside the fillable range, so nothing needs exempting anyway.
+    val defaults = listOf("--map", "build/real-train-map.csv",
+        "--steer-lo", "0.40", "--steer-hi", "0.80",
+        // Must match the cuts dumpRealTrain was run with, or the reported class
+        // mix contradicts the class= column of the map being checked.
+        // badBelow is SeverityScore.LABEL_CUTOFF, keeping class=bad and
+        // binaryLabel=1 the same set of pages.
+        "--good-above", "0.90", "--bad-below", "0.60")
+    setArgs((findProperty("corpusQaArgs") as String?)?.split(" ") ?: defaults)
+}
+
+tasks.register<JavaExec>("dumpRealTrain") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainDump")
+    jvmArgs("-Xmx3g")
+    val reviewPdf = "build/real-base-pages.pdf"
+    val baseIndex = "build/real-base-pages.csv"
+    val basesDir = "build/real-bases"
+    val defaults = listOf("--review", reviewPdf, "--index", baseIndex, "--bases", basesDir,
+        "--out", "build/real-train-src.pdf", "--features", "build/real-train-features.csv",
+        "--map", "build/real-train-map.csv", "--shard-dir", "build/real-train-shards",
+        // 1 clean + 3 steered. This was 10 while the corpus was 1 clean + 9
+        // stochastic variants; the steered design replaced the 9 with 3 measured
+        // draws, and the default was left behind. It must be 4 to match the
+        // 500-row artifact, the features file, and checkRealCorpus.
+        "--pages", "4", "--seed", "42", "--workers", "3")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(reviewPdf, baseIndex).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing base-page artifacts ${missing.joinToString(", ")} — "
+                + "run ./gradlew exportRealBasePages first")
+        }
+        val extra = providers.gradleProperty("realTrainArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(
+        layout.buildDirectory.file("real-train-src.pdf"),
+        layout.buildDirectory.file("real-train-features.csv"),
+        layout.buildDirectory.file("real-train-map.csv"))
+    inputs.file(reviewPdf)
+    inputs.file(baseIndex)
+    inputs.property("realTrainArgs", providers.gradleProperty("realTrainArgs").orElse(""))
+}
+
+// Fits 3 one-vs-rest logistic regressions per feature set and reports
+// good/middle/bad results for both the requested random 250/1000 split and a
+// grouped split that holds out 25 whole base pages.  Seconds, not minutes.
+tasks.register<JavaExec>("evalRealTrainModel") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainEval")
+    jvmArgs("-Xmx2g")
+    val features = "build/real-train-features.csv"
+    val map = "build/real-train-map.csv"
+    // The eval re-derives the classes from labelWordF1 itself and ignores the
+    // map's class= column, so these must be passed here too; leaving them off
+    // silently reverts to terciles while the report says "absolute". Same cuts
+    // as dumpRealTrain and checkRealCorpus. badBelow is
+    // SeverityScore.LABEL_CUTOFF.
+    val goodAbove = "0.90"
+    val badBelow = "0.60"
+    val defaults = listOf("--features", features, "--map", map,
+        "--good-above", goodAbove, "--bad-below", badBelow,
+        "--out-json", "build/real-train-model.json", "--report", "build/real-train-report.txt",
+        "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(features).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing ${missing.joinToString(", ")} — run ./gradlew dumpRealTrain first")
+        }
+        val extra = providers.gradleProperty("realTrainEvalArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(
+        layout.buildDirectory.file("real-train-model.json"),
+        layout.buildDirectory.file("real-train-report.txt"))
+    inputs.file(features)
+    inputs.file(map)
+    inputs.property("realTrainEvalArgs", providers.gradleProperty("realTrainEvalArgs").orElse(""))
+    // Tracked so that changing the cuts reruns the task instead of reporting
+    // the previous split's metrics as up-to-date.
+    inputs.property("goodAbove", goodAbove)
+    inputs.property("badBelow", badBelow)
+}
+
+// Grouped K-fold cross-validation of the readability model: every fold is
+// predicted by a model fitted on the other folds, and the held-out predictions
+// are pooled.  Unlike evalRealTrainModel (a single 80/20 split) this uses all
+// 500 rows for scoring, so the number does not depend on which 100 rows the
+// split happened to pick.  Folds hold out whole base pages, because the 4
+// variants of a page share its font, layout and text.  Cuts are the same
+// absolute ones as dumpRealTrain/checkRealCorpus/evalRealTrainModel, declared
+// as inputs so a stale report cannot pass as up-to-date.  Seconds, not minutes.
+tasks.register<JavaExec>("cvRealTrainModel") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainCrossVal")
+    jvmArgs("-Xmx2g")
+    val features = "build/real-train-features.csv"
+    val map = "build/real-train-map.csv"
+    val goodAbove = "0.90"
+    val badBelow = "0.60"
+    val folds = "5"
+    val defaults = listOf("--features", features, "--map", map,
+        "--good-above", goodAbove, "--bad-below", badBelow, "--cv", folds,
+        "--out-json", "build/real-train-cv.json",
+        "--report", "build/real-train-cv-report.txt",
+        "--errors", "build/real-train-cv-errors.csv",
+        "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(features).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing ${missing.joinToString(", ")} — run ./gradlew dumpRealTrain first")
+        }
+        val extra = providers.gradleProperty("realTrainCvArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(
+        layout.buildDirectory.file("real-train-cv.json"),
+        layout.buildDirectory.file("real-train-cv-report.txt"),
+        layout.buildDirectory.file("real-train-cv-errors.csv"))
+    inputs.file(features)
+    inputs.file(map)
+    inputs.property("realTrainCvArgs", providers.gradleProperty("realTrainCvArgs").orElse(""))
+    inputs.property("goodAbove", goodAbove)
+    inputs.property("badBelow", badBelow)
+    inputs.property("folds", folds)
+}
+
+// Fits the OCR-free good-vs-rest screen on the 11 image features and writes
+// build/real-train-image-model.json.  Same grouped 80/20 split and same absolute
+// cuts as evalRealTrainModel, so the artifact is fitted on the same 400 rows and
+// the two artifacts are comparable; the cross-validated screen metrics come from
+// cvRealTrainModel instead, because they must come from per-fold models.  Seconds.
+tasks.register<JavaExec>("trainRealImageModel") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainImageModel")
+    jvmArgs("-Xmx2g")
+    val features = "build/real-train-features.csv"
+    val map = "build/real-train-map.csv"
+    val goodAbove = "0.90"
+    val badBelow = "0.60"
+    // The operating point, passed explicitly so the artifact records the number
+    // that was actually used rather than the one compiled into the class.
+    val threshold = "0.70"
+    val defaults = listOf("--features", features, "--map", map,
+        "--good-above", goodAbove, "--bad-below", badBelow,
+        "--threshold", threshold,
+        "--out-json", "build/real-train-image-model.json",
+        "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(features).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing ${missing.joinToString(", ")} — run ./gradlew dumpRealTrain first")
+        }
+        val extra = providers.gradleProperty("realTrainImageArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    outputs.files(layout.buildDirectory.file("real-train-image-model.json"))
+    inputs.file(features)
+    inputs.file(map)
+    inputs.property("realTrainImageArgs", providers.gradleProperty("realTrainImageArgs").orElse(""))
+    inputs.property("goodAbove", goodAbove)
+    inputs.property("badBelow", badBelow)
+    inputs.property("threshold", threshold)
+}
+
+// Regenerates the committed per-page MRC gate from the same data as
+// trainRealImageModel, but writes it where the pipeline reads it.  The two
+// tasks differ only in --out-json: trainRealImageModel keeps a research copy in
+// build/, this one replaces src/main/resources/quality-image-screen.json, which
+// QualityModel.loadScreenDefault() loads at runtime.  Run it after changing
+// FeatureExtractor, the corpus, or the fitter, then ./gradlew test -- the
+// polarity identity test reads the committed file.
+tasks.register<JavaExec>("trainQualityScreen") {
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.RealTrainImageModel")
+    jvmArgs("-Xmx2g")
+    val features = "build/real-train-features.csv"
+    val map = "build/real-train-map.csv"
+    val defaults = listOf("--features", features, "--map", map,
+        "--good-above", "0.90", "--bad-below", "0.60",
+        "--threshold", "0.70",
+        "--out-json", "src/main/resources/quality-image-screen.json",
+        "--seed", "42", "--epochs", "400", "--lr", "0.5", "--lambda", "0.01")
+    setArgs(defaults)
+    doFirst {
+        val missing = listOf(features).filter { !file(it).isFile }
+        if (missing.isNotEmpty()) {
+            throw GradleException("missing ${missing.joinToString(", ")} — run ./gradlew dumpRealTrain first")
+        }
+        val extra = providers.gradleProperty("realTrainScreenArgs").orNull
+        if (!extra.isNullOrBlank()) {
+            setArgs(defaults + extra.trim().split(Regex("\\s+")))
+        }
+    }
+    inputs.file(features)
+    inputs.file(map)
+    inputs.property("realTrainScreenArgs", providers.gradleProperty("realTrainScreenArgs").orElse(""))
+}
+
+// Vendors a pinned pdfjs legacy UMD build into build/label/vendor/pdfjs so the
+// static labeling page can render PDFs over file:// (classic script, not ES
+// modules).  Requires network; one-time fetch.
+tasks.register("downloadPdfjs") {
+    val dir = project.layout.buildDirectory.dir("label/vendor/pdfjs").get().asFile
+    dir.mkdirs()
+    val ver = "3.11.174"
+    val base = "https://unpkg.com/pdfjs-dist@$ver/legacy/build"
+    inputs.property("pdfjsVersion", ver)
+    outputs.files(dir.resolve("pdf.min.js"), dir.resolve("pdf.worker.min.js"))
+    doLast {
+        exec { workingDir = dir; commandLine("curl", "-fsSL", "-o", "pdf.min.js", "$base/pdf.min.js") }
+        exec { workingDir = dir; commandLine("curl", "-fsSL", "-o", "pdf.worker.min.js", "$base/pdf.worker.min.js") }
+    }
+}
+
+// Emits build/label/index.html: the static PDF.js labeling page for the
+// synthetic corpus (original | MRC per row, readability checkboxes, autosave
+// to localStorage, CSV/state export).  Retraining steps are deferred.
+tasks.register<JavaExec>("exportLabelHtml") {
+    dependsOn("downloadPdfjs")
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("com.mrcpdf.quality.training.ExportLabelHtml")
+    args("--map", "build/synthetic-variant-map.csv",
+         "--out", "build/label/index.html")
 }
 
 tasks {

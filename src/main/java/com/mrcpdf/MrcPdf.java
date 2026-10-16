@@ -1,13 +1,20 @@
 package com.mrcpdf;
 
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
-import java.io.StringWriter;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -21,9 +28,9 @@ import javax.imageio.ImageIO;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
-import org.apache.pdfbox.text.TextPosition;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -33,9 +40,15 @@ import picocli.CommandLine.Parameters;
 import com.mrcpdf.model.PageResult;
 import com.mrcpdf.model.SegmentedImage;
 import com.mrcpdf.model.TextBlock;
+import com.mrcpdf.pipeline.ImageEncoder;
 import com.mrcpdf.pipeline.ImageSegmenter;
 import com.mrcpdf.pipeline.JBIG2Compressor;
+import com.mrcpdf.pipeline.PageOrigin;
 import com.mrcpdf.pipeline.PDFAssembler;
+import com.mrcpdf.pipeline.TextExtractor;
+import com.mrcpdf.quality.TextQualityScore;
+import com.mrcpdf.quality.TextQualityScorer;
+import com.mrcpdf.quality.model.QualityModel;
 import com.mrcpdf.util.Settings;
 
 /**
@@ -56,6 +69,16 @@ import com.mrcpdf.util.Settings;
 )
 public class MrcPdf implements Callable<Integer> {
 
+    /**
+     * Signals a refusal that has already been explained to the user, so the
+     * handler exits non-zero without printing a second, redundant trace.
+     */
+    static class AbortRunException extends IOException {
+        AbortRunException() {
+            super("aborted");
+        }
+    }
+
     @Parameters(index = "0", description = "Input PDF file")
     private File inputFile;
 
@@ -74,14 +97,35 @@ public class MrcPdf implements Callable<Integer> {
     @Option(names = {"--jpeg-quality"}, description = "Background JPEG quality when a foreground mask is present (0.1 - 1.0, default 0.50)")
     private Float jpegQuality;
 
-    @Option(names = {"--fg-color"}, description = "Enable the true MRC foreground color plane (text keeps its original color via a soft mask); not compatible with --pdfa")
+    @Option(names = {"--fg-color"}, description = "Enable the true MRC foreground color plane (text keeps its original color via a soft mask); allowed under --pdfa (PDF/A-2b permits soft masks, though conformance is not verified)")
     private Boolean fgColor;
 
-    @Option(names = {"--pdfa"}, description = "Enable PDF/A-2b output (XMP metadata, sRGB OutputIntent)")
+    @Option(names = {"--pdfa"}, description = "Stamp PDF/A-2b-shaped output: pdfaid XMP metadata and an sRGB OutputIntent. This is NOT verified conformance — the file is written as PDF 1.6 (PDF/A-2 needs 1.7) and the invisible text layer uses a non-embedded Standard 14 font unless pdf.fontPath is set. Validate with veraPDF if conformance matters.")
     private Boolean pdfa;
 
     @Option(names = {"--threads"}, description = "Worker threads for page preparation (default: available processors)")
     private Integer threads;
+
+    @Option(names = {"--mrc"}, description = "Enable/disable MRC compression (default: on)", negatable = true)
+    private Boolean mrcEnabled;
+
+    @Option(names = {"--pass-through"}, description = "Pass digital-native pages through unchanged (default: on)", negatable = true)
+    private Boolean passThroughEnabled;
+
+    @Option(names = {"--keep-smaller-only"}, description = "If MRC would make the output larger than the input (e.g. an already-optimized bilevel scan), write the original bytes instead of a larger file (default: off)")
+    private Boolean keepSmallerOnly;
+
+    @Option(names = {"--password"}, description = "Password for an encrypted input PDF", arity = "0..1", interactive = true, defaultValue = Option.NULL_VALUE)
+    private String password;
+
+    @Option(names = {"--ignore-encryption"}, description = "Proceed on a permission-restricted (owner-password) PDF whose restrictions would be dropped, since mrcpdf output is never re-encrypted (default: off)")
+    private Boolean ignoreEncryption;
+
+    @Option(names = {"--max-pages"}, description = "Refuse documents longer than this many pages (0 = no limit). Memory use grows with the document.")
+    private Integer maxPages;
+
+    @Option(names = {"--max-dpi"}, description = "Refuse a render DPI above this (0 = no limit). Raster area grows with the square of DPI, so a high value is the usual cause of an out-of-memory failure.")
+    private Integer maxDpi;
 
     @Override
     public Integer call() {
@@ -100,8 +144,15 @@ public class MrcPdf implements Callable<Integer> {
                     : new File(settings.getString("output.file", "output.pdf"));
             String resolvedNative = settings.getString("native.dir", "./deps/jbig2enc");
 
-            boolean useMrc = settings.getBoolean("pipeline.mrc.enabled", true);
+            boolean useMrc = mrcEnabled != null ? mrcEnabled : settings.getBoolean("pipeline.mrc.enabled", true);
             boolean usePdfa = pdfa != null ? pdfa : settings.getBoolean("pdf.pdfa.enabled", false);
+            // Digital-native pass-through runs regardless of --mrc and of the
+            // quality gate: a page already made of vectors gains nothing from
+            // being rendered and re-assembled, so it is carried over as it is.
+            boolean passThrough = passThroughEnabled != null ? passThroughEnabled
+                    : settings.getBoolean("pipeline.origin.passThrough", true);
+            boolean keepSmaller = keepSmallerOnly != null ? keepSmallerOnly
+                    : settings.getBoolean("pipeline.keepSmallerOnly", false);
 
             float resolvedDpi = dpi != null ? dpi
                     : (float) settings.getDouble("rendering.dpi", 300);
@@ -121,24 +172,28 @@ public class MrcPdf implements Callable<Integer> {
                 resolvedJpegQuality = (float) settings.getDouble("pipeline.jpegQuality", 0.85);
             }
 
-            // True MRC foreground color plane: soft masks are not allowed in
-            // PDF/A-2b, so force the setting off and warn when both are requested.
+            // True MRC foreground color plane.  PDF/A-2b permits a soft mask
+            // (SMask) over an image, so the color layer is left enabled under
+            // --pdfa; conformance is not verified, only shaping is attempted —
+            // see the PDF/A notes in the README.
             boolean fgColorEnabled = fgColor != null ? fgColor
                     : settings.getBoolean("pipeline.mrc.foregroundColor", false);
-            if (usePdfa && fgColorEnabled) {
-                System.out.println("  Note: foreground color layer disabled under PDF/A (soft masks not allowed)");
-                fgColorEnabled = false;
-            }
 
             // Font for the invisible text layer (supports CJK when a TTF/OTF is set)
             String resolvedFontPath = settings.getString("pdf.fontPath", "");
             if (resolvedFontPath.isEmpty() && usePdfa) {
                 resolvedFontPath = settings.getString("pdf.pdfa.fontPath", "");
             }
+            if (usePdfa && resolvedFontPath.isEmpty()) {
+                System.out.println("  Note: PDF/A requested but no font path set — the invisible"
+                        + " text layer falls back to the base font and no font embedding is done;"
+                        + " the output is PDF/A-shaped but not verified conformant.");
+            }
 
             System.out.println("  Output: " + resolvedOutput);
             System.out.println("  DPI:    " + resolvedDpi);
             System.out.println("  MRC:    " + (useMrc ? "on" : "off"));
+            System.out.println("  Pass-through: " + (passThrough ? "on" : "off"));
 
             ImageSegmenter segmenter = new ImageSegmenter(
                     settings.getInt("segmenter.tileSize", 64),
@@ -164,6 +219,37 @@ public class MrcPdf implements Callable<Integer> {
             assembler.setForegroundColorEnabled(fgColorEnabled);
             assembler.setFgScale(settings.getDouble("pipeline.mrc.foregroundScale", 0.5));
             assembler.setFgJpegQuality((float) settings.getDouble("pipeline.mrc.foregroundJpegQuality", 0.7));
+            // Fidelity-path background JPEG quality (no mask -> background is the
+            // only visual layer), defaults to the non-MRC pipeline.jpegQuality.
+            // --jpeg-quality overrides this path as well: an explicit CLI quality
+            // is a statement about the page, not about the mode it passes through.
+            float resolvedFidelityQuality = jpegQuality != null
+                    ? resolvedJpegQuality
+                    : (float) settings.getDouble("pipeline.jpegQuality", 0.85);
+            assembler.setFidelityJpegQuality(resolvedFidelityQuality);
+
+            // Per-page text-quality gate: pages scoring below the threshold keep
+            // their full-res fidelity path instead of MRC compression.
+            boolean qualityGateEnabled = settings.getBoolean("pipeline.quality.gateEnabled", true);
+            double qualityGateThreshold = settings.getDouble("pipeline.quality.threshold",
+                    TextQualityScorer.DEFAULT_GATE_THRESHOLD);
+
+            // Per-page gate model: the 11-feature digital-native-adjacent image
+            // screen trained on the real corpus.  When loaded it decides which
+            // non-native pages are worth compressing; absent, the geometric
+            // gate runs unchanged.
+            boolean modelEnabled = settings.getBoolean("pipeline.quality.model.enabled", true);
+            QualityModel qualityModel = null;
+            if (modelEnabled) {
+                qualityModel = QualityModel.loadScreenDefault();
+                if (qualityModel != null) {
+                    // predict() is p(not good) -- the artifact's polarity is
+                    // flipped on load so the gate's meaning is unchanged.
+                    System.out.printf("  Model:  %s gate, %d features, skip when p(not good)>=%.3f (holdout AUC %.3f)%n",
+                            qualityModel.variant(), qualityModel.featureNames().size(),
+                            qualityModel.threshold(), qualityModel.auc());
+                }
+            }
 
             // Resolve worker thread count: CLI arg > settings cap > available processors
             int workerThreads;
@@ -176,11 +262,37 @@ public class MrcPdf implements Callable<Integer> {
             }
             System.out.println("  Workers: " + workerThreads + " thread(s)");
             System.out.println("  Foreground: " + (useMrc && fgColorEnabled ? "color layer" : "black stencil"));
+            if (!useMrc) {
+                System.out.println("  Quality gate: off (MRC disabled)");
+            } else if (!qualityGateEnabled) {
+                System.out.println("  Quality gate: off (disabled in settings)");
+            } else if (qualityModel != null) {
+                System.out.printf("  Quality gate: model (%s, %d features, threshold %.3f)%n",
+                        qualityModel.variant(), qualityModel.featureNames().size(),
+                        qualityModel.threshold());
+            } else {
+                System.out.printf("  Quality gate: geometric (threshold %.2f)%n", qualityGateThreshold);
+            }
 
             runPipeline(inputFile, resolvedOutput, segmenter, compressor, assembler,
-                    useMrc, usePdfa, resolvedDpi, workerThreads, resolvedFontPath, fgColorEnabled);
+                    useMrc, usePdfa, passThrough, resolvedDpi, workerThreads, resolvedFontPath,
+                    fgColorEnabled, resolvedBgScale, resolvedJpegQuality, qualityGateEnabled,
+                    qualityGateThreshold, qualityModel, keepSmaller);
             return 0;
 
+        } catch (AbortRunException e) {
+            // Already reported; no second error line and no stack trace.
+            return 2;
+        } catch (org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException e) {
+            // A wrong or missing user password is ordinary user error, not a
+            // defect worth a stack trace.
+            System.err.println("Error: cannot decrypt the input PDF — the password is"
+                + " wrong or missing.");
+            System.err.println("       Pass it with --password <password>.");
+            return 1;
+        } catch (java.io.FileNotFoundException e) {
+            System.err.println("Error: no such file: " + e.getMessage());
+            return 1;
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
@@ -191,24 +303,80 @@ public class MrcPdf implements Callable<Integer> {
     private void runPipeline(File inputFile, File outputFile,
                              ImageSegmenter segmenter,
                              JBIG2Compressor compressor, PDFAssembler assembler,
-                             boolean useMrc, boolean usePdfa, float dpi,
-                             int workerThreads, String fontPath, boolean fgColorEnabled) throws IOException {
-        String inputName = inputFile.getName().replaceAll("\\.[^.]+$", "");
-        File tempDir = new File("temp/" + inputName + "-" + System.nanoTime());
-        tempDir.mkdirs();
+                             boolean useMrc, boolean usePdfa, boolean passThrough, float dpi,
+                             int workerThreads, String fontPath, boolean fgColorEnabled,
+                             double resolvedBgScale, float resolvedJpegQuality,
+                             boolean qualityGateEnabled, double qualityGateThreshold,
+                             QualityModel qualityModel, boolean keepSmallerOnly) throws IOException {
+        Path tempDir = createTempDir(inputFile.getName().replaceAll("\\.[^.]+$", ""));
 
-        try (PDDocument source = Loader.loadPDF(inputFile)) {
+        try (PDDocument source = Loader.loadPDF(inputFile, password)) {
+            // Policy check before anything is rendered: a restricted document
+            // must not reach the pipeline, because the pipeline cannot put the
+            // restrictions back on the output.
+            boolean encrypted = source.isEncrypted();
+            boolean ignoreEnc = ignoreEncryption != null && ignoreEncryption;
+            boolean passwordGiven = password != null && !password.isEmpty();
+            String refusal = encryptionDecision(encrypted, passwordGiven, ignoreEnc);
+            if (refusal != null) {
+                System.err.println(refusal);
+                throw new AbortRunException();
+            }
+            String encWarning = encryptionWarning(encrypted, passwordGiven, ignoreEnc);
+            if (encWarning != null) System.err.println(encWarning);
+
             PDFRenderer renderer = new PDFRenderer(source);
             int pageCount = source.getNumberOfPages();
+
+            // Refuse oversized inputs before rendering anything: dying with an
+            // OutOfMemoryError twenty minutes in is worse than being told now.
+            String pageLimit = pageLimitNotice(pageCount, maxPages != null ? maxPages : 0);
+            if (pageLimit != null) {
+                System.err.println(pageLimit);
+                throw new AbortRunException();
+            }
+            String dpiLimit = dpiLimitNotice(dpi, maxDpi != null ? maxDpi : 0);
+            if (dpiLimit != null) {
+                System.err.println(dpiLimit);
+                throw new AbortRunException();
+            }
             int srcWords = countWords(source);
             System.out.println("  Pages:  " + pageCount);
             if (srcWords > 0) {
                 System.out.println("  Words:  " + srcWords + " (source text)");
             } else {
                 System.out.println("  Words:  0 — no text in source; pages will have no text layer");
+                String advisory = textLayerAdvisory(pageCount);
+                if (advisory != null) System.err.println(advisory);
             }
 
             long totalStart = System.nanoTime();
+
+            // ── Origin pass (main thread): which pages are digital native? ──
+            //   Decided before the render loop so native pages are never
+            //   rasterised at all -- the whole point of passing them through.
+            //   The same pass measures each page's source resolution so a
+            //   low-resolution scan is not re-rendered at the configured DPI.
+            boolean[] nativePage = new boolean[pageCount];
+            float[] pageDpi = new float[pageCount];
+            int nativeCount = 0;
+            int nativeDpiCount = 0;
+            for (int i = 0; i < pageCount; i++) {
+                PageOrigin.Probe p = PageOrigin.probe(source.getPage(i));
+                nativePage[i] = passThrough
+                        && p.getCoverage() < PageOrigin.PAGE_FILL_COVERAGE;
+                pageDpi[i] = effectiveRenderDpi(dpi, p.getNativeDpi());
+                if (nativePage[i]) nativeCount++;
+                if (pageDpi[i] < dpi) nativeDpiCount++;
+            }
+            if (passThrough) {
+                System.out.println("  Pass-through pages: " + nativeCount + " (digital native)");
+            }
+            if (nativeDpiCount > 0) {
+                System.out.println("  Native-resolution pages: " + nativeDpiCount
+                        + " (rendered below " + (int) dpi + " dpi)");
+            }
+
             System.out.println("  Processing " + pageCount + " pages...");
 
             // ── Pass 1: render + prep ──
@@ -216,16 +384,25 @@ public class MrcPdf implements Callable<Integer> {
             //   thread-safe).  Segmentation + text extraction + image writes run
             //   in the worker pool, bounded by workerThreads.  A Semaphore
             //   throttles the main thread to workerThreads + 2 queued pages.
-            List<PageResult> results = new ArrayList<>(pageCount);
-            int[] imgWidths = new int[pageCount];
-            int[] imgHeights = new int[pageCount];
+            // Per-page holders for worker-produced data (filled on worker threads,
+            // consumed on the main thread after all workers complete).
+            class PageData {
+                int imgW, imgH;
+                byte[] bgJpeg;
+                byte[] fgColorJpeg;
+                BufferedImage mask;
+                TextQualityScore qualityScore;
+                boolean gateSkip;
+                boolean passThrough;
+            }
+            PageData[] pageData = new PageData[pageCount];
             AtomicInteger threadCounter = new AtomicInteger(1);
             ExecutorService executor = Executors.newFixedThreadPool(workerThreads,
                     r -> new Thread(r, "prep-" + threadCounter.getAndIncrement()));
             try {
-                List<Future<PageResult>> futures = new ArrayList<>(pageCount);
+                List<Future<Void>> futures = new ArrayList<>(pageCount);
                 long pipelineStart = System.nanoTime();
-                String perPageFmt = "    [prep-%d] page %d: %4.1fs%n";
+                String perPageFmt = "    [prep-%d] page %d: %4.1fs (cum %5.1fs)%n";
 
                 Semaphore semaphore = new Semaphore(workerThreads + 2);
 
@@ -237,41 +414,101 @@ public class MrcPdf implements Callable<Integer> {
                         throw new IOException("Pipeline interrupted", e);
                     }
 
-                    BufferedImage page = renderer.renderImageWithDPI(i, dpi);
-
                     final int pageIdx = i;
+                    // Digital-native pages are never rasterised at all.
+                    final BufferedImage page = nativePage[i] ? null
+                            : renderer.renderImageWithDPI(i, pageDpi[i]);
+
                     futures.add(executor.submit(() -> {
                         long localStart = System.nanoTime();
                         try {
-                            imgWidths[pageIdx] = page.getWidth();
-                            imgHeights[pageIdx] = page.getHeight();
-
-                            // Segment (background + foreground mask) or use raw page
-                            BufferedImage background;
-                            if (useMrc) {
-                                SegmentedImage seg = segmenter.segment(page);
-                                background = seg.getCleanedBackground();
-                                ImageIO.write(seg.getForegroundMask(), "bmp",
-                                        new File(tempDir, "mask-" + pageIdx + ".bmp"));
+                            PageData pd = new PageData();
+                            pageData[pageIdx] = pd;
+                            pd.passThrough = nativePage[pageIdx];
+                            if (pd.passThrough) {
+                                pd.imgW = rasterWidth(source.getPage(pageIdx), pageDpi[pageIdx]);
+                                pd.imgH = rasterHeight(source.getPage(pageIdx), pageDpi[pageIdx]);
                             } else {
-                                background = page;
-                            }
-                            ImageIO.write(background, "bmp",
-                                    new File(tempDir, "bg-" + pageIdx + ".bmp"));
-                            // Foreground color plane = the original rendered page
-                            if (useMrc && fgColorEnabled) {
-                                ImageIO.write(page, "bmp",
-                                        new File(tempDir, "fg-" + pageIdx + ".bmp"));
+                                pd.imgW = page.getWidth();
+                                pd.imgH = page.getHeight();
                             }
 
-                            // Extract existing text (no OCR — source must be searchable)
-                            PageResult r = TextPositionCollector.extractPage(source, pageIdx, dpi,
-                                    page.getWidth(), page.getHeight());
+                            boolean screenGood = true;
+                            // Per-page text-quality gate: score the rendered page
+                            // and, when quality is low, keep the fidelity path
+                            // (full-res page, no MRC segmentation).  Scoring uses
+                            // whole-page metrics: the PDFBox-derived text layer
+                            // pins confidence to exactly 100.0, so text-layer
+                            // glyph scoring is not engaged by this pipeline.
+                            if (!pd.passThrough && useMrc && qualityGateEnabled) {
+                                // The scorer normalises pixel-length features by
+                                // DPI, so it must see the DPI this page was
+                                // actually rendered at, not the configured target.
+                                TextQualityScorer scorer =
+                                        new TextQualityScorer(pageDpi[pageIdx], qualityModel);
+                                TextQualityScore score = scorer.compute(page, null);
+                                // Model gate when a decision is available; the
+                                // geometric threshold is the fallback (no model
+                                // or text-layer variant with uninformative layer).
+                                pd.gateSkip = score.isModelSkip()
+                                        || (score.getModelProbability() < 0
+                                            && score.isBelow(qualityGateThreshold));
+                                pd.qualityScore = score;
+                                screenGood = !pd.gateSkip;
+                                if (pd.gateSkip) {
+                                    System.out.printf("    [quality] page %d: composite %.2f, p(not good)=%s — MRC skipped (fidelity path)%n",
+                                            pageIdx + 1, score.getComposite(),
+                                            score.getModelProbability() >= 0
+                                                    ? String.format("%.2f", score.getModelProbability())
+                                                    : "n/a");
+                                }
+                            }
+
+                            if (pd.passThrough) {
+                                // Nothing to segment or encode.  The JBIG2 batch
+                                // runs over the whole document, so this page still
+                                // needs a mask slot to keep the indices aligned.
+                                if (useMrc) {
+                                    writeWhiteMask(tempDir, pageIdx, pd.imgW, pd.imgH);
+                                }
+                            } else if (runMrc(pd.passThrough, useMrc, qualityGateEnabled,
+                                    screenGood)) {
+                                SegmentedImage seg = segmenter.segment(page);
+                                // Write the mask as PNG for jbig2enc (lossless,
+                                // compact), then drop the in-memory copy: it is a
+                                // full-resolution binary per page and the only
+                                // later consumer is the CCITT fallback, which
+                                // re-reads the PNG from disk at assembly time.
+                                // Retaining it here pinned every page's mask in
+                                // the heap for the whole pipeline run.
+                                ImageIO.write(seg.getForegroundMask(), "png",
+                                        new File(tempDir.toFile(), "mask-" + pageIdx + ".png"));
+                                pd.mask = null;
+                                pd.bgJpeg = ImageEncoder.encodeBackground(seg.getCleanedBackground(),
+                                        assembler.getBgJpegQuality(), true,
+                                        assembler.getBackgroundScale(), assembler.getBgSmoothSigma());
+                                if (fgColorEnabled) {
+                                    pd.fgColorJpeg = ImageEncoder.encodeForegroundColor(page,
+                                            assembler.getFgJpegQuality(), assembler.getFgScale());
+                                }
+                            } else if (useMrc) {
+                                // Gate-skipped: no segmentation; an empty white
+                                // mask keeps the JBIG2 batch index-aligned.  The
+                                // full-resolution page is encoded here in the
+                                // worker (once) so assembly never re-renders it.
+                                pd.bgJpeg = ImageEncoder.encodeBackground(page,
+                                        assembler.getFidelityJpegQuality(), false, 1.0, 0f);
+                                writeWhiteMask(tempDir, pageIdx, pd.imgW, pd.imgH);
+                            } else {
+                                pd.bgJpeg = ImageEncoder.encodeBackground(page,
+                                        resolvedJpegQuality, false, 1.0, 0f);
+                            }
+
                             double elapsed = (System.nanoTime() - localStart) / 1e9;
                             double cumulative = (System.nanoTime() - pipelineStart) / 1e9;
                             System.out.printf(perPageFmt, pageIdx + 1, pageIdx + 1,
                                     elapsed, cumulative);
-                            return r;
+                            return null;
                         } finally {
                             semaphore.release();
                         }
@@ -281,10 +518,10 @@ public class MrcPdf implements Callable<Integer> {
                 // Shutdown executor (no more submissions)
                 executor.shutdown();
 
-                // Collect results in page order
+                // Wait for all workers to finish
                 try {
-                    for (Future<PageResult> f : futures) {
-                        results.add(f.get());
+                    for (Future<Void> f : futures) {
+                        f.get();
                     }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -298,6 +535,22 @@ public class MrcPdf implements Callable<Integer> {
                 System.out.printf("    Processing done: %d pages in %.1fs (%d threads)%n",
                         pageCount, processingWall, workerThreads);
 
+                // ── Text extraction (main thread — PDFTextStripper is not thread-safe) ──
+                List<TextBlock>[] textBlocksOut = new List[1];
+                List<PageResult> results = new ArrayList<>(pageCount);
+                for (int i = 0; i < pageCount; i++) {
+                    PageData pd = pageData[i];
+                    // Extracted for every page, pass-through included: the
+                    // blocks are what the final word count and the CJK font
+                    // check read. A pass-through page never has a layer
+                    // written for it -- it keeps its own -- but its words are
+                    // still in the output and are still counted.
+                    TextExtractor.extractTextBlocks(source, i, pageDpi[i], pd.imgW, pd.imgH, textBlocksOut);
+                    results.add(new PageResult(i, pd.imgW, pd.imgH, textBlocksOut[0],
+                            pd.bgJpeg, pd.fgColorJpeg, pd.mask,
+                            pd.qualityScore, pd.gateSkip, pd.passThrough));
+                }
+
                 // ── Font resolution for the invisible text layer ──
                 resolveTextFont(assembler, fontPath, results);
 
@@ -306,7 +559,13 @@ public class MrcPdf implements Callable<Integer> {
                 if (useMrc) {
                     long t0 = System.nanoTime();
                     System.out.println("  Batch JBIG2 compression...");
-                    jbig2Batch = compressor.compressAllFromDir(tempDir, pageCount, imgWidths, imgHeights);
+                    int[] imgWidths = new int[pageCount];
+                    int[] imgHeights = new int[pageCount];
+                    for (int i = 0; i < pageCount; i++) {
+                        imgWidths[i] = pageData[i].imgW;
+                        imgHeights[i] = pageData[i].imgH;
+                    }
+                    jbig2Batch = compressor.compressAllFromDir(tempDir.toFile(), pageCount, imgWidths, imgHeights);
                     double elapsed = (System.nanoTime() - t0) / 1e9;
                     if (jbig2Batch != null) {
                         System.out.printf("    JBIG2 batch done in %.1fs (sym: %d bytes)%n",
@@ -328,48 +587,112 @@ public class MrcPdf implements Callable<Integer> {
                 System.out.println("  Assembling PDF...");
                 try (PDDocument output = new PDDocument()) {
                     List<PDPage> outPages = new ArrayList<>(pageCount);
+                    Set<PDPage> passThroughPages = new HashSet<>();
+                    int fidelityPages = 0;
 
                     for (int i = 0; i < pageCount; i++) {
-                        BufferedImage bg = ImageIO.read(new File(tempDir, "bg-" + i + ".bmp"));
-                        BufferedImage fgColor = (useMrc && fgColorEnabled)
-                                ? ImageIO.read(new File(tempDir, "fg-" + i + ".bmp")) : null;
-
+                        PageResult pr = results.get(i);
                         PDPage outPage;
-                        if (jbig2Batch != null && jbig2Batch.getGlobalSym().length > 0) {
-                            JBIG2Compressor.CompressionResult pageData = jbig2Batch.getPages().get(i);
-                            outPage = assembler.addPageJbig2(output, source, i, bg,
-                                    pageData.getData(), jbig2Batch.getGlobalSym(),
-                                    pageData.getWidth(), pageData.getHeight(),
-                                    fgColor,
-                                    results.get(i));
+                        if (pr.isPassThrough()) {
+                            // Digital native: the source page, untouched.
+                            outPage = assembler.importOriginalPage(output, source, i);
+                            passThroughPages.add(outPage);
+                        } else if (pr.isMrcSkip()) {
+                            // Quality gate: original page as the only visual
+                            // layer.  The worker already rendered it and encoded
+                            // the full-res JPEG, so there is no second render.
+                            outPage = assembler.addPageFidelity(output, source, i,
+                                    pr.getBgJpeg(), pr);
+                            fidelityPages++;
+                        } else if (jbig2Batch != null && jbig2Batch.getGlobalSym().length > 0) {
+                            JBIG2Compressor.CompressionResult jbig2Page = jbig2Batch.getPages().get(i);
+                            outPage = assembler.addPageJbig2(output, source, i,
+                                    pr.getBgJpeg(), pr.getFgColorJpeg(),
+                                    jbig2Page.getData(), jbig2Batch.getGlobalSym(),
+                                    jbig2Page.getWidth(), jbig2Page.getHeight(),
+                                    pr);
                         } else if (useMrc) {
-                            // CCITT G4 foreground (no shared JBIG2 available)
-                            BufferedImage mask = ImageIO.read(new File(tempDir, "mask-" + i + ".bmp"));
-                            outPage = assembler.addPage(output, source, i, bg, mask, fgColor, results.get(i));
+                            // jbig2enc unavailable: CCITT fallback.  The worker's
+                            // mask was spilled to disk to keep the heap flat, so
+                            // re-read it here (a page masked white for the
+                            // gate keeps its file, so the image is non-null).
+                            BufferedImage mask = null;
+                            File maskFile = new File(tempDir.toFile(), "mask-" + i + ".png");
+                            if (maskFile.isFile()) {
+                                mask = ImageIO.read(maskFile);
+                            }
+                            outPage = assembler.addPage(output, source, i,
+                                    pr.getBgJpeg(), pr.getFgColorJpeg(),
+                                    mask, pr);
                         } else {
-                            outPage = assembler.addPage(output, source, i, bg, null, results.get(i));
+                            outPage = assembler.addPage(output, source, i,
+                                    pr.getBgJpeg(), null, null, pr);
                         }
 
                         outPages.add(outPage);
                     }
+                    if (fidelityPages > 0) {
+                        System.out.println("  Fidelity pages: " + fidelityPages
+                                + " kept at full resolution (quality gate)");
+                    }
 
                     // Finalize: copy metadata, add PDF/A if needed
                     System.out.println("  Finalizing document...");
-                    var preserved = assembler.finishAssembly(output, source, outPages, usePdfa);
+                    var preserved = assembler.finishAssembly(output, source, outPages, usePdfa, passThroughPages);
                     if (preserved.outlines() > 0)
                         System.out.println("  Bookmarks:  " + preserved.outlines() + " (preserved)");
                     if (preserved.annotations() > 0)
                         System.out.println("  Links:      " + preserved.annotations() + " (preserved)");
                     if (preserved.embeddedFiles() > 0)
                         System.out.println("  Attachments: " + preserved.embeddedFiles() + " (preserved)");
-                    File tempOutput = File.createTempFile("mrcpdf-", ".pdf", outputFile.getParentFile());
+                    if (preserved.formFields() > 0)
+                        System.out.println("  Form:     " + preserved.formFields() + " field(s) (preserved)");
+                    if (preserved.droppedNamedDests() > 0)
+                        System.err.println("  Warning: dropped " + preserved.droppedNamedDests()
+                            + " named destination(s) from the /Names/Dests tree; a bookmark"
+                            + " or link that resolves through one will not work in the"
+                            + " output.");
+                    // Resolve the parent to an absolute path: a bare "out.pdf" has a null
+                    // parent, which would silently redirect the temp file to the
+                    // system temp dir and defeat the atomic move below.
+                    File outParent = outputFile.getAbsoluteFile().getParentFile();
+                    File tempOutput = File.createTempFile("mrcpdf-", ".pdf", outParent);
                     try {
                         output.save(tempOutput);
-                        Files.move(tempOutput.toPath(), outputFile.toPath(),
-                                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                        try {
+                            Files.move(tempOutput.toPath(), outputFile.toPath(),
+                                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                        } catch (AtomicMoveNotSupportedException e) {
+                            // The filesystem/volume does not support atomic renames.
+                            // A finished document should not be thrown away over a
+                            // rename nicety: fall back to a plain replace.
+                            Files.move(tempOutput.toPath(), outputFile.toPath(),
+                                    StandardCopyOption.REPLACE_EXISTING);
+                        }
                     } catch (Exception e) {
                         tempOutput.delete();
                         throw e;
+                    }
+
+                    // ── Expansion guard ──────────────────────────────────────
+                    // MRC adds a background layer per page, so on an input that
+                    // is already tightly optimized (a bilevel CCITT scan, say)
+                    // the "compressed" output can be larger than what it
+                    // replaced.  Default is to keep the MRC result and say so;
+                    // silently discarding it would be worse, and silently
+                    // handing back a larger file is what we are fixing.
+                    long inSize = inputFile.length();
+                    long outSize = outputFile.length();
+                    String expansion = expansionNotice(inSize, outSize, keepSmallerOnly);
+                    if (expansion != null) {
+                        System.err.println(expansion);
+                        if (keepSmallerOnly) {
+                            Files.copy(inputFile.toPath(), outputFile.toPath(),
+                                    StandardCopyOption.REPLACE_EXISTING);
+                            System.out.println("  Output: " + outputFile.getName()
+                                    + " (" + formatSize(outputFile.length())
+                                    + ", original kept -- smaller than the MRC result)");
+                        }
                     }
 
                     long totalElapsed = (System.nanoTime() - totalStart) / 1_000_000_000L;
@@ -386,6 +709,43 @@ public class MrcPdf implements Callable<Integer> {
             }
         } finally {
             deleteDir(tempDir);
+        }
+    }
+
+    private static Path createTempDir(String prefix) throws IOException {
+        String base = System.getProperty("mrcpdf.temp.dir");
+        if (base != null && !base.isEmpty()) {
+            return Files.createTempDirectory(Path.of(base), prefix + "-");
+        }
+        return Files.createTempDirectory(prefix + "-");
+    }
+
+    /**
+     * Best-effort recursive delete. Deliberately swallows its own failures: this
+     * runs from a {@code finally} block, where throwing would mask whatever
+     * exception actually ended the run and report a cleanup problem as if it
+     * were the real fault.
+     */
+    private static void deleteDir(Path dir) {
+        if (!Files.exists(dir)) return;
+        try {
+            Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
+            @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    Files.delete(file);
+                    return FileVisitResult.CONTINUE;
+                }
+                @Override
+                public FileVisitResult postVisitDirectory(Path d, IOException exc) throws IOException {
+                    Files.delete(d);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            // A leftover temp directory is untidy, not fatal, and must never
+            // replace the real failure this is masking.
+            System.err.println("  Warning: could not fully remove temp dir " + dir
+                    + " (" + e.getMessage() + ").");
         }
     }
 
@@ -428,174 +788,229 @@ public class MrcPdf implements Callable<Integer> {
     }
 
     /**
-     * Custom PDFTextStripper that captures per-character positions from the
-     * source PDF's existing text layer, then assembles word-level TextBlock
-     * entries.  PDF coordinates are converted to page-image pixel coordinates
-     * (top-left origin, y increasing downward).
+     * The conjunction this pipeline is built on: a page is MRC-compressed only
+     * when it is not digital native and the screen calls it worth compressing.
+     * A native page passes through whatever the screen says; with MRC off every
+     * page takes the plain raster path; with the gate disabled every
+     * non-native page is compressed.
+     *
+     * <p>Package-private so all four combinations of the first and last
+     * arguments are directly testable rather than inferred through the
+     * worker's branch structure.
      */
-    private static class TextPositionCollector extends PDFTextStripper {
-        private final List<CharPos> chars;
-
-        TextPositionCollector() throws IOException {
-            super();
-            setSortByPosition(true);
-            chars = new ArrayList<>();
-        }
-
-        static PageResult extractPage(PDDocument doc, int pageIdx, float dpi,
-                                      int imgW, int imgH) throws IOException {
-            TextPositionCollector c = new TextPositionCollector();
-            c.setStartPage(pageIdx + 1);
-            c.setEndPage(pageIdx + 1);
-            c.writeText(doc, new StringWriter());
-            // imgW/imgH are the dimensions of the rendered background image
-            // (which already includes any page rotation swap). Using the actual
-            // rendered dimensions keeps the text-layer scale factors consistent
-            // with the background regardless of rotation or rounding.
-            return new PageResult(pageIdx, imgW, imgH, c.buildWordBlocks(dpi));
-        }
-
-        @Override
-        protected void processTextPosition(TextPosition text) {
-            String ch = text.getUnicode();
-            if (ch == null || ch.isEmpty()) return;
-            if (ch.chars().allMatch(Character::isWhitespace)) return;
-            float charH = text.getHeight() > 0 ? text.getHeight() : text.getFontSizeInPt();
-            // Keep the full TextPosition as one atomic entry — use the bounding
-            // box PDFBox provides rather than splitting into individual characters
-            // with guessed uniform widths, which causes horizontal misalignment.
-            chars.add(new CharPos(ch, text.getX(), text.getY(), text.getWidth(), charH));
-        }
-
-        private List<TextBlock> buildWordBlocks(float dpi) {
-            List<TextBlock> blocks = new ArrayList<>();
-            if (chars.isEmpty()) return blocks;
-
-            // Step 1: Cluster characters into visual lines.
-            // Different runs may assign slightly different y values to characters
-            // on the same visual line, so sort by y first and merge nearby y values.
-            chars.sort((a, b) -> Float.compare(a.y, b.y));
-
-            List<List<CharPos>> lines = new ArrayList<>();
-            List<CharPos> currentLine = new ArrayList<>();
-            float[] heights = new float[chars.size()];
-            for (int i = 0; i < chars.size(); i++) heights[i] = chars.get(i).height;
-            java.util.Arrays.sort(heights);
-            float pageMedianHeight = heights[heights.length / 2];
-
-            // Anchor each line to the RUNNING MEAN baseline of its characters,
-            // not a fixed first-char anchor: a slightly raised first glyph (e.g. a
-            // superscript) no longer forces the rest of the line to split off, and
-            // slowly drifting baselines (curved scans) stay one line. The threshold
-            // is adaptive — the larger of the page-wide median and the current
-            // line's mean height — so smaller sub/superscript glyphs merge into
-            // their line while genuinely distant lines still split.
-            float lineMeanY = 0f;
-            float lineMeanHeight = 0f;
-            int lineCount = 1;
-            for (CharPos cp : chars) {
-                if (currentLine.isEmpty()) {
-                    // First char of a line: establishes its baseline anchor.
-                    lineMeanY = cp.y;
-                    lineMeanHeight = cp.height;
-                    lineCount = 1;
-                } else {
-                    float threshold = 0.5f * Math.max(pageMedianHeight, lineMeanHeight);
-                    if (Math.abs(cp.y - lineMeanY) > threshold) {
-                        lines.add(currentLine);
-                        currentLine = new ArrayList<>();
-                        lineMeanY = cp.y;
-                        lineMeanHeight = cp.height;
-                        lineCount = 1;
-                    } else {
-                        lineMeanY = (lineMeanY * lineCount + cp.y) / (lineCount + 1);
-                        lineMeanHeight = (lineMeanHeight * lineCount + cp.height) / (lineCount + 1);
-                        lineCount++;
-                    }
-                }
-                currentLine.add(cp);
-            }
-            if (!currentLine.isEmpty()) {
-                lines.add(currentLine);
-            }
-
-            // Step 2: Within each line, sort by x then split into words by gap.
-            for (List<CharPos> line : lines) {
-                line.sort((a, b) -> Float.compare(a.x, b.x));
-
-                List<CharPos> word = new ArrayList<>();
-                word.add(line.get(0));
-                for (int i = 1; i < line.size(); i++) {
-                    CharPos prev = word.get(word.size() - 1);
-                    CharPos cur = line.get(i);
-                    float gap = cur.x - (prev.x + prev.width);
-                    float gapThreshold = Math.max(prev.height * 0.3f, 2.0f);
-                    if (gap > gapThreshold) {
-                        blocks.add(toBlock(word, dpi));
-                        word = new ArrayList<>();
-                    }
-                    word.add(cur);
-                }
-                if (!word.isEmpty()) {
-                    blocks.add(toBlock(word, dpi));
-                }
-            }
-            return blocks;
-        }
-
-        private TextBlock toBlock(List<CharPos> word, float dpi) {
-            StringBuilder sb = new StringBuilder();
-            float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE;
-            float maxX = Float.MIN_VALUE, maxY = Float.MIN_VALUE;
-            float scale = dpi / 72f;
-            List<float[]> charPosList = new ArrayList<>();
-            for (CharPos cp : word) {
-                sb.append(cp.text);
-                minX = Math.min(minX, cp.x);
-                minY = Math.min(minY, cp.y);
-                maxX = Math.max(maxX, cp.x + cp.width);
-                maxY = Math.max(maxY, cp.y + cp.height);
-                charPosList.add(new float[]{cp.x * scale, cp.y * scale,
-                        cp.width * scale, cp.height * scale});
-            }
-            int px = Math.round(minX * scale);
-            // bbox.y = topmost baseline in image pixels (top-left origin, y increases
-            // downward); charPositions are stored in the same pixel units so that
-            // baselineRatio() compares like with like.
-            int py = Math.round(minY * scale);
-            int pw = Math.round((maxX - minX) * scale);
-            int ph = Math.round((maxY - minY) * scale);
-            return new TextBlock(sb.toString(),
-                    new java.awt.Rectangle(px, py, Math.max(1, pw), Math.max(1, ph)), 100.0,
-                    charPosList);
-        }
-
-        private static class CharPos {
-            final String text;
-            final float x, y, width, height;
-            CharPos(String text, float x, float y, float width, float height) {
-                this.text = text; this.x = x; this.y = y; this.width = width; this.height = height;
-            }
-        }
+    static boolean runMrc(boolean digitalNative, boolean useMrc, boolean qualityGateEnabled,
+                          boolean screenGood) {
+        if (digitalNative || !useMrc) return false;
+        return !qualityGateEnabled || screenGood;
     }
 
-    private static void deleteDir(File dir) {
-        File[] files = dir.listFiles();
-        if (files != null) {
-            for (File f : files) {
-                if (f.isDirectory()) {
-                    deleteDir(f);
-                }
-                f.delete();
-            }
-        }
-        dir.delete();
+    /**
+     * Floor for the per-page render DPI derived from a source raster. A measured
+     * resolution is a compression hint, not a contract: below this it stops
+     * looking like a real page resolution (a tiny logo drawn large) and
+     * re-rendering there would cost fidelity for no meaningful size win.
+     */
+    static final float MIN_RENDER_DPI = 36f;
+
+    /**
+     * The DPI to render one page at: the configured DPI, lowered to the source
+     * raster's native resolution when that is lower. Never raised -- a source
+     * richer than the target is still rendered at the target -- and never below
+     * {@link #MIN_RENDER_DPI}.
+     *
+     * @param configured the DPI from settings / the CLI
+     * @param nativeDpi  the source raster's resolution, or 0 when unknown
+     */
+    static float effectiveRenderDpi(float configured, double nativeDpi) {
+        if (nativeDpi <= 0) return configured;
+        return Math.max(MIN_RENDER_DPI, (float) Math.min(configured, nativeDpi));
+    }
+
+    /** Rendered pixel width of a source page at {@code dpi}, rotation applied. */
+    private static int rasterWidth(PDPage page, float dpi) {
+        PDRectangle box = page.getCropBox();
+        return rasterDimension(page.getRotation() % 180 != 0 ? box.getHeight() : box.getWidth(),
+                dpi);
+    }
+
+    /** Rendered pixel height of a source page at {@code dpi}, rotation applied. */
+    private static int rasterHeight(PDPage page, float dpi) {
+        PDRectangle box = page.getCropBox();
+        return rasterDimension(page.getRotation() % 180 != 0 ? box.getWidth() : box.getHeight(),
+                dpi);
+    }
+
+    private static int rasterDimension(float points, float dpi) {
+        // PDFBox renders a rotated page to exactly floor(points * dpi / 72)
+        // pixels; rounding up here produced a size the renderer never emitted
+        // and the mask/geometry were written at a dimension the render never
+        // matched (A8).
+        return Math.max(1, (int) Math.floor(points * dpi / 72.0));
+    }
+
+    /**
+     * Writes an all-white mask for a page that produced no foreground. The
+     * JBIG2 batch compresses masks by document index, so every page needs a
+     * file even when nothing was segmented.
+     */
+    private static void writeWhiteMask(Path tempDir, int pageIndex, int width, int height)
+            throws IOException {
+        BufferedImage mask = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_BINARY);
+        Graphics2D g = mask.createGraphics();
+        g.setColor(java.awt.Color.WHITE);
+        g.fillRect(0, 0, width, height);
+        g.dispose();
+        ImageIO.write(mask, "png", new File(tempDir.toFile(), "mask-" + pageIndex + ".png"));
     }
 
     private static String formatSize(long bytes) {
         if (bytes < 1024) return bytes + " B";
         if (bytes < 1024 * 1024) return String.format("%.0f KB", bytes / 1024.0);
         return String.format("%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+
+    /**
+     * Advisory for a source whose text layer is empty.
+     *
+     * <p>This tool never runs OCR by design, so an image-only scan keeps no
+     * searchable text: the output is a smaller picture, not a searchable
+     * document. That is a fine outcome, but it is silent unless we say so, and
+     * it is the single most common way a user is surprised -- "no recognition
+     * errors" reads as "no missing text". So say it plainly, once per document,
+     * with the remedy.
+     *
+     * @return the warning to print to stderr, or {@code null} if there is
+     *         nothing to warn about.
+     */
+    static String textLayerAdvisory(int pageCount) {
+        if (pageCount <= 0) return null;
+        return "  Warning: no text layer found in any of the " + pageCount
+            + " source page" + (pageCount == 1 ? "" : "s")
+            + ". mrcpdf does not run OCR, so the output will not be searchable."
+            + "\n           To get a searchable PDF, add a text layer first"
+            + " (e.g. ocrmypdf input.pdf output.pdf) and then run mrcpdf on the"
+            + " result; mrcpdf will re-use that layer and keep it sharp.";
+    }
+
+    /**
+     * Decides whether the MRC result is a net loss for this document, and words
+     * the warning if so.
+     *
+     * <p>MRC is not a guaranteed win. A page that is already a well-compressed
+     * 1-bit mask gets a background JPEG bolted on top, and the background is
+     * roughly 84% of the output — so against an already-tight input the
+     * "compressed" file can come out larger.
+     *
+     * <p>Default behaviour keeps the MRC result and warns: the tool was asked to
+     * compress, and quietly handing back the input instead would hide what
+     * happened. {@code --keep-smaller-only} opts into never enlarging a file.
+     *
+     * @return the warning to print to stderr, or {@code null} when the output
+     *         did not expand
+     */
+    static String expansionNotice(long inBytes, long outBytes, boolean keepSmallerOnly) {
+        if (outBytes <= inBytes) return null;
+        String pct = inBytes <= 0 ? "unknown"
+                : String.format("%.1f%%", (outBytes - inBytes) * 100.0 / inBytes);
+        return "  Warning: MRC made the output larger -- input "
+            + formatSize(inBytes) + ", output " + formatSize(outBytes) + " (+" + pct + ")."
+            + (keepSmallerOnly
+                ? " --keep-smaller-only is set, so the original bytes were kept instead."
+                : " The source is probably already well compressed (e.g. a bilevel"
+                  + " CCITT scan). Pass --keep-smaller-only to never enlarge a file.");
+    }
+
+    /**
+     * Refuses a document longer than the caller's ceiling.
+     *
+     * <p>Heap use is O(document): backgrounds, JBIG2 streams and word lists all
+     * accumulate, and the output document is built in full before any byte is
+     * written. An unbounded page count has no defined behaviour past exhaustion.
+     *
+     * @return the refusal, or {@code null} if within the limit or unlimited
+     */
+    static String pageLimitNotice(int pageCount, int maxPages) {
+        if (maxPages <= 0) return null;
+        if (pageCount <= maxPages) return null;
+        return "  Error: the input has " + pageCount + " pages, over the --max-pages"
+            + " limit of " + maxPages + ". Memory use grows with the document, so a"
+            + " run this long is likely to exhaust the heap.\n"
+            + "         Split the document, or raise the limit with"
+            + " --max-pages " + pageCount + " if you have the memory for it.";
+    }
+
+    /**
+     * Refuses a render resolution above the caller's ceiling.
+     *
+     * <p>Raster area scales with the square of DPI, so {@code --dpi 1200} on
+     * letter is 4x the pixels of the 300 DPI default — enough to run the heap
+     * out inside the quality scorer, which is what happens with no limit set.
+     *
+     * @return the refusal, or {@code null} if within the limit or unlimited
+     */
+    static String dpiLimitNotice(float dpi, float maxDpi) {
+        if (maxDpi <= 0) return null;
+        if (dpi <= maxDpi) return null;
+        return "  Error: --dpi " + (int) dpi + " is over the --max-dpi limit of "
+            + (int) maxDpi + ". Raster area grows with the square of DPI, so this"
+            + " needs roughly " + String.format("%.0fx", Math.pow(dpi / 300f, 2))
+            + " the memory of a 300 DPI run, and is the usual cause of an"
+            + " out-of-memory failure.\n"
+            + "         Lower --dpi, or raise the limit with --max-dpi " + (int) dpi
+            + " if you have the memory for it.";
+    }
+
+    /**
+     * Decides whether an encrypted input may be processed at all.
+     *
+     * <p>mrcpdf has no way to re-encrypt: the output is always written
+     * unencrypted. Running an encrypted document through therefore downgrades
+     * its protection, and doing that quietly is the part that does real damage —
+     * the result looks like an ordinary file and carries none of the original
+     * restrictions.
+     *
+     * <p>The distinction that matters is which password opened the document. If
+     * a blank password suffices, the file is owner-password-only:
+     * permission-restricted, deliberately so. That is refused. If the caller
+     * supplied the user password they already have legitimate access, so it
+     * proceeds — but {@link #encryptionWarning} still fires, because the output
+     * remains unprotected either way.
+     *
+     * @param encrypted        whether the loaded document is encrypted
+     * @param passwordGiven    whether the caller supplied a password
+     * @param ignoreEncryption whether {@code --ignore-encryption} was passed
+     * @return the refusal to print before exiting, or {@code null} to proceed
+     */
+    static String encryptionDecision(boolean encrypted, boolean passwordGiven,
+                                     boolean ignoreEncryption) {
+        if (!encrypted) return null;
+        if (passwordGiven) return null;
+        if (ignoreEncryption) return null;
+        return "  Error: the input PDF is encrypted with an owner password, so it"
+            + " carries permission restrictions. The output will NOT be encrypted and"
+            + " will carry none of those restrictions — an unprotected copy of a"
+            + " protected document.\n"
+            + "         Re-run with --ignore-encryption if you are authorised to remove"
+            + " those restrictions, or decrypt the file first.";
+    }
+
+    /**
+     * The notice emitted whenever an encrypted document is processed.
+     *
+     * <p>Fires even under {@code --ignore-encryption}: the override decides
+     * whether to proceed, not whether to mention that the output is unprotected.
+     *
+     * @return the warning to print to stderr, or {@code null} if the input was
+     *         not encrypted
+     */
+    static String encryptionWarning(boolean encrypted, boolean passwordGiven,
+                                    boolean ignoreEncryption) {
+        if (!encrypted) return null;
+        String how = ignoreEncryption
+            ? " --ignore-encryption was given."
+            : (passwordGiven ? " The password was supplied." : "");
+        return "  Warning: the input PDF is encrypted; the output will NOT be"
+            + " encrypted and carries none of the input's restrictions." + how;
     }
 
     private static int countWords(PDDocument doc) throws IOException {

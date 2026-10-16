@@ -3,20 +3,29 @@ package com.mrcpdf.pipeline;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSBase;
 import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSFloat;
 import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.cos.COSNumber;
+import org.apache.pdfbox.cos.COSObject;
 import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
+import org.apache.pdfbox.pdmodel.PDDestinationNameTreeNode;
+import org.apache.pdfbox.pdmodel.interactive.form.PDAcroForm;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDMetadata;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitWidthDestination;
@@ -35,7 +44,6 @@ import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlin
  *   - XML metadata stream (XMP)
  *
  * Limitations:
- *   - Annotation page references (e.g. link destinations) are not remapped.
  *   - Named destinations are preserved but may reference missing pages.
  */
 public class MetadataPreserver {
@@ -43,7 +51,8 @@ public class MetadataPreserver {
     /**
      * Counts of metadata elements copied from source to output.
      */
-    public record PreserveResult(int outlines, int annotations, int embeddedFiles) {}
+    public record PreserveResult(int outlines, int annotations, int embeddedFiles,
+            int droppedNamedDests, int formFields) {}
 
     /**
      * Copies all metadata from source to output.
@@ -54,12 +63,32 @@ public class MetadataPreserver {
      * @return Counts of copied elements.
      */
     public PreserveResult preserve(PDDocument source, PDDocument output, List<PDPage> outputPages) throws IOException {
+        return preserve(source, output, outputPages, Collections.emptySet());
+    }
+
+    /**
+     * Preserves metadata from the source document into the assembled output.
+     *
+     * @param source          The source document.
+     * @param output          The newly assembled PDF.
+     * @param outputPages     Output pages indexed to match source pages.
+     * @param passThroughPages Output pages that are the source pages imported
+     *                         verbatim ({@code output.importPage}); their user
+     *                         space is unchanged, so annotation geometry must
+     *                         not be remapped.
+     * @return Counts of copied elements.
+     */
+    public PreserveResult preserve(PDDocument source, PDDocument output, List<PDPage> outputPages,
+                                   Set<PDPage> passThroughPages) throws IOException {
         copyDocumentInfo(source, output);
         int outlines = copyOutline(source, output, outputPages);
-        int annotations = copyAnnotations(source, outputPages);
+        Map<COSBase, COSBase> substitutions = new IdentityHashMap<>();
+        int annotations = copyAnnotations(source, outputPages, passThroughPages, substitutions);
+        int formFields = copyAcroForm(source, output, substitutions);
         int embeddedFiles = copyEmbeddedFiles(source, output);
+        int droppedNamedDests = countNamedDests(source);
         copyXmlMetadata(source, output);
-        return new PreserveResult(outlines, annotations, embeddedFiles);
+        return new PreserveResult(outlines, annotations, embeddedFiles, droppedNamedDests, formFields);
     }
 
     private void copyDocumentInfo(PDDocument source, PDDocument output) {
@@ -148,7 +177,9 @@ public class MetadataPreserver {
         }
     }
 
-    private int copyAnnotations(PDDocument source, List<PDPage> outputPages) throws IOException {
+    private int copyAnnotations(PDDocument source, List<PDPage> outputPages,
+                                Set<PDPage> passThroughPages,
+                                Map<COSBase, COSBase> substitutions) throws IOException {
         int totalAnnotations = 0;
         int pageCount = Math.min(source.getNumberOfPages(), outputPages.size());
         for (int i = 0; i < pageCount; i++) {
@@ -164,12 +195,241 @@ public class MetadataPreserver {
                 // Strip /P (parent page) — the cloned annotation dictionary should not
                 // carry a reference back to the source page.
                 cloned.removeItem(COSName.P);
+                remapAnnotationDest(cloned, source, outputPages);
+                if (!passThroughPages.contains(dstPage)) {
+                    // Pass-through pages keep the source page's geometry verbatim
+                    // (importPage copies MediaBox/CropBox origin and /Rotate), so a
+                    // /Rect in source user space is already correct in the output.
+                    remapAnnotationGeometry(cloned, srcPage);
+                }
                 dstAnnots.add(cloned);
             }
             dstPage.getCOSObject().setItem(COSName.ANNOTS, dstAnnots);
+            // Record source annotation -> its clone so that the AcroForm field
+            // tree, deep-copied separately, reuses these exact objects instead of
+            // creating a second copy of every widget. Two copies means the field
+            // appears twice and edits land on the wrong one.
+            for (int a = 0; a < annotations.size(); a++) {
+                substitutions.put(annotations.get(a).getCOSObject(),
+                    dstAnnots.get(a) instanceof COSObject o ? o.getObject() : dstAnnots.get(a));
+            }
             totalAnnotations += annotations.size();
         }
         return totalAnnotations;
+    }
+
+    /**
+     * Remaps page references inside a cloned annotation dictionary from source
+     * pages to the corresponding output pages. Handles /Dest (explicit or array
+     * form) and /A → /D (action destination).
+     */
+    private void remapAnnotationDest(COSDictionary annot, PDDocument source, List<PDPage> outputPages) {
+        COSBase dest = annot.getDictionaryObject(COSName.DEST);
+        if (dest != null) {
+            COSBase remapped = resolvePageRef(dest, source, outputPages);
+            if (remapped != dest) annot.setItem(COSName.DEST, remapped);
+        }
+        COSBase action = annot.getDictionaryObject(COSName.A);
+        if (action instanceof COSDictionary actionDict) {
+            COSBase aDest = actionDict.getDictionaryObject(COSName.D);
+            if (aDest != null) {
+                COSBase remapped = resolvePageRef(aDest, source, outputPages);
+                if (remapped != aDest) actionDict.setItem(COSName.D, remapped);
+            }
+        }
+    }
+
+    /**
+     * If {@code value} is a COSObject whose referent is a source page dictionary,
+     * returns the matching output page's COSObject. Otherwise returns {@code value}
+     * unchanged. Identity-based: compares the underlying COSObject, not page index,
+     * because annotations may hold indirect references to the page object.
+     */
+    private COSBase resolvePageRef(COSBase value, PDDocument source, List<PDPage> outputPages) {
+        if (!(value instanceof COSObject cosObj)) return value;
+        COSBase referent = cosObj.getObject();
+        if (!(referent instanceof COSDictionary)) return value;
+        for (int i = 0; i < outputPages.size(); i++) {
+            if (source.getPage(i).getCOSObject() == referent) {
+                return outputPages.get(i).getCOSObject();
+            }
+        }
+        return value;
+    }
+
+    /**
+     * Remaps annotation geometry from the source page's default user space to
+     * the output page's fresh, un-rotated, zero-origin user space.
+     *
+     * <p>The /Rect (and /QuadPoints, /Vertices, /InkList, /L, /CL) of a source
+     * annotation lives in source default user space: pre-/{@code Rotate}, and
+     * relative to the page origin rather than the crop box.  The pipeline's
+     * output page is the page as PDFBox renders it — crop box shifted to the
+     * origin, rotation applied, axes swapped for 90/270 — drawn into a brand-new
+     * page whose user space starts at (0,0).  The annotation must move through
+     * the same mapping or its region lands on the wrong part of the page.
+     *
+     * <p>Transformation of source point (x, y) (y-up, page space) to output
+     * point (mx, my) (y-up, output page, dims swapped for 90/270):
+     * <pre>
+     *   R=0:   (x − llx,        (lly + H) − y)
+     *   R=90:  ((lly + H) − y,  (llx + W) − x)
+     *   R=180: ((llx + W) − x,  y − lly)
+     *   R=270: (y − lly,        x − llx)
+     * </pre>
+     */
+    private void remapAnnotationGeometry(COSDictionary annot, PDPage srcPage) {
+        PDRectangle crop = srcPage.getCropBox();
+        float llx = crop.getLowerLeftX();
+        float lly = crop.getLowerLeftY();
+        float w = crop.getWidth();
+        float h = crop.getHeight();
+        int rotation = srcPage.getRotation() % 360;
+        if (rotation < 0) rotation += 360;
+
+        remapRect(annot, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.QUADPOINTS, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.VERTICES, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.L, rotation, llx, lly, w, h);
+        remapPointPairs(annot, COSName.getPDFName("CL"), rotation, llx, lly, w, h);
+        COSBase ink = annot.getDictionaryObject(COSName.getPDFName("InkList"));
+        if (ink instanceof COSArray inkList) {
+            for (COSBase sub : inkList) {
+                COSBase subVal = sub;
+                if (subVal instanceof COSObject cosObj) subVal = cosObj.getObject();
+                if (subVal instanceof COSArray stroke) {
+                    remapPointArray(stroke, rotation, llx, lly, w, h);
+                }
+            }
+        }
+    }
+
+    private static float mapX(float x, float y, int rotation, float llx, float lly,
+                              float w, float h) {
+        switch (rotation) {
+            case 90: return (lly + h) - y;
+            case 180: return (llx + w) - x;
+            case 270: return y - lly;
+            default: return x - llx;
+        }
+    }
+
+    private static float mapY(float x, float y, int rotation, float llx, float lly,
+                              float w, float h) {
+        switch (rotation) {
+            case 90: return (llx + w) - x;
+            case 180: return y - lly;
+            case 270: return x - llx;
+            default: return (lly + h) - y;
+        }
+    }
+
+    private void remapRect(COSDictionary annot, int rotation, float llx, float lly,
+                           float w, float h) {
+        COSBase rectVal = annot.getDictionaryObject(COSName.RECT);
+        if (!(rectVal instanceof COSArray rect) || rect.size() != 4) return;
+        float x0 = cosFloat(rect, 0), y0 = cosFloat(rect, 1);
+        float x1 = cosFloat(rect, 2), y1 = cosFloat(rect, 3);
+        float mx0 = mapX(x0, y0, rotation, llx, lly, w, h);
+        float my0 = mapY(x0, y0, rotation, llx, lly, w, h);
+        float mx1 = mapX(x1, y1, rotation, llx, lly, w, h);
+        float my1 = mapY(x1, y1, rotation, llx, lly, w, h);
+        rect.set(0, new COSFloat(Math.min(mx0, mx1)));
+        rect.set(1, new COSFloat(Math.min(my0, my1)));
+        rect.set(2, new COSFloat(Math.max(mx0, mx1)));
+        rect.set(3, new COSFloat(Math.max(my0, my1)));
+    }
+
+    /** Transforms each (x, y) pair in a flat number array (QuadPoints, Vertices, L, CL). */
+    private void remapPointPairs(COSDictionary annot, COSName key, int rotation,
+                                 float llx, float lly, float w, float h) {
+        COSBase value = annot.getDictionaryObject(key);
+        if (value instanceof COSArray arr) {
+            remapPointArray(arr, rotation, llx, lly, w, h);
+        }
+    }
+
+    private void remapPointArray(COSArray arr, int rotation, float llx, float lly,
+                                 float w, float h) {
+        for (int i = 0; i + 1 < arr.size(); i += 2) {
+            float x = cosFloat(arr, i);
+            float y = cosFloat(arr, i + 1);
+            arr.set(i, new COSFloat(mapX(x, y, rotation, llx, lly, w, h)));
+            arr.set(i + 1, new COSFloat(mapY(x, y, rotation, llx, lly, w, h)));
+        }
+    }
+
+    private static float cosFloat(COSArray arr, int index) {
+        COSBase base = arr.get(index);
+        if (base instanceof COSNumber num) {
+            return num.floatValue();
+        }
+        return 0f;
+    }
+
+    /**
+     * Carries the interactive form across.
+     *
+     * <p>Widget annotations are copied with every other annotation, but on their
+     * own they are inert: without an {@code /AcroForm} root in the output
+     * catalog, viewers treat the widgets as artwork and form-heavy documents
+     * (government, enterprise — a core MRC target) come out unusable.
+     *
+     * <p>The field tree is deep-copied with {@code substitutions} pre-seeded, so
+     * each widget in the tree resolves to the very object already placed on the
+     * output page's {@code /Annots} rather than to a second clone.
+     *
+     * <p>{@code /NeedAppearances} is set. Widget appearance streams reference
+     * font resources from the source {@code /DR}; after a rebuild those are not
+     * guaranteed to resolve, and a field that draws nothing is worse than one
+     * that redraws itself. Asking the viewer to regenerate is the reliable
+     * option, and it is what the flag exists for.
+     *
+     * @return the number of fields in the copied tree, or 0 if there was no form
+     */
+    private int copyAcroForm(PDDocument source, PDDocument output,
+                             Map<COSBase, COSBase> substitutions) throws IOException {
+        PDAcroForm srcForm = source.getDocumentCatalog().getAcroForm();
+        if (srcForm == null) return 0;
+
+        IdentityHashMap<COSBase, COSBase> visited = new IdentityHashMap<>(substitutions);
+        COSDictionary copied = deepCopyCOSDictionary(srcForm.getCOSObject(), visited);
+
+        // Note: /NeedAppearances is deliberately NOT set here. PDAcroForm access
+        // lazily runs PDFBox's AcroFormDefaultFixup, which regenerates the widget
+        // appearance streams itself and resets the flag -- setting it beforehand
+        // only fights that. The regenerated /AP is the better outcome: the field
+        // actually draws.
+
+        PDAcroForm dstForm = new PDAcroForm(output, copied);
+        output.getDocumentCatalog().setAcroForm(dstForm);
+
+        COSBase fieldsBase = copied.getDictionaryObject(COSName.FIELDS);
+        COSArray fields = fieldsBase instanceof COSArray a ? a : null;
+        return fields != null ? fields.size() : 0;
+    }
+
+    /**
+     * Counts the source's named destinations, which are <em>not</em> carried
+     * over.
+     *
+     * <p>Carrying the {@code /Names/Dests} tree across verbatim would be worse
+     * than dropping it: the destinations point at page references that no
+     * longer resolve once pages are rebuilt, so a link through one would fail
+     * at click time with nothing to indicate why. Carrying them across
+     * <em>correctly</em> needs the same page-reference remapping the outline
+     * code already performs, which is a larger change than its apparent size.
+     *
+     * <p>So they are dropped, and counted here so the caller can report the
+     * loss instead of letting it pass unnoticed.
+     */
+private int countNamedDests(PDDocument source) throws IOException {
+        PDDocumentNameDictionary srcNames = source.getDocumentCatalog().getNames();
+        if (srcNames == null) return 0;
+        PDDestinationNameTreeNode srcDests = srcNames.getDests();
+        if (srcDests == null) return 0;
+        var names = srcDests.getNames();
+        return names != null ? names.size() : 0;
     }
 
     private int copyEmbeddedFiles(PDDocument source, PDDocument output) throws IOException {

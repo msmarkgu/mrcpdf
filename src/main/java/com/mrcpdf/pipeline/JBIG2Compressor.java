@@ -14,6 +14,7 @@ import org.apache.pdfbox.pdmodel.graphics.image.CCITTFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 
 import com.mrcpdf.util.PlatformUtils;
+import com.mrcpdf.util.PlatformUtils.Arch;
 import com.mrcpdf.util.PlatformUtils.Os;
 import com.mrcpdf.util.Settings;
 import com.mrcpdf.util.SubprocessRunner;
@@ -23,20 +24,48 @@ import com.mrcpdf.util.SubprocessRunner;
  * falling back to CCITT Group 4 fax encoding via PDFBox when
  * the native binary is unavailable.
  *
- * jbig2enc flags:
- *   -p  — Produce a global symbol dictionary (shared across pages).
- *   -s  — Refine smearing to improve symbol matching.
+ * jbig2enc flags (as reported by the bundled binary's --help):
+ *   -p  — Produce PDF-ready data (this is what writes the shared global
+ *        symbol dictionary the PDF JBIG2Decode stream requires).
+ *   -s  — Use text region, not generic coder (symbol-mode matching).
+ *   -r  — Refine; requires -s and is lossless. NOT passed, so symbol
+ *        matching runs at the lossy default threshold -- hence the
+ *        "visually lossless, not bit-identical" wording in the docs.
  */
 public class JBIG2Compressor {
 
+    /**
+     * Wall-clock limit for one jbig2enc invocation when neither the caller nor
+     * settings says otherwise. A batch that hangs is worse than one that falls
+     * back, so even the default is a bound rather than no limit.
+     */
+    private static final int DEFAULT_TIMEOUT_MS = 300_000;
+
     private final String nativeDir;
+
+    /**
+     * Explicit timeout in milliseconds, or &le;0 to read
+     * {@code jbig2enc.timeoutMs} from settings (falling back to
+     * {@link #DEFAULT_TIMEOUT_MS}).
+     */
+    private final long timeoutMs;
 
     public JBIG2Compressor() {
         this("deps/jbig2enc");
     }
 
     public JBIG2Compressor(String nativeDir) {
+        this(nativeDir, 0L);
+    }
+
+    public JBIG2Compressor(String nativeDir, long timeoutMs) {
         this.nativeDir = nativeDir;
+        this.timeoutMs = timeoutMs;
+    }
+
+    private long resolveTimeoutMs() {
+        if (timeoutMs > 0) return timeoutMs;
+        return Settings.getInstance().getInt("jbig2enc.timeoutMs", DEFAULT_TIMEOUT_MS);
     }
 
     /**
@@ -96,13 +125,48 @@ public class JBIG2Compressor {
      * @return BatchResult with shared global sym and per-page data, or null if
      *         jbig2enc is unavailable or fails (caller should use CCITT fallback).
      */
+    /**
+     * Page count beyond which the mask paths will not fit on a Windows command
+     * line, leaving headroom for the flags and the executable path.
+     *
+     * <p>Windows {@code CreateProcess} caps a command line at 32 767
+     * characters. Every mask path is passed as one argument, so a long document
+     * eventually cannot be started at all.
+     */
+    static final int WINDOWS_CMDLINE_LIMIT = 32767;
+
+    /**
+     * Warns when this batch's command line is at risk of exceeding the Windows
+     * limit, rather than letting {@code ProcessBuilder} fail obscurely.
+     *
+     * <p>Chunking the batch is not a safe drop-in fix: each chunk would emit its
+     * own {@code .sym}, and a PDF {@code JBIG2Decode} stream carries exactly one
+     * globals stream, so per-page data across chunks would reference symbols
+     * that are not in the stream they are paired with. That needs real JBIG2
+     * assembly work, not a loop. Until then the failure is surfaced rather than
+     * left to look like an ordinary CCITT downgrade.
+     *
+     * @return the warning, or {@code null} when the command line fits
+     */
+    static String commandLengthWarning(File exe, List<String> args, int pageCount) {
+        long len = exe.length();
+        for (String a : args) len += a.length() + 1;
+        if (len <= WINDOWS_CMDLINE_LIMIT) return null;
+        return "  Warning: " + pageCount + " mask paths need about " + len
+            + " command-line characters, over the " + WINDOWS_CMDLINE_LIMIT
+            + "-character limit on Windows — this run will fall back to CCITT G4"
+            + " for the whole document and lose the shared symbol dictionary."
+            + " Split the document into parts of under ~600 pages to stay under"
+            + " the limit.";
+    }
+
     public BatchResult compressAllFromDir(File maskDir, int pageCount, int[] imgWidths, int[] imgHeights) throws IOException {
         File jbig2enc = findJbig2enc();
         if (jbig2enc == null) return null;
 
         List<String> imagePaths = new ArrayList<>(pageCount);
         for (int i = 0; i < pageCount; i++) {
-            imagePaths.add(new File(maskDir, "mask-" + i + ".bmp").getAbsolutePath());
+            imagePaths.add(new File(maskDir, "mask-" + i + ".png").getAbsolutePath());
         }
 
         // Use a UUID-scoped basename to keep JBIG2 output files (.sym, .0000, ...)
@@ -120,15 +184,36 @@ public class JBIG2Compressor {
         args.add(basename);
         args.addAll(imagePaths);
 
-        SubprocessRunner.Result result = SubprocessRunner.run(jbig2enc, args, -1);
-        if (result.getExitCode() != 0) return null;
+        String tooLong = commandLengthWarning(jbig2enc, args, pageCount);
+        if (tooLong != null) System.err.println(tooLong);
+
+        SubprocessRunner.Result result;
+        try {
+            result = SubprocessRunner.run(jbig2enc, args, resolveTimeoutMs());
+        } catch (IOException e) {
+            // The binary could not even be started (missing interpreter, wrong
+            // architecture, exec permission, timeout). Surface it and let the
+            // caller use CCITT G4 rather than aborting the whole document.
+            System.err.println("  Warning: jbig2enc could not run (" + e.getMessage()
+                    + ") — using CCITT G4 fallback.");
+            return null;
+        }
+        if (result.getExitCode() != 0) {
+            System.err.println("  Warning: jbig2enc exited " + result.getExitCode()
+                    + formatStderr(result) + " — using CCITT G4 fallback.");
+            return null;
+        }
 
         // Read output files, then delete them immediately
         try {
             // Read shared global symbol dictionary
             File symFile = new File(basename + ".sym");
             byte[] globalSym = symFile.exists() ? Files.readAllBytes(symFile.toPath()) : new byte[0];
-            if (globalSym.length == 0) return null;
+            if (globalSym.length == 0) {
+                System.err.println("  Warning: jbig2enc produced no symbol dictionary"
+                        + " — using CCITT G4 fallback.");
+                return null;
+            }
 
             // Read per-page data (jbig2enc -p writes <basename>.0000, .0001, ...)
             List<CompressionResult> pages = new ArrayList<>(pageCount);
@@ -160,30 +245,67 @@ public class JBIG2Compressor {
                 return compressWithJbig2enc(jbig2enc, foregroundMask);
             } catch (IOException e) {
                 // jbig2enc failed → fall through to fallback
+                System.err.println("  Warning: jbig2enc failed (" + e.getMessage()
+                        + ") — using CCITT G4 fallback.");
             }
         }
         return compressWithFallback(foregroundMask);
     }
 
     /**
-     * Locates the jbig2enc binary for the current OS.
+     * Formats a failed run's stderr for a one-line warning: empty when there was
+     * none, otherwise the first line (a jbig2enc failure can be verbose).
+     */
+    private static String formatStderr(SubprocessRunner.Result result) {
+        String err = result.getStderrString().trim();
+        if (err.isEmpty()) return "";
+        int nl = err.indexOf('\n');
+        if (nl >= 0) err = err.substring(0, nl) + " ...";
+        return ": " + err;
+    }
+
+    /**
+     * Locates the jbig2enc binary for the current OS and architecture.
      *
-     * Searches deps/jbig2enc/{os}/jbig2enc (or jbig2enc.exe on Windows).
-     * The base path can be overridden via system property "mrcpdf.native.dir"
-     * (defaults to "native").
+     * Search order:
+     *   1. System property "mrcpdf.jbig2enc.binary" (full path to a custom binary).
+     *   2. {nativeDir}/{os}-{arch}/jbig2enc (e.g. linux-arm64, mac-arm64).
+     *   3. {nativeDir}/{os}/jbig2enc (legacy single-arch layout).
+     * On Windows the binary name is "jbig2enc.exe".
      *
      * @return The executable File, or null if not found.
      */
     private File findJbig2enc() {
-        Os os = PlatformUtils.detectOs();
-        String dirName;
-        switch (os) {
-            case WINDOWS: dirName = "win"; break;
-            case MAC: dirName = "mac"; break;
-            default: dirName = "linux";
+        String custom = System.getProperty("mrcpdf.jbig2enc.binary");
+        if (custom != null && !custom.isEmpty()) {
+            File f = new File(custom);
+            if (f.canExecute()) return f;
         }
-        File exe = new File(nativeDir + "/" + dirName, os == Os.WINDOWS ? "jbig2enc.exe" : "jbig2enc");
+
+        Os os = PlatformUtils.detectOs();
+        Arch arch = PlatformUtils.detectArch();
+        String osName;
+        switch (os) {
+            case WINDOWS: osName = "win"; break;
+            case MAC: osName = "mac"; break;
+            default: osName = "linux";
+        }
+        String archName;
+        switch (arch) {
+            case AARCH64: archName = "arm64"; break;
+            default: archName = "x64";
+        }
+        String exeName = (os == Os.WINDOWS) ? "jbig2enc.exe" : "jbig2enc";
+
+        File exe = new File(nativeDir + "/" + osName + "-" + archName, exeName);
         if (exe.canExecute()) return exe;
+        exe = new File(nativeDir + "/" + osName, exeName);
+        if (exe.canExecute()) return exe;
+
+        System.out.println(
+            "  Warning: jbig2enc not found for " + osName + "-" + archName
+                + " — using CCITT G4 fallback. Install jbig2enc or set"
+                + " -Dmrcpdf.jbig2enc.binary=<path>.");
         return null;
     }
 
@@ -216,7 +338,7 @@ public class JBIG2Compressor {
             args.add(prefix);
             args.add(tempBmp.getAbsolutePath());
 
-            SubprocessRunner.Result result = SubprocessRunner.run(jbig2enc, args, -1);
+            SubprocessRunner.Result result = SubprocessRunner.run(jbig2enc, args, resolveTimeoutMs());
             if (result.getExitCode() != 0) {
                 throw new IOException("jbig2enc failed: " + result.getStderrString());
             }

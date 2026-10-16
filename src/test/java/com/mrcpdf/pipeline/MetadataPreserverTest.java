@@ -9,6 +9,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.zip.InflaterInputStream;
 import java.util.stream.StreamSupport;
 
@@ -16,9 +18,12 @@ import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentNameDictionary;
 import org.apache.pdfbox.pdmodel.PDEmbeddedFilesNameTreeNode;
+import org.apache.pdfbox.pdmodel.PDDestinationNameTreeNode;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.interactive.annotation.PDAnnotationLink;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitDestination;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
 import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode;
@@ -229,6 +234,171 @@ class MetadataPreserverTest {
             assertEquals(0, result.outlines());
             assertEquals(0, result.annotations());
             assertEquals(0, result.embeddedFiles());
+            assertEquals(0, result.droppedNamedDests(),
+                "a document with no name tree drops nothing");
         }
+    }
+
+    /**
+     * Named destinations are not carried over. Copying the tree verbatim would
+     * be worse than dropping it -- the page references stop resolving once pages
+     * are rebuilt -- so the loss is counted and reported rather than silent.
+     */
+    @Test
+    void preserve_countsDroppedNamedDests() throws IOException {
+        try (PDDocument source = new PDDocument()) {
+            source.addPage(new PDPage());
+            PDDocumentNameDictionary names = new PDDocumentNameDictionary(source.getDocumentCatalog());
+            source.getDocumentCatalog().setNames(names);
+            PDDestinationNameTreeNode dests = new PDDestinationNameTreeNode();
+            dests.setNames(Map.of(
+                "chapter1", new PDPageFitDestination(),
+                "chapter2", new PDPageFitDestination()));
+            names.setDests(dests);
+
+            try (PDDocument output = blankOutputFor(source)) {
+                var result = preserver.preserve(source, output, allPages(output));
+                assertEquals(2, result.droppedNamedDests(),
+                    "both named destinations should be counted as dropped");
+            }
+        }
+    }
+
+    @Test
+    void preserve_namedDestsAreNotCopiedIntoOutput() throws IOException {
+        try (PDDocument source = new PDDocument()) {
+            source.addPage(new PDPage());
+            PDDocumentNameDictionary names = new PDDocumentNameDictionary(source.getDocumentCatalog());
+            source.getDocumentCatalog().setNames(names);
+            PDDestinationNameTreeNode dests = new PDDestinationNameTreeNode();
+            dests.setNames(Map.of("chapter1", new PDPageFitDestination()));
+            names.setDests(dests);
+
+            try (PDDocument output = blankOutputFor(source)) {
+                preserver.preserve(source, output, allPages(output));
+                PDDocumentNameDictionary outNames = output.getDocumentCatalog().getNames();
+                // Either no name dictionary at all, or one without a Dests tree.
+                // An unresolved /Names/Dests is worse than none: the link fails
+                // at click time with nothing to indicate why.
+                assertTrue(outNames == null || outNames.getDests() == null,
+                    "/Names/Dests must not be carried over unresolved");
+            }
+        }
+    }
+
+    /**
+     * A11: annotations are copied with their source /Rect, which is specified in
+     * the source page's default user space BEFORE rotation and relative to the
+     * crop box lower-left.  The output page is the rendered (rotated) page in a
+     * fresh, un-rotated, zero-origin user space, so the rect must be transformed
+     * through the same mapping PDFBox applies to the page content — otherwise
+     * link targets and highlights land on the wrong part of the page.
+     */
+    @Test
+    void preserve_remapsAnnotationGeometryForRotatedCropbox() throws IOException {
+        // Crop box offset from the page origin (llx=40, lly=60) and 90-degree
+        // rotation, so a wrongly-flipped transform fails loudly.
+        PDDocument source = new PDDocument();
+        PDPage srcPage = new PDPage(new PDRectangle(0, 0, 612, 792));
+        srcPage.setCropBox(new PDRectangle(40, 60, 300, 500));
+        srcPage.setRotation(90);
+        PDAnnotationLink link = new PDAnnotationLink();
+        link.setRectangle(new PDRectangle(100, 120, 50, 30)); // x0=100,y0=120,x1=150,y1=150 (page space)
+        srcPage.getAnnotations().add(link);
+        source.addPage(srcPage);
+
+        try (source; PDDocument output = outputFor(source)) {
+            preserver.preserve(source, output, allPages(output));
+
+            PDRectangle out = output.getPage(0).getAnnotations().get(0).getRectangle();
+            // R=90: out_x = (lly + H) - y, out_y = (llx + W) - x, on a page
+            // (W=300, H=500).
+            // (100,120) -> (60+500-120, 40+300-100) = (440, 240)
+            // (150,150) -> (60+500-150, 40+300-150) = (410, 190)
+            assertEquals(410f, out.getLowerLeftX(), 0.5f, "R=90 rect x0 — swapped axis");
+            assertEquals(190f, out.getLowerLeftY(), 0.5f, "R=90 rect y0");
+            assertEquals(440f, out.getUpperRightX(), 0.5f, "R=90 rect x1");
+            assertEquals(240f, out.getUpperRightY(), 0.5f, "R=90 rect y1");
+        }
+    }
+
+    /**
+     * A11, un-rotated page with an offset crop box: only the origin translation
+     * and the device y-flip apply (out_y = (lly + H) - y).
+     */
+    @Test
+    void preserve_remapsAnnotationGeometryForOffsetCropbox() throws IOException {
+        PDDocument source = new PDDocument();
+        PDPage srcPage = new PDPage(new PDRectangle(0, 0, 612, 792));
+        srcPage.setCropBox(new PDRectangle(40, 60, 300, 500));
+        PDAnnotationLink link = new PDAnnotationLink();
+        link.setRectangle(new PDRectangle(100, 120, 50, 30));
+        srcPage.getAnnotations().add(link);
+        source.addPage(srcPage);
+
+        try (source; PDDocument output = outputFor(source)) {
+            preserver.preserve(source, output, allPages(output));
+
+            PDRectangle out = output.getPage(0).getAnnotations().get(0).getRectangle();
+            // R=0: out_x = x - llx = 100-40 = 60; out_y = (lly+H) - y.
+            // (100,120) -> (60, 560-120) = (60,440); (150,150) -> (110, 410).
+            assertEquals(60f, out.getLowerLeftX(), 0.5f, "R=0 rect x0 — cropbox origin");
+            assertEquals(410f, out.getLowerLeftY(), 0.5f, "R=0 rect y0 — y-flip");
+            assertEquals(110f, out.getUpperRightX(), 0.5f, "R=0 rect x1");
+            assertEquals(440f, out.getUpperRightY(), 0.5f, "R=0 rect y1");
+        }
+    }
+
+    /**
+     * P0 regression: pass-through pages (imported verbatim from the source)
+     * keep the source page's geometry — MediaBox/CropBox origin and /Rotate are
+     * copied by {@code output.importPage}, so an annotation /Rect written in the
+     * source's user space is already correct in the output.  The A11 geometry
+     * remap applies the page-to-output transform a second time and was corrupting
+     * these pages.  Pass-through pages must keep the /Rect (and quads) untouched.
+     */
+    @Test
+    void preserve_keepsAnnotationGeometryOnPassThroughPages() throws IOException {
+        PDDocument source = new PDDocument();
+        PDPage srcPage = new PDPage(new PDRectangle(0, 0, 612, 792));
+        srcPage.setCropBox(new PDRectangle(40, 60, 300, 500));
+        srcPage.setRotation(90);
+        PDAnnotationLink link = new PDAnnotationLink();
+        link.setRectangle(new PDRectangle(100, 120, 50, 30));
+        srcPage.getAnnotations().add(link);
+        source.addPage(srcPage);
+
+        try (source; PDDocument output = new PDDocument()) {
+            // ImportOriginalPage's mechanism: the output page is the source page
+            // shallow-copied, so its user space is unchanged.
+            PDPage imported = output.importPage(srcPage);
+            preserver.preserve(source, output, List.of(imported), Set.of(imported));
+
+            PDRectangle out = output.getPage(0).getAnnotations().get(0).getRectangle();
+            // Pass-through: geometry must be preserved verbatim, NOT remapped
+            // to (410,190,440,240) like a rebuilt page would be.
+            assertEquals(100f, out.getLowerLeftX(), 0.5f, "pass-through rect x0 — untouched");
+            assertEquals(120f, out.getLowerLeftY(), 0.5f, "pass-through rect y0");
+            assertEquals(150f, out.getUpperRightX(), 0.5f, "pass-through rect x1");
+            assertEquals(150f, out.getUpperRightY(), 0.5f, "pass-through rect y1");
+        }
+    }
+
+    /**
+     * Output document whose pages mirror the pipeline's: crop-box dimensions,
+     * width/height swapped for 90/270 rotations, un-rotated.
+     */
+    private static PDDocument outputFor(PDDocument source) {
+        PDDocument output = new PDDocument();
+        for (int i = 0; i < source.getNumberOfPages(); i++) {
+            PDPage src = source.getPage(i);
+            PDRectangle cb = src.getCropBox();
+            if (src.getRotation() % 180 != 0) {
+                output.addPage(new PDPage(new PDRectangle(cb.getHeight(), cb.getWidth())));
+            } else {
+                output.addPage(new PDPage(new PDRectangle(cb.getWidth(), cb.getHeight())));
+            }
+        }
+        return output;
     }
 }

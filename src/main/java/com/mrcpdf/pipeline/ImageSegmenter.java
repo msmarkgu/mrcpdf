@@ -28,6 +28,16 @@ public class ImageSegmenter {
     // 0 disables that filter.
     private final double maxComponentArea; // fraction of page area
     private final double maxComponentDim;  // fraction of the larger page dimension
+    // Oversized components escape the drop when they are line-work rather than
+    // blobs: either thin-and-widened (rules, underlines, column dividers) or
+    // sparse in their bbox (hollow table borders, outlines). Photos, logos and
+    // solid display blocks still get dropped. These are in mask pixels at the
+    // rendering DPI, but are only consulted for components already flagged
+    // oversized by maxComponentArea/maxComponentDim, so they bound line-work
+    // that would otherwise be softened by the downsampled background.
+    static final int LINE_LIKE_MAX_THIN_PX = 48;
+    static final double LINE_LIKE_MIN_ASPECT = 5.0;
+    static final double SPARSE_MAX_FILL = 0.25;
 
     public ImageSegmenter() {
         this(64, 0.95, 0);
@@ -92,7 +102,9 @@ public class ImageSegmenter {
      *      the "otsu" threshold mode.
      *   4. Drop oversized connected components (photos, logos, halftones) from
      *      the mask so they stay in the color background instead of polluting
-     *      the JBIG2 dictionary (filterLargeComponents).
+     *      the JBIG2 dictionary (filterLargeComponents). Thin line-work stays:
+     *      rules, underlines and hollow borders are real document elements and
+     *      belong in the sharp foreground mask, not the downsampled background.
      *   5. Build a binary TYPE_BYTE_BINARY foreground mask: black where the
      *      pixel is foreground (text), white elsewhere. This mask becomes the
      *      JBIG2-compressed foreground layer in the output PDF.
@@ -123,7 +135,7 @@ public class ImageSegmenter {
         if ("otsu".equals(thresholdMode)) {
             int threshold = otsuThreshold(bgNormalized);
             for (int i = 0; i < binary.length; i++) {
-                binary[i] = (gray[i] <= threshold) ? 1 : 0;
+                binary[i] = (bgNormalized[i] <= threshold) ? 1 : 0;
             }
         } else {
             int[] thresholds = sauvolaThreshold(bgNormalized, width, height, sauvolaWindow, sauvolaK, sauvolaR);
@@ -151,31 +163,9 @@ public class ImageSegmenter {
         return new SegmentedImage(foregroundMask, cleanedBackground);
     }
 
-    /**
-     * Converts a flat ARGB int array to a grayscale int array (0 = black, 255 = white)
-     * using ITU-R BT.601 luma with integer arithmetic.
-     *
-     * Integer coefficients (scaled by 256):
-     *   0.299 * 256 ≈ 77
-     *   0.587 * 256 ≈ 150
-     *   0.114 * 256 ≈ 29
-     *   Sum: 77 + 150 + 29 = 256 (exact), so (R=G=B) maps to itself.
-     *
-     * Bit shifts in RGB extraction:
-     *   (rgb >> 16) & 0xFF  — extract the red  byte (bits 16-23 of 0xAARRGGBB)
-     *   (rgb >>  8) & 0xFF  — extract the green byte (bits  8-15)
-     *   rgb        & 0xFF  — extract the blue byte (bits  0-7)
-     */
+    /** Delegates to {@link com.mrcpdf.util.ImageOps#toGrayscale(int[])}. */
     private int[] toGrayscale(int[] rgba) {
-        int[] gray = new int[rgba.length];
-        for (int i = 0; i < rgba.length; i++) {
-            int rgb = rgba[i];
-            int r = (rgb >> 16) & 0xFF;
-            int g = (rgb >> 8) & 0xFF;
-            int b = rgb & 0xFF;
-            gray[i] = (77 * r + 150 * g + 29 * b) >> 8;
-        }
-        return gray;
+        return com.mrcpdf.util.ImageOps.toGrayscale(rgba);
     }
 
     /**
@@ -313,39 +303,7 @@ public class ImageSegmenter {
      *     uses them as the product to give heavier weight to balanced splits.
      */
     private int otsuThreshold(int[] pixels) {
-        int[] histogram = new int[256];
-        for (int p : pixels) {
-            histogram[p]++;
-        }
-
-        int total = pixels.length;
-        double sum = 0;
-        for (int i = 0; i < 256; i++) {
-            sum += (double) i * histogram[i];
-        }
-
-        double sumB = 0;
-        int wB = 0;
-        double maxVariance = 0;
-        int threshold = 0;
-
-        for (int i = 0; i < 256; i++) {
-            wB += histogram[i];
-            if (wB == 0) continue;
-            int wF = total - wB;
-            if (wF == 0) break;
-
-            sumB += (double) i * histogram[i];
-            double meanB = sumB / wB;
-            double meanF = (sum - sumB) / wF;
-            double variance = (double) wB * wF * (meanB - meanF) * (meanB - meanF);
-
-            if (variance > maxVariance) {
-                maxVariance = variance;
-                threshold = i;
-            }
-        }
-        return threshold;
+        return com.mrcpdf.util.ImageOps.otsuStats(pixels).threshold();
     }
 
     /**
@@ -420,6 +378,13 @@ public class ImageSegmenter {
      * {@code maxComponentDim} (a fraction of the larger page dimension). Setting
      * either limit to 0 disables that criterion.
      *
+     * An oversized component is kept when it is line-work: line-like (a hairline
+     * bbox, {@code LINE_LIKE_MAX_THIN_PX} by {@code LINE_LIKE_MIN_ASPECT}) or
+     * sparse in its bbox ({@code SPARSE_MAX_FILL}). Rules, underlines, column
+     * dividers and hollow table borders thereby stay sharp in the foreground
+     * mask instead of being softened by the downsampled background; solid
+     * photos/logos and display-type blobs still drop.
+     *
      * Implementation: single-pass union-find labeling (8-connectivity) with one
      * int array (negative root size), then per-root area/bbox accumulation.
      */
@@ -478,7 +443,16 @@ public class ImageSegmenter {
             int compW = (int) (acc[3] - acc[1] + 1);
             int compH = (int) (acc[4] - acc[2] + 1);
             if (acc[0] > maxAreaPx || Math.max(compW, compH) > maxDimPx) {
-                drop[dropCount++] = e.getKey();
+                // Drop oversized components — unless they are thin line-work
+                // (rules/underlines/dividers) or sparse in their bbox (hollow
+                // borders/outlines), which belong in the sharp foreground mask.
+                int thinSide = Math.min(compW, compH);
+                boolean lineLike = thinSide <= LINE_LIKE_MAX_THIN_PX
+                        && (long) thinSide * (long) LINE_LIKE_MIN_ASPECT <= (long) Math.max(compW, compH);
+                boolean sparse = (double) acc[0] / ((long) compW * compH) <= SPARSE_MAX_FILL;
+                if (!lineLike && !sparse) {
+                    drop[dropCount++] = e.getKey();
+                }
             }
         }
         if (dropCount == 0) return;

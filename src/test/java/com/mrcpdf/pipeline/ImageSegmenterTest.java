@@ -6,33 +6,40 @@ import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
 
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.rendering.PDFRenderer;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import com.mrcpdf.model.SegmentedImage;
 
-    /**
-     * Tests for ImageSegmenter (pure-Java binarization pipeline).
-     *
-     * Verifies that segment() returns non-null outputs, preserves dimensions,
-     * produces a foreground mask, correctly identifies text vs blank pages,
-     * and inpaints foreground pixels in the cleaned background.
-     */
+/**
+ * Tests for ImageSegmenter (pure-Java binarization pipeline).
+ *
+ * Verifies that segment() returns non-null outputs, preserves dimensions,
+ * produces a foreground mask, correctly identifies text vs blank pages,
+ * and inpaints foreground pixels in the cleaned background.
+ */
 class ImageSegmenterTest {
 
-    static PageExtractor extractor;
     static ImageSegmenter segmenter;
 
     @BeforeAll
     static void setup() {
-        extractor = new PageExtractor(150f);
         segmenter = new ImageSegmenter();
+    }
+
+    private static BufferedImage renderPage(String pdfPath) throws IOException {
+        try (PDDocument doc = Loader.loadPDF(new File(pdfPath))) {
+            return new PDFRenderer(doc).renderImageWithDPI(0, 150);
+        }
     }
 
     @Test
     void segment_blankPage_returnsNonNull() throws IOException {
-        var pages = extractor.extractPages(new File("tests/blank.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/blank.pdf");
+        SegmentedImage result = segmenter.segment(page);
         assertNotNull(result);
         assertNotNull(result.getForegroundMask());
         assertNotNull(result.getCleanedBackground());
@@ -40,8 +47,7 @@ class ImageSegmenterTest {
 
     @Test
     void segment_preservesDimensions() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        BufferedImage page = pages.get(0);
+        BufferedImage page = renderPage("tests/simple-text.pdf");
         SegmentedImage result = segmenter.segment(page);
         assertEquals(page.getWidth(), result.getForegroundMask().getWidth());
         assertEquals(page.getHeight(), result.getForegroundMask().getHeight());
@@ -51,16 +57,16 @@ class ImageSegmenterTest {
 
     @Test
     void segment_foregroundMaskIsBinary() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/simple-text.pdf");
+        SegmentedImage result = segmenter.segment(page);
         BufferedImage mask = result.getForegroundMask();
         assertEquals(BufferedImage.TYPE_BYTE_BINARY, mask.getType());
     }
 
     @Test
     void segment_blankPage_hasLittleForeground() throws IOException {
-        var pages = extractor.extractPages(new File("tests/blank.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/blank.pdf");
+        SegmentedImage result = segmenter.segment(page);
         BufferedImage mask = result.getForegroundMask();
         int width = mask.getWidth();
         int height = mask.getHeight();
@@ -80,8 +86,8 @@ class ImageSegmenterTest {
 
     @Test
     void segment_simpleText_hasForegroundPixels() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        SegmentedImage result = segmenter.segment(pages.get(0));
+        BufferedImage page = renderPage("tests/simple-text.pdf");
+        SegmentedImage result = segmenter.segment(page);
         BufferedImage mask = result.getForegroundMask();
         int width = mask.getWidth();
         int height = mask.getHeight();
@@ -101,8 +107,7 @@ class ImageSegmenterTest {
 
     @Test
     void segment_cleanedBackground_reducesTextNoise() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
-        BufferedImage page = pages.get(0);
+        BufferedImage page = renderPage("tests/simple-text.pdf");
         SegmentedImage result = segmenter.segment(page);
         BufferedImage cleaned = result.getCleanedBackground();
 
@@ -132,13 +137,13 @@ class ImageSegmenterTest {
 
     @Test
     void otsuMode_remainsFunctional() throws IOException {
-        var pages = extractor.extractPages(new File("tests/simple-text.pdf"));
+        BufferedImage page = renderPage("tests/simple-text.pdf");
         ImageSegmenter otsu = new ImageSegmenter(64, 0.95, 0, "otsu", 15, 0.20, 128, 0.005, 0.10);
-        SegmentedImage result = otsu.segment(pages.get(0));
+        SegmentedImage result = otsu.segment(page);
 
         assertEquals(BufferedImage.TYPE_BYTE_BINARY, result.getForegroundMask().getType());
         int blackPixels = countBlackPixels(result.getForegroundMask());
-        assertTrue((double) blackPixels / (pages.get(0).getWidth() * pages.get(0).getHeight()) > 0.001,
+        assertTrue((double) blackPixels / (page.getWidth() * page.getHeight()) > 0.001,
                 "Otsu mode should still detect text as foreground");
     }
 
@@ -166,6 +171,55 @@ class ImageSegmenterTest {
         // Interior of the large rectangle is background (white in mask)
         assertEquals(0x00FFFFFF, mask.getRGB(120, 90) & 0xFFFFFF,
                 "oversized dark region should be dropped from the foreground mask");
+    }
+
+    /**
+     * A thin full-width rule (an underline) exceeds the dimension cutoff but has
+     * a tiny area.  It must stay in the foreground mask: line-work is a real
+     * document element, not a picture, so it must not be softened by falling
+     * into the downsampled background.
+     */
+    @Test
+    void thinWideRule_survivesDimDrop() {
+        // 200x200 page, dimensions round to maxDimPx=60 and maxAreaPx=4000 at
+        // (0.10, 0.30): the 190x3 bar has area 570 < 4000 but width 190 > 60.
+        int w = 200, h = 200;
+        BufferedImage page = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = page.createGraphics();
+        g.setColor(java.awt.Color.LIGHT_GRAY);
+        g.fillRect(0, 0, w, h);
+        g.setColor(java.awt.Color.BLACK);
+        g.fillRect(5, 95, 190, 3);         // full-width underline
+        g.dispose();
+
+        ImageSegmenter segmenter = new ImageSegmenter(64, 0.95, 0, "sauvola", 15, 0.20, 128, 0.10, 0.30);
+        BufferedImage mask = segmenter.segment(page).getForegroundMask();
+
+        assertEquals(0x00000000, mask.getRGB(100, 96) & 0xFFFFFF,
+                "thin full-width rule must stay in the foreground mask");
+    }
+
+    /**
+     * A hollow box (a table border) is a sparse component: tiny area relative to
+     * its bbox, so it is perimeter line-work, not a filled picture.  It must be
+     * kept, not dropped into the downsampled background.
+     */
+    @Test
+    void hollowBoxOutline_survivesDimDrop() {
+        int w = 200, h = 200;
+        BufferedImage page = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = page.createGraphics();
+        g.setColor(java.awt.Color.LIGHT_GRAY);
+        g.fillRect(0, 0, w, h);
+        g.setColor(java.awt.Color.BLACK);
+        g.drawRect(25, 25, 150, 150);      // hollow table border
+        g.dispose();
+
+        ImageSegmenter segmenter = new ImageSegmenter(64, 0.95, 0, "sauvola", 15, 0.20, 128, 0.10, 0.30);
+        BufferedImage mask = segmenter.segment(page).getForegroundMask();
+
+        assertEquals(0x00000000, mask.getRGB(25, 25) & 0xFFFFFF,
+                "hollow box outline must stay in the foreground mask");
     }
 
     @Test

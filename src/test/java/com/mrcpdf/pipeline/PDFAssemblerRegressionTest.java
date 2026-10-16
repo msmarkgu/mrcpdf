@@ -1,5 +1,7 @@
 package com.mrcpdf.pipeline;
 
+import java.awt.Color;
+import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.io.File;
@@ -19,11 +21,15 @@ import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.apache.pdfbox.pdmodel.graphics.PDXObject;
 import org.apache.pdfbox.pdmodel.graphics.color.PDOutputIntent;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.rendering.PDFRenderer;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -751,7 +757,14 @@ class PDFAssemblerRegressionTest {
         List<TextBlock> blocks = Collections.singletonList(
             new TextBlock("Test", new Rectangle(10, 10, 100, 40), 0.95));
         PageResult ocr = new PageResult(1, imgW, imgH, blocks);
+        // A colored background: this test is about the chroma sampling of the
+        // 3-component path, so the source must not be neutral (a neutral
+        // background is now encoded as a 1-component JPEG).
         BufferedImage bg = new BufferedImage(imgW, imgH, BufferedImage.TYPE_3BYTE_BGR);
+        Graphics2D bgG = bg.createGraphics();
+        bgG.setColor(new Color(180, 150, 120));
+        bgG.fillRect(0, 0, imgW, imgH);
+        bgG.dispose();
         BufferedImage fgMask = new BufferedImage(imgW, imgH, BufferedImage.TYPE_BYTE_BINARY);
         List<BufferedImage> masks = Collections.singletonList(fgMask);
 
@@ -1138,6 +1151,88 @@ class PDFAssemblerRegressionTest {
             int textPixel = rendered.getRGB(100, 200);
             int textR = (textPixel >> 16) & 0xFF;
             assertTrue(textR < 64, "Disabled fg-color should render black stencil text (R=" + textR + ")");
+        }
+    }
+
+    /**
+     * A page that inherits its {@code /Resources} from the {@code /Pages} parent
+     * owns no such entry of its own, so {@link PDDocument#importPage} -- a
+     * shallow copy of the page dictionary -- brings nothing across and the
+     * imported content stream names fonts nothing resolves. {@link
+     * PDFAssembler#importOriginalPage} puts them back; this pins that, because
+     * no shipped fixture inherits its resources and the pass-through path would
+     * otherwise fail only on documents nobody here has opened.
+     */
+    @Test
+    void importOriginalPage_restoresInheritedResources() throws IOException {
+        File source = new File(tempDir, "inherited-resources.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(PAGE_W, PAGE_H));
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.beginText();
+                cs.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 12);
+                cs.newLineAtOffset(40, PAGE_H - 60);
+                cs.showText("Inherited resources survive the import.");
+                cs.endText();
+            }
+            PDResources resources = page.getResources();
+            COSDictionary pages = doc.getDocumentCatalog().getPages().getCOSObject();
+            pages.setItem(COSName.RESOURCES, resources.getCOSObject());
+            page.getCOSObject().removeItem(COSName.RESOURCES);
+            doc.save(source);
+        }
+
+        File imported = new File(tempDir, "inherited-resources-out.pdf");
+        PDFAssembler assembler = new PDFAssembler();
+        try (PDDocument sourceDoc = Loader.loadPDF(source);
+             PDDocument output = new PDDocument()) {
+            assertNull(sourceDoc.getPage(0).getCOSObject().getItem(COSName.RESOURCES),
+                    "the fixture must rely on inheritance");
+            assertNotNull(sourceDoc.getPage(0).getResources(),
+                    "PDFBox must still resolve them through the parent");
+            assembler.importOriginalPage(output, sourceDoc, 0);
+            output.save(imported);
+        }
+
+        try (PDDocument output = Loader.loadPDF(imported)) {
+            assertNotNull(output.getPage(0).getCOSObject().getItem(COSName.RESOURCES),
+                    "the imported page must carry its own /Resources now");
+            String text = new PDFTextStripper().getText(output);
+            assertTrue(text.contains("Inherited resources"),
+                    "the imported page's text must still resolve (got: "
+                            + text.trim() + ")");
+        }
+    }
+
+    /**
+     * A6 regression: an empty JBIG2 page stream (or empty globals) would be
+     * wrapped into a corrupt PDF image object — viewers have nothing to decode.
+     * addPageJbig2 must reject the data up front.
+     */
+    @Test
+    void addPageJbig2_rejectsEmptyPageData() throws IOException {
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(new byte[0], new byte[]{0x01}, "empty page data"));
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(null, new byte[]{0x01}, "null page data"));
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(new byte[]{0x01}, new byte[0], "empty globals"));
+        assertThrows(IllegalArgumentException.class,
+                () -> addPageJbig2WithData(new byte[]{0x01}, null, "null globals"));
+    }
+
+    private void addPageJbig2WithData(byte[] pageData, byte[] globals, String label)
+            throws IOException {
+        File source = createSourcePdf();
+        BufferedImage bg = new BufferedImage(PAGE_W, PAGE_H, BufferedImage.TYPE_BYTE_GRAY);
+        PageResult ocr = new PageResult(1, PAGE_W, PAGE_H, new ArrayList<>());
+        PDFAssembler assembler = new PDFAssembler();
+        try (PDDocument sourceDoc = Loader.loadPDF(source);
+             PDDocument output = new PDDocument()) {
+            assembler.addPageJbig2(output, sourceDoc, 0,
+                    ImageEncoder.encodeBackground(bg, 0.8f, true, 0.5f, 0f), null,
+                    pageData, globals, PAGE_W / 2, PAGE_H / 2, ocr);
         }
     }
 }

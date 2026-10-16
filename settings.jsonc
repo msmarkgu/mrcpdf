@@ -60,11 +60,45 @@
     // DPI (e.g. 600) each page needs ~1 GB, so cap this and raise the JVM heap.
     "pipeline.maxThreads": 0,
 
+    // ===== Origin =====
+    // Pass digital-native pages through unchanged: a page with no page-filling
+    // raster on it is carried into the output exactly as it came in -- no
+    // render, no segmentation, no re-encoded text layer.
+    //   true  = native pages are imported untouched (default)
+    //   false = every page is rendered and rebuilt, native or not
+    // Independent of pipeline.mrc.enabled: it applies with MRC off and under
+    // PDF/A as well.  Override via --no-pass-through / --pass-through.
+    "pipeline.origin.passThrough": true,
+
     // ===== MRC =====
     // Enable Mixed Raster Content compression.
     //   true  = segment background (JPEG) + foreground (JBIG2) + text layer
     //   false = original images (JPEG) + text layer only (no MRC compression)
+    // Digital-native pass-through (pipeline.origin.passThrough) still applies
+    // when this is false.
     "pipeline.mrc.enabled": true,
+
+    // Per-page text-quality gate (only applies when MRC is enabled).
+    // Each page is scored by TextQualityScorer; pages scoring below the
+    // threshold keep the fidelity-preserving path (full-resolution original
+    // image, no JBIG2 mask) because MRC would degrade their text.
+    //   false = compress every page with MRC, ignore the score
+    "pipeline.quality.gateEnabled": true,
+
+    // Composite text-quality threshold in [0, 1] (higher = better).
+    // Pages scoring below this value skip MRC. 0.5 is a provisional Phase-1
+    // default; clean pages score well above it, blank/degraded pages below.
+    "pipeline.quality.threshold": 0.5,
+
+    // Per-page gate model: when true (and the bundled quality-image-screen.json
+    // artifact is present) the worker's skip decision uses the 11-feature image
+    // screen's logistic score instead of the geometric composite threshold
+    // above. The artifact's polarity is flipped on load, so the score it
+    // exposes is p(not good) and the threshold reads as "skip when
+    // p(not good) >= 0.30". The geometric threshold remains the fallback
+    // when no artifact is available. quality-model.json is the superseded
+    // research gate and is no longer loaded.
+    "pipeline.quality.model.enabled": true,
 
     // Background downscale factor for MRC (0.1 - 1.0).
     //   0.33 = 3x downsampling (e.g., 300 DPI → ~100 DPI background)
@@ -95,8 +129,9 @@
     // True MRC foreground color plane: the binary mask becomes a soft mask
     // (SMask) over a downsampled copy of the original page, so text pixels keep
     // their original color instead of flat black.
-    //   false = black stencil (default, smaller, PDF/A compatible)
-    //   true  = color text (soft masks are NOT allowed in PDF/A-2b)
+    //   false = black stencil (default, smaller)
+    //   true  = color text (PDF/A-2b permits soft masks; conformance of the
+    //           resulting file is not independently verified)
     // Override via --fg-color CLI flag.
     "pipeline.mrc.foregroundColor": false,
 
@@ -112,9 +147,18 @@
 
     // ===== JBIG2 Compression =====
     // Flags passed to the jbig2enc binary.
-    //   -p = global symbol dictionary
-    //   -s = refine smearing
+    //   -p = produce PDF-ready data (writes the shared global symbol dictionary)
+    //   -s = use text region, not generic coder (symbol-mode matching)
+    // Refinement (-r, lossless, requires -s) is deliberately not passed: the
+    // docs claim "visually lossless, not bit-identical", which is what the
+    // lossy default threshold produces.
     "jbig2enc.flags": "-p -s",
+
+    // Wall-clock limit for one jbig2enc run, in milliseconds.
+    // A pathological document must not be able to hang the batch forever; when
+    // the limit trips, the page falls back to CCITT G4.
+    //   300000 = 5 minutes (default)
+    "jbig2enc.timeoutMs": 300000,
 
     // ===== PDF/A =====
     // Enable PDF/A-2b output (adds XMP metadata, sRGB OutputIntent).
