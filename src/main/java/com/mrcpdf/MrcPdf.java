@@ -121,6 +121,12 @@ public class MrcPdf implements Callable<Integer> {
     @Option(names = {"--ignore-encryption"}, description = "Proceed on a permission-restricted (owner-password) PDF whose restrictions would be dropped, since mrcpdf output is never re-encrypted (default: off)")
     private Boolean ignoreEncryption;
 
+    @Option(names = {"--max-pages"}, description = "Refuse documents longer than this many pages (0 = no limit). Memory use grows with the document.")
+    private Integer maxPages;
+
+    @Option(names = {"--max-dpi"}, description = "Refuse a render DPI above this (0 = no limit). Raster area grows with the square of DPI, so a high value is the usual cause of an out-of-memory failure.")
+    private Integer maxDpi;
+
     @Override
     public Integer call() {
         Settings settings = Settings.load();
@@ -321,6 +327,19 @@ public class MrcPdf implements Callable<Integer> {
 
             PDFRenderer renderer = new PDFRenderer(source);
             int pageCount = source.getNumberOfPages();
+
+            // Refuse oversized inputs before rendering anything: dying with an
+            // OutOfMemoryError twenty minutes in is worse than being told now.
+            String pageLimit = pageLimitNotice(pageCount, maxPages != null ? maxPages : 0);
+            if (pageLimit != null) {
+                System.err.println(pageLimit);
+                throw new AbortRunException();
+            }
+            String dpiLimit = dpiLimitNotice(dpi, maxDpi != null ? maxDpi : 0);
+            if (dpiLimit != null) {
+                System.err.println(dpiLimit);
+                throw new AbortRunException();
+            }
             int srcWords = countWords(source);
             System.out.println("  Pages:  " + pageCount);
             if (srcWords > 0) {
@@ -899,6 +918,46 @@ public class MrcPdf implements Callable<Integer> {
                 ? " --keep-smaller-only is set, so the original bytes were kept instead."
                 : " The source is probably already well compressed (e.g. a bilevel"
                   + " CCITT scan). Pass --keep-smaller-only to never enlarge a file.");
+    }
+
+    /**
+     * Refuses a document longer than the caller's ceiling.
+     *
+     * <p>Heap use is O(document): backgrounds, JBIG2 streams and word lists all
+     * accumulate, and the output document is built in full before any byte is
+     * written. An unbounded page count has no defined behaviour past exhaustion.
+     *
+     * @return the refusal, or {@code null} if within the limit or unlimited
+     */
+    static String pageLimitNotice(int pageCount, int maxPages) {
+        if (maxPages <= 0) return null;
+        if (pageCount <= maxPages) return null;
+        return "  Error: the input has " + pageCount + " pages, over the --max-pages"
+            + " limit of " + maxPages + ". Memory use grows with the document, so a"
+            + " run this long is likely to exhaust the heap.\n"
+            + "         Split the document, or raise the limit with"
+            + " --max-pages " + pageCount + " if you have the memory for it.";
+    }
+
+    /**
+     * Refuses a render resolution above the caller's ceiling.
+     *
+     * <p>Raster area scales with the square of DPI, so {@code --dpi 1200} on
+     * letter is 4x the pixels of the 300 DPI default — enough to run the heap
+     * out inside the quality scorer, which is what happens with no limit set.
+     *
+     * @return the refusal, or {@code null} if within the limit or unlimited
+     */
+    static String dpiLimitNotice(float dpi, float maxDpi) {
+        if (maxDpi <= 0) return null;
+        if (dpi <= maxDpi) return null;
+        return "  Error: --dpi " + (int) dpi + " is over the --max-dpi limit of "
+            + (int) maxDpi + ". Raster area grows with the square of DPI, so this"
+            + " needs roughly " + String.format("%.0fx", Math.pow(dpi / 300f, 2))
+            + " the memory of a 300 DPI run, and is the usual cause of an"
+            + " out-of-memory failure.\n"
+            + "         Lower --dpi, or raise the limit with --max-dpi " + (int) dpi
+            + " if you have the memory for it.";
     }
 
     /**

@@ -89,6 +89,8 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--pass-through / --no-pass-through` | Pass **digital-native** pages (no page-filling raster) through unchanged (default on). Applies with MRC on or off, and under `--pdfa`. Disable to force every page through render/re-encode. |
 | `--password <pw>` | Password for an encrypted input PDF (prompted if given without a value). |
 | `--ignore-encryption` | Proceed on a permission-restricted (owner-password) PDF. **mrcpdf output is never re-encrypted**, so those restrictions cannot be carried over — without this flag such a file is refused. |
+| `--max-pages <n>` | Refuse documents longer than n pages (0 = no limit, the default). Memory use grows with the document. |
+| `--max-dpi <n>` | Refuse a render DPI above n (0 = no limit, the default). Raster area grows with the square of DPI, so a high value is the usual cause of an out-of-memory failure. |
 | `--keep-smaller-only` | If MRC would make the output larger than the input, keep the original bytes instead. MRC adds a background layer per page, so an already-tight bilevel scan can come out bigger; without this flag the run warns and keeps the (larger) MRC result. |
 | `--threads <n>` | Worker threads for page prep (default: available processors). |
 | `--settings <file>` | Path to `settings.jsonc` (default `./settings.jsonc`). |
