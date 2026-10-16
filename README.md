@@ -83,7 +83,7 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--dpi <n>` | Rendering DPI for page images (default 300). |
 | `--bg-scale <0.1-1.0>` | Background downscale factor (default 0.33). |
 | `--jpeg-quality <0.1-1.0>` | Background JPEG quality (default 0.50 with MRC on, 0.85 with MRC off). |
-| `--pdfa` | Enable PDF/A-2b output (XMP metadata, sRGB OutputIntent). |
+| `--pdfa` | Stamp **PDF/A-2b-shaped** output: `pdfaid` XMP metadata and an sRGB OutputIntent. This is *not* verified conformance — see the limitations below. |
 | `--fg-color` | Re-render the foreground in the source's true text colors via a soft-mask color layer. Off by default; also works under `--pdfa` (PDF/A-2b permits soft masks, though conformance is not independently verified). |
 | `--mrc / --no-mrc` | Enable/disable MRC compression (default on). With MRC off, rebuilt pages are a single high-quality JPEG + invisible text layer (no mask) — faster, for downstream pipelines that don't need MRC layers. |
 | `--pass-through / --no-pass-through` | Pass **digital-native** pages (no page-filling raster) through unchanged (default on). Applies with MRC on or off, and under `--pdfa`. Disable to force every page through render/re-encode. |
@@ -125,6 +125,7 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 | Digital-native pages (no page-filling raster) | ✅ Passed through unchanged — original fonts, layout, and vector content intact |
 
 ### Known limitations
+- **`--pdfa` does not produce a conformant PDF/A-2b file.** It stamps the shape — `pdfaid:part 2 / conformance B` XMP and an sRGB OutputIntent — and that is all. Two known hard failures against the specification: the output header and catalog `/Version` are **1.6**, where PDF/A-2 requires **1.7**, and the invisible text layer uses a **non-embedded Standard 14 font** (set `pdf.fontPath` to embed one). Conformance is never validated, here or in CI. If PDF/A conformance matters, run the output through [veraPDF](https://verapdf.org/) and do not rely on this flag.
 - **Encrypted input loses its encryption.** mrcpdf cannot re-encrypt, so an encrypted source produces an unencrypted output that carries none of the original permissions. A permission-restricted (owner-password) file is therefore *refused* by default; `--ignore-encryption` proceeds and still warns. A user-password file is readable with `--password`. There is no output encryption option.
 - Rebuilt pages re-render the invisible text layer with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family and size styling are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected, and digital-native pages passed through unchanged keep their source fonts entirely. Text color is preserved in the visual layer when `--fg-color` is enabled.
 - Passed-through pages under `--pdfa` are carried over without validation — their embedded fonts are not re-checked for PDF/A conformance.

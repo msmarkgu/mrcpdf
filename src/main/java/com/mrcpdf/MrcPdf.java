@@ -100,7 +100,7 @@ public class MrcPdf implements Callable<Integer> {
     @Option(names = {"--fg-color"}, description = "Enable the true MRC foreground color plane (text keeps its original color via a soft mask); allowed under --pdfa (PDF/A-2b permits soft masks, though conformance is not verified)")
     private Boolean fgColor;
 
-    @Option(names = {"--pdfa"}, description = "Enable PDF/A-2b output (XMP metadata, sRGB OutputIntent)")
+    @Option(names = {"--pdfa"}, description = "Stamp PDF/A-2b-shaped output: pdfaid XMP metadata and an sRGB OutputIntent. This is NOT verified conformance — the file is written as PDF 1.6 (PDF/A-2 needs 1.7) and the invisible text layer uses a non-embedded Standard 14 font unless pdf.fontPath is set. Validate with veraPDF if conformance matters.")
     private Boolean pdfa;
 
     @Option(names = {"--threads"}, description = "Worker threads for page preparation (default: available processors)")

@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.transform.OutputKeys;
@@ -43,6 +44,17 @@ public final class PdfaWriter {
 
           DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
           factory.setNamespaceAware(true);
+          // This parses XMP lifted verbatim out of an untrusted input file, so
+          // external entities and doctypes must be off. Without this a crafted
+          // source could read local files or reach the network.
+          factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+          factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+          factory.setFeature(
+              "http://xml.org/sax/features/external-general-entities", false);
+          factory.setFeature(
+              "http://xml.org/sax/features/external-parameter-entities", false);
+          factory.setXIncludeAware(false);
+          factory.setExpandEntityReferences(false);
           DocumentBuilder builder = factory.newDocumentBuilder();
           Document xmlDoc =
               builder.parse(new ByteArrayInputStream(rawXml.getBytes(StandardCharsets.UTF_8)));
@@ -55,26 +67,20 @@ public final class PdfaWriter {
             desc.setAttributeNS(
                 "http://www.w3.org/2000/xmlns/", "xmlns:pdfaid", "http://www.aiim.org/pdfa/ns/id/");
 
-            NodeList partList =
-                xmlDoc.getElementsByTagNameNS("http://www.aiim.org/pdfa/ns/id/", "part");
-            if (partList.getLength() == 0) {
-              Element partEl =
-                  xmlDoc.createElementNS("http://www.aiim.org/pdfa/ns/id/", "pdfaid:part");
-              partEl.setTextContent("2");
-              desc.appendChild(partEl);
-            }
-
-            NodeList confList =
-                xmlDoc.getElementsByTagNameNS("http://www.aiim.org/pdfa/ns/id/", "conformance");
-            if (confList.getLength() == 0) {
-              Element confEl =
-                  xmlDoc.createElementNS("http://www.aiim.org/pdfa/ns/id/", "pdfaid:conformance");
-              confEl.setTextContent("B");
-              desc.appendChild(confEl);
-            }
+            // Overwrite rather than write-only-if-absent. A source declaring
+            // part 1 would otherwise be carried through while the file is built
+            // with PDF/A-2 features, yielding an internally inconsistent
+            // document that claims to be two things at once.
+            setOrAddTextChild(xmlDoc, desc, "part", "2");
+            setOrAddTextChild(xmlDoc, desc, "conformance", "B");
           }
 
           TransformerFactory tf = TransformerFactory.newInstance();
+          // Source XMP is parsed here, so do not let it pull in external
+          // entities. PDFBox's own DOM parser is hardened the same way.
+          tf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+          tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+          tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_STYLESHEET, "");
           Transformer transformer = tf.newTransformer();
           transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
           transformer.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
@@ -111,11 +117,31 @@ public final class PdfaWriter {
     }
   }
 
+  /**
+   * Sets {@code pdfaid:<localName>} to {@code text}, creating the element if the
+   * source XMP did not have it and overwriting it if it did.
+   */
+  private static void setOrAddTextChild(Document xmlDoc, Element desc,
+                                        String localName, String text) {
+    NodeList existing =
+        xmlDoc.getElementsByTagNameNS("http://www.aiim.org/pdfa/ns/id/", localName);
+    Element el =
+        existing.getLength() > 0
+            ? (Element) existing.item(0)
+            : xmlDoc.createElementNS("http://www.aiim.org/pdfa/ns/id/", "pdfaid:" + localName);
+    if (existing.getLength() == 0) desc.appendChild(el);
+    el.setTextContent(text);
+  }
+
   private static void setStaticPdfaMetadata(PDDocumentCatalog catalog, PDDocument doc)
       throws IOException {
+    // "\\uFEFF" inside a text block is six literal characters, not a BOM: the
+    // escape is not processed there. Building the packet with concatenation so
+    // the real U+FEFF reaches the bytes is the whole point of the xpacket
+    // marker -- a textual one defeats it.
     String xmp =
-        """
-                <?xpacket begin="\\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>
+        "<?xpacket begin=\"﻿\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
+            + """
                 <x:xmpmeta xmlns:x="adobe:ns:meta/">
                   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
                     <rdf:Description rdf:about=""
