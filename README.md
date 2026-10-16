@@ -84,7 +84,7 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--bg-scale <0.1-1.0>` | Background downscale factor (default 0.33). |
 | `--jpeg-quality <0.1-1.0>` | Background JPEG quality (default 0.50 with MRC on, 0.85 with MRC off). |
 | `--pdfa` | Stamp **PDF/A-2b-shaped** output: `pdfaid` XMP metadata and an sRGB OutputIntent. This is *not* verified conformance — see the limitations below. |
-| `--fg-color` | Re-render the foreground in the source's true text colors via a soft-mask color layer. Off by default; also works under `--pdfa` (PDF/A-2b permits soft masks, though conformance is not independently verified). |
+| `--fg-color` | Re-render the foreground in the source's true text colors via a soft-mask color layer. Off by default. Soft masks are permitted by PDF/A-2b, so this does not conflict with `--pdfa` — though see the PDF/A caveat below before relying on either. |
 | `--mrc / --no-mrc` | Enable/disable MRC compression (default on). With MRC off, rebuilt pages are a single high-quality JPEG + invisible text layer (no mask) — faster, for downstream pipelines that don't need MRC layers. |
 | `--pass-through / --no-pass-through` | Pass **digital-native** pages (no page-filling raster) through unchanged (default on). Applies with MRC on or off, and under `--pdfa`. Disable to force every page through render/re-encode. |
 | `--password <pw>` | Password for an encrypted input PDF (prompted if given without a value). |
@@ -94,6 +94,14 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--keep-smaller-only` | If MRC would make the output larger than the input, keep the original bytes instead. MRC adds a background layer per page, so an already-tight bilevel scan can come out bigger; without this flag the run warns and keeps the (larger) MRC result. |
 | `--threads <n>` | Worker threads for page prep (default: available processors). |
 | `--settings <file>` | Path to `settings.jsonc` (default `./settings.jsonc`). |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Completed. Warnings may still have been printed — the output is valid. |
+| `1` | The run failed: unreadable or corrupt input, wrong password, missing file, or an internal error. |
+| `2` | **Refused before processing**: the input was permission-restricted, or it exceeded `--max-pages` / `--max-dpi`. Nothing was rendered and no output file was written. |
 
 The jbig2enc binary and CJK font bundled in `deps/` are used automatically; all defaults are configurable via [`settings.jsonc`](settings.jsonc), and CLI flags take precedence.
 
@@ -128,7 +136,7 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 - **`--pdfa` does not produce a conformant PDF/A-2b file.** It stamps the shape — `pdfaid:part 2 / conformance B` XMP and an sRGB OutputIntent — and that is all. Two known hard failures against the specification: the output header and catalog `/Version` are **1.6**, where PDF/A-2 requires **1.7**, and the invisible text layer uses a **non-embedded Standard 14 font** (set `pdf.fontPath` to embed one). Conformance is never validated, here or in CI. If PDF/A conformance matters, run the output through [veraPDF](https://verapdf.org/) and do not rely on this flag.
 - **Encrypted input loses its encryption.** mrcpdf cannot re-encrypt, so an encrypted source produces an unencrypted output that carries none of the original permissions. A permission-restricted (owner-password) file is therefore *refused* by default; `--ignore-encryption` proceeds and still warns. A user-password file is readable with `--password`. There is no output encryption option.
 - Rebuilt pages re-render the invisible text layer with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family and size styling are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected, and digital-native pages passed through unchanged keep their source fonts entirely. Text color is preserved in the visual layer when `--fg-color` is enabled.
-- Passed-through pages under `--pdfa` are carried over without validation — their embedded fonts are not re-checked for PDF/A conformance.
+- Passed-through pages under `--pdfa` are carried over as they are — their embedded fonts, and any other source-side PDF/A issues, are never inspected.
 - Solid oversized elements — a component wider or taller than `segmenter.maxComponentDim` (default 10% of the page's long side) or larger than `segmenter.maxComponentArea` (default 0.5% of page area) is dropped from the foreground mask and softened with the background. That is deliberate for photos, logos and halftones, but text merged with such an element — large display type, a dark banner behind a heading — is therefore rebuilt from the downsampled background, not the full-resolution mask. Thin line-work is exempt: rules, underlines, column dividers and hollow table borders stay in the sharp mask (see `ImageSegmenter`).
 - Named destinations (the `/Names/Dests` tree) are **not preserved**. The tree is dropped rather than copied, because its page references stop resolving once pages are rebuilt, and a broken destination reference fails silently at click time. The run reports how many were dropped. Bookmarks and annotation links that address a page directly *are* re-mapped to the rebuilt pages, and their geometry is transformed through the page's rotation and crop-box offset.
 
@@ -152,9 +160,15 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 ### Benchmarking
 
 ```bash
-./scripts/benchmark_mrc.sh                 # all real-world PDFs
-./scripts/benchmark_mrc.sh simple-text.pdf # a single file
+MRCPDF_BENCH_DIR=/path/to/pdfs ./scripts/benchmark_mrc.sh   # all PDFs in a directory
+./scripts/benchmark_mrc.sh /path/to/one.pdf                  # a single file
 ```
+
+The input corpus is **not** part of the repository — point `MRCPDF_BENCH_DIR` at
+your own PDFs, or pass a path as the argument. The script records input size,
+output size and the ratio measured **against the input file**, so its numbers are
+comparable with the headline claim above. It rebuilds the JAR first if any source
+is newer, so it cannot silently benchmark a stale build.
 
 ---
 
