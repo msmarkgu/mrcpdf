@@ -87,6 +87,8 @@ Build the fat JAR manually (not needed if you use `run.sh`):
 | `--fg-color` | Re-render the foreground in the source's true text colors via a soft-mask color layer. Off by default; also works under `--pdfa` (PDF/A-2b permits soft masks, though conformance is not independently verified). |
 | `--mrc / --no-mrc` | Enable/disable MRC compression (default on). With MRC off, rebuilt pages are a single high-quality JPEG + invisible text layer (no mask) — faster, for downstream pipelines that don't need MRC layers. |
 | `--pass-through / --no-pass-through` | Pass **digital-native** pages (no page-filling raster) through unchanged (default on). Applies with MRC on or off, and under `--pdfa`. Disable to force every page through render/re-encode. |
+| `--password <pw>` | Password for an encrypted input PDF (prompted if given without a value). |
+| `--ignore-encryption` | Proceed on a permission-restricted (owner-password) PDF. **mrcpdf output is never re-encrypted**, so those restrictions cannot be carried over — without this flag such a file is refused. |
 | `--keep-smaller-only` | If MRC would make the output larger than the input, keep the original bytes instead. MRC adds a background layer per page, so an already-tight bilevel scan can come out bigger; without this flag the run warns and keeps the (larger) MRC result. |
 | `--threads <n>` | Worker threads for page prep (default: available processors). |
 | `--settings <file>` | Path to `settings.jsonc` (default `./settings.jsonc`). |
@@ -121,6 +123,7 @@ Rule of thumb: allow ~1–1.5 GB per page in flight and cap `--threads` (or `pip
 | Digital-native pages (no page-filling raster) | ✅ Passed through unchanged — original fonts, layout, and vector content intact |
 
 ### Known limitations
+- **Encrypted input loses its encryption.** mrcpdf cannot re-encrypt, so an encrypted source produces an unencrypted output that carries none of the original permissions. A permission-restricted (owner-password) file is therefore *refused* by default; `--ignore-encryption` proceeds and still warns. A user-password file is readable with `--password`. There is no output encryption option.
 - Rebuilt pages re-render the invisible text layer with a single font (the Standard 14 font, or a TTF/OTF configured via `pdf.fontPath` in settings.jsonc). Original font family and size styling are not reproduced in the hidden layer — the *visual* layer (background + mask) is unaffected, and digital-native pages passed through unchanged keep their source fonts entirely. Text color is preserved in the visual layer when `--fg-color` is enabled.
 - Passed-through pages under `--pdfa` are carried over without validation — their embedded fonts are not re-checked for PDF/A conformance.
 - Solid oversized elements — a component wider or taller than `segmenter.maxComponentDim` (default 10% of the page's long side) or larger than `segmenter.maxComponentArea` (default 0.5% of page area) is dropped from the foreground mask and softened with the background. That is deliberate for photos, logos and halftones, but text merged with such an element — large display type, a dark banner behind a heading — is therefore rebuilt from the downsampled background, not the full-resolution mask. Thin line-work is exempt: rules, underlines, column dividers and hollow table borders stay in the sharp mask (see `ImageSegmenter`).

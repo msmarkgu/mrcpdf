@@ -69,6 +69,16 @@ import com.mrcpdf.util.Settings;
 )
 public class MrcPdf implements Callable<Integer> {
 
+    /**
+     * Signals a refusal that has already been explained to the user, so the
+     * handler exits non-zero without printing a second, redundant trace.
+     */
+    static class AbortRunException extends IOException {
+        AbortRunException() {
+            super("aborted");
+        }
+    }
+
     @Parameters(index = "0", description = "Input PDF file")
     private File inputFile;
 
@@ -104,6 +114,12 @@ public class MrcPdf implements Callable<Integer> {
 
     @Option(names = {"--keep-smaller-only"}, description = "If MRC would make the output larger than the input (e.g. an already-optimized bilevel scan), write the original bytes instead of a larger file (default: off)")
     private Boolean keepSmallerOnly;
+
+    @Option(names = {"--password"}, description = "Password for an encrypted input PDF", arity = "0..1", interactive = true, defaultValue = Option.NULL_VALUE)
+    private String password;
+
+    @Option(names = {"--ignore-encryption"}, description = "Proceed on a permission-restricted (owner-password) PDF whose restrictions would be dropped, since mrcpdf output is never re-encrypted (default: off)")
+    private Boolean ignoreEncryption;
 
     @Override
     public Integer call() {
@@ -258,6 +274,19 @@ public class MrcPdf implements Callable<Integer> {
                     qualityGateThreshold, qualityModel, keepSmaller);
             return 0;
 
+        } catch (AbortRunException e) {
+            // Already reported; no second error line and no stack trace.
+            return 2;
+        } catch (org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException e) {
+            // A wrong or missing user password is ordinary user error, not a
+            // defect worth a stack trace.
+            System.err.println("Error: cannot decrypt the input PDF — the password is"
+                + " wrong or missing.");
+            System.err.println("       Pass it with --password <password>.");
+            return 1;
+        } catch (java.io.FileNotFoundException e) {
+            System.err.println("Error: no such file: " + e.getMessage());
+            return 1;
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
@@ -275,7 +304,21 @@ public class MrcPdf implements Callable<Integer> {
                              QualityModel qualityModel, boolean keepSmallerOnly) throws IOException {
         Path tempDir = createTempDir(inputFile.getName().replaceAll("\\.[^.]+$", ""));
 
-        try (PDDocument source = Loader.loadPDF(inputFile)) {
+        try (PDDocument source = Loader.loadPDF(inputFile, password)) {
+            // Policy check before anything is rendered: a restricted document
+            // must not reach the pipeline, because the pipeline cannot put the
+            // restrictions back on the output.
+            boolean encrypted = source.isEncrypted();
+            boolean ignoreEnc = ignoreEncryption != null && ignoreEncryption;
+            boolean passwordGiven = password != null && !password.isEmpty();
+            String refusal = encryptionDecision(encrypted, passwordGiven, ignoreEnc);
+            if (refusal != null) {
+                System.err.println(refusal);
+                throw new AbortRunException();
+            }
+            String encWarning = encryptionWarning(encrypted, passwordGiven, ignoreEnc);
+            if (encWarning != null) System.err.println(encWarning);
+
             PDFRenderer renderer = new PDFRenderer(source);
             int pageCount = source.getNumberOfPages();
             int srcWords = countWords(source);
@@ -856,6 +899,59 @@ public class MrcPdf implements Callable<Integer> {
                 ? " --keep-smaller-only is set, so the original bytes were kept instead."
                 : " The source is probably already well compressed (e.g. a bilevel"
                   + " CCITT scan). Pass --keep-smaller-only to never enlarge a file.");
+    }
+
+    /**
+     * Decides whether an encrypted input may be processed at all.
+     *
+     * <p>mrcpdf has no way to re-encrypt: the output is always written
+     * unencrypted. Running an encrypted document through therefore downgrades
+     * its protection, and doing that quietly is the part that does real damage —
+     * the result looks like an ordinary file and carries none of the original
+     * restrictions.
+     *
+     * <p>The distinction that matters is which password opened the document. If
+     * a blank password suffices, the file is owner-password-only:
+     * permission-restricted, deliberately so. That is refused. If the caller
+     * supplied the user password they already have legitimate access, so it
+     * proceeds — but {@link #encryptionWarning} still fires, because the output
+     * remains unprotected either way.
+     *
+     * @param encrypted        whether the loaded document is encrypted
+     * @param passwordGiven    whether the caller supplied a password
+     * @param ignoreEncryption whether {@code --ignore-encryption} was passed
+     * @return the refusal to print before exiting, or {@code null} to proceed
+     */
+    static String encryptionDecision(boolean encrypted, boolean passwordGiven,
+                                     boolean ignoreEncryption) {
+        if (!encrypted) return null;
+        if (passwordGiven) return null;
+        if (ignoreEncryption) return null;
+        return "  Error: the input PDF is encrypted with an owner password, so it"
+            + " carries permission restrictions. The output will NOT be encrypted and"
+            + " will carry none of those restrictions — an unprotected copy of a"
+            + " protected document.\n"
+            + "         Re-run with --ignore-encryption if you are authorised to remove"
+            + " those restrictions, or decrypt the file first.";
+    }
+
+    /**
+     * The notice emitted whenever an encrypted document is processed.
+     *
+     * <p>Fires even under {@code --ignore-encryption}: the override decides
+     * whether to proceed, not whether to mention that the output is unprotected.
+     *
+     * @return the warning to print to stderr, or {@code null} if the input was
+     *         not encrypted
+     */
+    static String encryptionWarning(boolean encrypted, boolean passwordGiven,
+                                    boolean ignoreEncryption) {
+        if (!encrypted) return null;
+        String how = ignoreEncryption
+            ? " --ignore-encryption was given."
+            : (passwordGiven ? " The password was supplied." : "");
+        return "  Warning: the input PDF is encrypted; the output will NOT be"
+            + " encrypted and carries none of the input's restrictions." + how;
     }
 
     private static int countWords(PDDocument doc) throws IOException {
