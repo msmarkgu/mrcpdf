@@ -79,7 +79,7 @@ if "%FORCE_DOWNLOAD%"=="true" (
 
 if not exist "%JBIG2_EXE%" (
   echo.
-  echo Downloading jbig2enc v0.32 (MSVC x64) for Windows...
+  echo Downloading jbig2enc v0.32 ^(MSVC x64^) for Windows...
   echo   URL: %WIN_ZIP_URL%
   powershell -NoProfile -Command "Invoke-WebRequest -UseBasicParsing -Uri '%WIN_ZIP_URL%' -OutFile '%SCRIPT_DIR%jbig2enc-win.zip'" 2>nul
   if exist "%SCRIPT_DIR%jbig2enc-win.zip" (
